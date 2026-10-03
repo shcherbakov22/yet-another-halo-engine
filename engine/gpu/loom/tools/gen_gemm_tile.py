@@ -185,6 +185,8 @@ def configure(fmt, t):
     G.GPL = 1
     G.Q4_HDR = fmt in ("q4k", "q5k")
     G.VDEC_W = G.IQ3_U8F = G.VDECW_FR = t.w3
+    # IQ3_S: the shorter sign chain tips the allocator into A-fragment copies (+0.7..2.5%); IQ3_XXS -0.6% (ffn, kres, swiglu)
+    G.IQ3_SGN2 = t.w3 and fmt == "iq3xxs"
     G.Q4FMIX = t.q4fmix
     G.LR = t.bm
     G.NW = t.nwave // 2        # table-staging stride 64*NW = LANES

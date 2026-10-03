@@ -20,6 +20,10 @@ IQ3_U8F = False
 # VDECW_FR: the word path's sign spread without quarter-rate v_mul_lo_u32.
 # nibble * 0x00204081 becomes shifts and ORs, s1 * 255 becomes (s1 << 8) - s1 (top byte wraps). Same integers: bit-identical.
 VDECW_FR = False
+# IQ3_SGN2 (with IQ3_U8F + VDECW_FR): u = (g ^ (0x80808080 - s1)) + s1 straight from the grid word, and the sign spread as
+# two shift-adds (n | n << 7, t | t << 14: the bits are disjoint, so OR is the add). Per byte, s = 0: g ^ 0x80 = g + 128;
+# s = 1: (g ^ 0x7f) + 1 = 128 - g (grid magnitudes 1..127: no borrow, no carry). Same bytes as ((g ^ -s) + s) ^ 0x80.
+IQ3_SGN2 = False
 # Q4FMIX (Q4_K/Q5_K): narrow as fptrunc(fma(e, 1, -dm)) instead of fptrunc(e - dm). The product by 1 is exact: bit-identical.
 # It selects v_fma_mix{lo,hi}. v_cvt_f16_f32 writes only v0..v127: with 128 VGPRs of accumulators live, each result spills one.
 # The 1.0 comes from gb & ~gb so the canonicalizer cannot fold the fma back into a subf.
@@ -215,12 +219,24 @@ def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None):
         # On the two grid words: s1 = sign bit i in byte i (nibble * 0x00204081), m = s1 * 255, mag = (g ^ m) + s1.
         # Per byte that is 256 - g for a set bit, no carry since grid magnitudes are > 0. (i8 vectors lower element by element.)
         e(f"    %wsb_{t} = scalar.extui {sgb8} : i8 to i32")
+        sgn2 = IQ3_SGN2 and IQ3_U8F and VDECW_FR and dsc_s is not None
+        if sgn2:
+            e(f"    %c128i_sg2_{t} = scalar.constant 128 : i32")
+            e(f"    %c16384i_sg2_{t} = scalar.constant 16384 : i32")
         for h, gw in ((0, gw0), (1, gw1)):
             if h:
                 e(f"    %wsn{h}_{t}0 = scalar.shrui %wsb_{t}, %c4i : i32")
             else:
                 e(f"    %wsn{h}_{t}0 = scalar.addi %wsb_{t}, %c0i : i32")
             e(f"    %wsn{h}_{t} = scalar.andi %wsn{h}_{t}0, %c15i : i32")
+            if sgn2:
+                e(f"    %wst{h}_{t} = scalar.fmai %wsn{h}_{t}, %c128i_sg2_{t}, %wsn{h}_{t} : i32")
+                e(f"    %wsp{h}_{t} = scalar.fmai %wst{h}_{t}, %c16384i_sg2_{t}, %wst{h}_{t} : i32")
+                e(f"    %ws1{h}_{t} = scalar.andi %wsp{h}_{t}, %vdw_ones : i32")
+                e(f"    %wsk{h}_{t} = scalar.subi %c80x4_iq3, %ws1{h}_{t} : i32")
+                e(f"    %wsx{h}_{t} = scalar.xori {gw}, %wsk{h}_{t} : i32")
+                e(f"    %wu{h}_{t} = scalar.addi %wsx{h}_{t}, %ws1{h}_{t} : i32")
+                continue
             if VDECW_FR:
                 # n * 0x00204081 & 0x01010101 == (t | t << 14) & 0x01010101, t = n | n << 7 (n <= 15: OR cannot carry)
                 e(f"    %wst7{h}_{t} = scalar.shli %wsn{h}_{t}, %c7i : i32")
@@ -237,8 +253,9 @@ def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None):
                 e(f"    %wsm{h}_{t} = scalar.muli %ws1{h}_{t}, %vdw_ff : i32")
             e(f"    %wx{h}_{t} = scalar.xori {gw}, %wsm{h}_{t} : i32")
             e(f"    %wm{h}_{t} = scalar.addi %wx{h}_{t}, %ws1{h}_{t} : i32")
-        e(f"    %vmw_{t} = vector.from_elements %wm0_{t}, %wm1_{t} : vector<2xi32>")
-        e(f"    %vm_{t} = vector.bitcast %vmw_{t} : vector<2xi32> to vector<8xi8>")
+        if not sgn2:
+            e(f"    %vmw_{t} = vector.from_elements %wm0_{t}, %wm1_{t} : vector<2xi32>")
+            e(f"    %vm_{t} = vector.bitcast %vmw_{t} : vector<2xi32> to vector<8xi8>")
     else:
         e(f"    %vg_{t} = vector.from_elements {gw0}, {gw1} : vector<2xi32>")
         e(f"    %vb_{t} = vector.bitcast %vg_{t} : vector<2xi32> to vector<8xi8>")
@@ -248,8 +265,9 @@ def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None):
         e(f"    %vx_{t} = vector.xori %vb_{t}, %vn_{t} : vector<8xi8>")
         e(f"    %vm_{t} = vector.addi %vx_{t}, %vs_{t} : vector<8xi8>")
     if IQ3_U8F and VDEC_W and dsc_s is not None:
-        e(f"    %wu0_{t} = scalar.xori %wm0_{t}, %c80x4_iq3 : i32")
-        e(f"    %wu1_{t} = scalar.xori %wm1_{t}, %c80x4_iq3 : i32")
+        if not (IQ3_SGN2 and VDECW_FR):
+            e(f"    %wu0_{t} = scalar.xori %wm0_{t}, %c80x4_iq3 : i32")
+            e(f"    %wu1_{t} = scalar.xori %wm1_{t}, %c80x4_iq3 : i32")
         e(f"    %vuw_{t} = vector.from_elements %wu0_{t}, %wu1_{t} : vector<2xi32>")
         e(f"    %vub_{t} = vector.bitcast %vuw_{t} : vector<2xi32> to vector<8xi8>")
         e(f"    %vuf_{t} = vector.uitofp %vub_{t} : vector<8xi8> to vector<8xf32>")
