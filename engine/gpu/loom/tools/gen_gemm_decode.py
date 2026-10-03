@@ -28,6 +28,10 @@ IQ3_SGN2 = False
 # It selects v_fma_mix{lo,hi}. v_cvt_f16_f32 writes only v0..v127: with 128 VGPRs of accumulators live, each result spills one.
 # The 1.0 comes from gb & ~gb so the canonicalizer cannot fold the fma back into a subf.
 Q4FMIX = False
+# Q3_FMIX (Q3_K): narrow dsc * q as fptrunc(fma(dsc, q, -0.0)) instead of fptrunc(dsc * q): d * sc * q has <= 19 significant
+# bits, so the product is exact either way, and the -0.0 addend keeps a zero product's sign (q = 0 with dsc < 0 stays -0; the
+# MMA output keeps it too: +0 there changed the GEMM hashes). Selects v_fma_mix{lo,hi} instead of mul + v_cvt_f16_f32.
+Q3_FMIX = True
 
 KSUB = PH = GPP = GPL = ROWP = None
 
@@ -1165,16 +1169,25 @@ def q3k_compute(v, gb):
             e(f"    %q3sc{t} = scalar.subi %q3s6{t}, %c32i : i32")
             e(f"    %q3scf{t} = scalar.sitofp %q3sc{t} : i32 to f32")
             e(f"    %q3dsc{t} = scalar.mulf %d, %q3scf{t} : f32")
-            e(f"    %q3dv{t} = vector.splat %q3dsc{t} : vector<16xf32>")
-            e(f"    %q3v{t} = vector.mulf %q3dv{t}, %q3qf{t} : vector<16xf32>")
-            e(f"    %h{hn}{u} = vector.fptrunc %q3v{t} : vector<16xf32> to vector<16xf16>")
+            if Q3_FMIX:
+                hs = []
+                for j in range(16):
+                    e(f"    %q3y{t}_{j} = vector.extract %q3qf{t}[{j}] : vector<16xf32> -> f32")
+                    e(f"    %q3m{t}_{j} = scalar.fmaf %q3dsc{t}, %q3y{t}_{j}, %q3cm0f : f32")
+                    e(f"    %q3h{t}_{j} = scalar.fptrunc %q3m{t}_{j} : f32 to f16")
+                    hs.append(f"%q3h{t}_{j}")
+                e(f"    %h{hn}{u} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
+            else:
+                e(f"    %q3dv{t} = vector.splat %q3dsc{t} : vector<16xf32>")
+                e(f"    %q3v{t} = vector.mulf %q3dv{t}, %q3qf{t} : vector<16xf32>")
+                e(f"    %h{hn}{u} = vector.fptrunc %q3v{t} : vector<16xf32> to vector<16xf16>")
         e(f"    vector.store %hlo{u}, %wl_view[%drow, %col{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
         e(f"    vector.store %hhi{u}, %wl_view[%drow, %colh{u}] : vector<16xf16>, view<{LR}x{ROWP}xf16>")
     return L
 
 
 def q3k_setup():
-    return ["  %q3c54i = scalar.constant 54 : i32", "  %q3c96i = scalar.constant 96 : i32",
+    return ["  %q3cm0f = scalar.constant -0.0 : f32", "  %q3c54i = scalar.constant 54 : i32", "  %q3c96i = scalar.constant 96 : i32",
             "  %q3c3b = scalar.constant 3 : i8", "  %q3c1b = scalar.constant 1 : i8",
             "  %q3c2b = scalar.constant 2 : i8", "  %q3c4b = scalar.constant 4 : i8",
             "  %q3m3v = vector.splat %q3c3b : vector<16xi8>", "  %q3m1v = vector.splat %q3c1b : vector<16xi8>",
