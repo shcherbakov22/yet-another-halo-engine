@@ -173,6 +173,8 @@ One line each: what, the number, why.
 
 Prefill GEMMs:
 
+- afrag B-fragment offsets with the token part hoisted out of the phase loop (one live-in VGPR, per step only the phase's k tile and a constant): clock-free +1.0% (IQ3_S kstore) to +5.7% (IQ4_XS kstore, 200 VGPRs), bit-identical. Loom does not fold the step constant into the load's 12-bit immediate (it adds it in SALU per step as before), and the loop-long value costs 37 more `v_mov` (allocator copies) and +27 VALU in the IQ3_S loop.
+- Afrag knob retests on the fused ffn (clock-free, one round): `b0early` 2 (IQ3_S 216 VGPRs, IQ4_XS 200), `lhs_stream` 4 / 0, `b0early` off all slower; `lhs_stream` 1 even at 184 VGPRs, but the 8 free registers buy nothing (`b0early` 2 on top: IQ3_S +1.5%, IQ4_XS still 200).
 - Cycle ablations of IQ3_S kstore (instructions replaced by `s_nop`, clock-free, standalone): no WMMA -33.7% (the rest alone is 26.9 cycles per WMMA slot, mostly overlapped), no barriers -5.2%, no fragment `ds_load_b128` -1.5%, no global loads -1.3%, no LDS stores -1.1%, no dead zero-init moves -0.2% (~1 cycle per VALU issue). Never nop `s_waitcnt`: scalar descriptor loads then land late and the kernel hangs the GPU.
 - Wave64 tile GEMM: IQ3_S kstore 23.93 -> 31.27 M cycles; wave64 VALU / LDS instructions cost ~1.7x and operand fragments do not shrink.
 - KSUB = 32 for more residency: IQ3_S ffn_gate +6.8% cycles in pp2048; twice the phases, twice the barriers, and the kernel was already at its issue bound.
