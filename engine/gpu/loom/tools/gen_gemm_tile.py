@@ -771,6 +771,11 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("    %sks0 = index.constant 0 : index")
         for j in range(t.tn // 16):
             afrag_rhs(0, j)
+        if t.b0early > 1:
+            # step 1's prefetched B fragments too: a copy of one would otherwise drain the queue right after its load
+            e("    %sks1 = index.constant 16 : index")
+            for j in range(min(t.bpre, t.tn // 16)):
+                afrag_rhs(1, j)
     # decode (only the decoding slots) into the weight tile
     if not DECAHEAD and not DBUF:
         e("    scf.if %decoder {")
@@ -900,7 +905,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
                 e("    scf.schedule.fence")
             if not (t.bpre and st) and not (t.b0early and st == 0):
                 e(f"    %sks{st} = index.constant {16 * st} : index")
-            if t.bpre and st + 1 < nst:
+            if t.bpre and st + 1 < nst and not (t.b0early > 1 and st == 0):
                 e(f"    %sks{st + 1} = index.constant {16 * (st + 1)} : index")
 
             def slhs(i):
@@ -912,7 +917,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
 
             def srhs(j, st=st):
                 if AFRAG:
-                    if not (t.b0early and st == 0):
+                    if not (t.b0early and st == 0) and not (t.b0early > 1 and st == 1 and j < t.bpre):
                         afrag_rhs(st, j)
                 else:
                     e(f"    %stc{st}_{j} = index.add %wt_off, %c{16 * j} : index")
