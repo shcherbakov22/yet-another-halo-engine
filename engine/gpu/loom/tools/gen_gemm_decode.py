@@ -28,6 +28,9 @@ IQ3_SGN2 = False
 # It selects v_fma_mix{lo,hi}. v_cvt_f16_f32 writes only v0..v127: with 128 VGPRs of accumulators live, each result spills one.
 # The 1.0 comes from gb & ~gb so the canonicalizer cannot fold the fma back into a subf.
 Q4FMIX = False
+# Q4DFMA (with Q4FMIX): fptrunc(fma(dsc, q, -dm)) straight from the nibble, without the vector multiply and the opaque 1.0:
+# dsc * q has <= 21 significant bits, so it is exact and the fma sees the same value (and zero sign) as fma(dsc * q, 1, -dm).
+Q4DFMA = True
 # Q3_FMIX (Q3_K): narrow dsc * q as fptrunc(fma(dsc, q, -0.0)) instead of fptrunc(dsc * q): d * sc * q has <= 19 significant
 # bits, so the product is exact either way, and the -0.0 addend keeps a zero product's sign (q = 0 with dsc < 0 stays -0; the
 # MMA output keeps it too: +0 there changed the GEMM hashes). Selects v_fma_mix{lo,hi} instead of mul + v_cvt_f16_f32.
@@ -561,7 +564,7 @@ def q4k_compute(v, gb, q5=False):
     L = []
     e = L.append
     it = iter(v)
-    if Q4FMIX:
+    if Q4FMIX and not Q4DFMA:
         # an opaque 1.0 (see Q4FMIX): gb & ~gb is 0, unprovable to the folder
         e(f"    %q4nb = scalar.xori {gb}, %q4m1 : i32")
         e(f"    %q4z = scalar.andi {gb}, %q4nb : i32")
@@ -661,15 +664,20 @@ def q4k_compute(v, gb, q5=False):
                 src = f"%n5{half}{u}"
             # nibbles are 0..15 (0..31 with q5's bit): uitofp gives the same value and selects v_cvt_f32_ubyteN
             e(f"    %fq{half}{u} = vector.uitofp {src} : vector<16xi8> to vector<16xf32>")
-            e(f"    %sq{half}{u} = vector.mulf %dsc_v{u}, %fq{half}{u} : vector<16xf32>")
+            if not (Q4FMIX and Q4DFMA):
+                e(f"    %sq{half}{u} = vector.mulf %dsc_v{u}, %fq{half}{u} : vector<16xf32>")
             if Q4FMIX:
                 if half == "lo":
                     e(f"    %ndm{u} = scalar.negf %dm{u} : f32")
                 hs = []
                 for j in range(16):
                     t = f"{half}{u}_{j}"
-                    e(f"    %qe{t} = vector.extract %sq{half}{u}[{j}] : vector<16xf32> -> f32")
-                    e(f"    %qm{t} = scalar.fmaf %qe{t}, %q4one, %ndm{u} : f32")
+                    if Q4DFMA:
+                        e(f"    %qe{t} = vector.extract %fq{half}{u}[{j}] : vector<16xf32> -> f32")
+                        e(f"    %qm{t} = scalar.fmaf %dsc{u}, %qe{t}, %ndm{u} : f32")
+                    else:
+                        e(f"    %qe{t} = vector.extract %sq{half}{u}[{j}] : vector<16xf32> -> f32")
+                        e(f"    %qm{t} = scalar.fmaf %qe{t}, %q4one, %ndm{u} : f32")
                     e(f"    %qt{t} = scalar.fptrunc %qm{t} : f32 to f16")
                     hs.append(f"%qt{t}")
                 e(f"    %h{half}{u} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
