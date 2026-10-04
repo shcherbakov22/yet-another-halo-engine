@@ -54,6 +54,9 @@ Q4FMIX = False
 # Q4DFMA (with Q4FMIX): fptrunc(fma(dsc, q, -dm)) straight from the nibble, without the vector multiply and the opaque 1.0:
 # dsc * q has <= 21 significant bits, so it is exact and the fma sees the same value (and zero sign) as fma(dsc * q, 1, -dm).
 Q4DFMA = True
+# Q4_F16P (Q4_K / Q5_K, with Q4DFMA): the quants as f16 subnormal pairs instead of a v_cvt_f32_ubyteN each: Q4_K loop
+# VALU 169 -> 158 (+4 movs), Q5_K 204 -> 202; one process A/B Q4_K -0.4..+0.7% (kres +0.4 / +0.7%): off
+Q4_F16P = False
 # F16PAIR (IQ4_XS): the u bytes (q + 128) as f16 subnormals: w & 0x00ff00ff and (w >> 8) & 0x00ff00ff are pairs c * 2^-24
 # (exact; FP16 denormals are on) for 3 ops per 4 values instead of a v_cvt_f32_ubyteN each; narrowed as
 # fptrunc(fma(dsc * 2^24, c * 2^-24, -128 * dsc)): the scaled dsc is exact, so the fma sees the same exact product.
@@ -993,6 +996,37 @@ def q4k_compute(v, gb, q5=False):
                 e(f"    %n5w{half}{u} = vector.ori %qwm{half}{u}, %h16{half}{u} : vector<4xi32>")
                 e(f"    %n5{half}{u} = vector.bitcast %n5w{half}{u} : vector<4xi32> to vector<16xi8>")
                 src = f"%n5{half}{u}"
+            if Q4_F16P and Q4FMIX and Q4DFMA:
+                # quants (0..31) as f16 subnormal pairs q * 2^-24 (exact): bytes 0 / 2 and 1 / 3 of each word in the
+                # halves' low bytes; fma(dsc * 2^24, q * 2^-24, -dm) sees the exact product dsc * q as before
+                if half == "lo":
+                    e(f"    %ndm{u} = scalar.negf %dm{u} : f32")
+                    e(f"    %dsc24_{u} = scalar.mulf %dsc{u}, %q4c24f : f32")
+                srcw = f"%n5w{half}{u}" if q5 else f"%qws{half}{u}"
+                emask = "%q4m00ff" if q5 else "%q4m000f"
+                e(f"    %fpe{half}{u} = vector.andi {srcw}, {emask} : vector<4xi32>")
+                if q5:
+                    e(f"    %fps{half}{u} = vector.shrui {srcw}, %q4s8w : vector<4xi32>")
+                    e(f"    %fpo{half}{u} = vector.andi %fps{half}{u}, %q4m00ff : vector<4xi32>")
+                else:
+                    e(f"    %fps{half}{u} = vector.shrui {srcw}, %q4s8w : vector<4xi32>")
+                    e(f"    %fpo{half}{u} = vector.andi %fps{half}{u}, %q4m000f : vector<4xi32>")
+                hs = []
+                for w in range(4):
+                    for nm in ("e", "o"):
+                        e(f"    %fpx{nm}{half}{u}_{w} = vector.extract %fp{nm}{half}{u}[{w}] : vector<4xi32> -> i32")
+                        e(f"    %fpv{nm}{half}{u}_{w} = vector.from_elements %fpx{nm}{half}{u}_{w} : vector<1xi32>")
+                        e(f"    %fph{nm}{half}{u}_{w} = vector.bitcast %fpv{nm}{half}{u}_{w} : vector<1xi32> to vector<2xf16>")
+                for j in range(16):
+                    t = f"{half}{u}_{j}"
+                    w, b = divmod(j, 4)
+                    e(f"    %qeh{t} = vector.extract %fph{'e' if b % 2 == 0 else 'o'}{half}{u}_{w}[{b // 2}] : vector<2xf16> -> f16")
+                    e(f"    %qe{t} = scalar.extf %qeh{t} : f16 to f32")
+                    e(f"    %qm{t} = scalar.fmaf %dsc24_{u}, %qe{t}, %ndm{u} : f32")
+                    e(f"    %qt{t} = scalar.fptrunc %qm{t} : f32 to f16")
+                    hs.append(f"%qt{t}")
+                e(f"    %h{half}{u} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
+                continue
             # nibbles are 0..15 (0..31 with q5's bit): uitofp gives the same value and selects v_cvt_f32_ubyteN
             e(f"    %fq{half}{u} = vector.uitofp {src} : vector<16xi8> to vector<16xf32>")
             if not (Q4FMIX and Q4DFMA):
@@ -1026,7 +1060,11 @@ def q4k_compute(v, gb, q5=False):
 
 
 def q4k_setup():
-    return ["  %c15b = scalar.constant 15 : i8", "  %c4b = scalar.constant 4 : i8", "  %c1b = scalar.constant 1 : i8",
+    f16p = ["  %q4c24f = scalar.constant 16777216.0 : f32",
+            "  %q4k000f = scalar.constant 983055 : i32", "  %q4m000f = vector.splat %q4k000f : vector<4xi32>",
+            "  %q4k00ff = scalar.constant 16711935 : i32", "  %q4m00ff = vector.splat %q4k00ff : vector<4xi32>",
+            "  %q4k8 = scalar.constant 8 : i32", "  %q4s8w = vector.splat %q4k8 : vector<4xi32>"]
+    return (f16p if Q4_F16P else []) + ["  %c15b = scalar.constant 15 : i8", "  %c4b = scalar.constant 4 : i8", "  %c1b = scalar.constant 1 : i8",
             "  %m15v = vector.splat %c15b : vector<16xi8>", "  %s4v = vector.splat %c4b : vector<16xi8>",
             "  %one8v = vector.splat %c1b : vector<16xi8>",
             "  %c0f4 = scalar.constant 252645135 : i32", "  %m0f4 = vector.splat %c0f4 : vector<4xi32>",
