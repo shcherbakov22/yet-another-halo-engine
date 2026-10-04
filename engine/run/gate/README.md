@@ -3,8 +3,9 @@
 Checks that a candidate HAL set still computes the model correctly, from all-position logits on held-out text. Use it for any change that is not bit-identical (hidden md5).
 
 - Corpus: 16 disjoint 2048-token windows and one 8192-token window of wikitext-2 (`corpus/`, md5s in `corpus/manifest.json`), tokenized with llama.cpp `llama-tokenize --ids --no-bos`.
-- Golden: a frozen Loom output of a reference set (positions 1536..2047 of each window), kept in `~/yah-scratch/golden2`.
+- Golden: a frozen Loom output of a reference set (positions 1536..2047 of each window), kept in `~/yah-scratch/golden4` (windows 00-03, the production set of 2026-10-04; it differs from the Oct 1 set by mean KL 5.7e-7, so compare against a golden of the current default).
 - Tiers: T1 (rounding level, windows 00-03) for exact-math rewrites with a different rounding; T2 (quantization level, windows 00-15 plus the 8K window) for changes that quantize. The limits are in `thresholds_T1.json` / `thresholds_T2.json`. T1 was calibrated from the distance between the old HIP engine and the golden (`reference_distance` inside the file): mean KL 5.3e-7, p99.9 1.8e-5, 0 top-1 flips. T2 is provisional.
+- N (`thresholds_N.json`, the default bar for non-bit-exact changes since 2026-10-04): quality-neutral, no worse than two correct engines differ: the HIP engine's full distance to the golden (mean KL 5.3e-7, p99.9 1.8e-5), 0 top-1 flips, |ln PPL ratio| <= 1e-4.
 
 Run:
 

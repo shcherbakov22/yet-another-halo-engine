@@ -1,0 +1,16 @@
+{
+ "tier": "N",
+ "note": "quality-neutral (user bar since 2026-10-04): no worse than two correct engines differ, i.e. the HIP engine's distance to the golden (thresholds_T1.json reference_distance); T1 asks a quarter of its mean KL",
+ "windows": [
+  "00",
+  "01",
+  "02",
+  "03"
+ ],
+ "from": 1536,
+ "tie": 0.1,
+ "kl_mean_max": 5.296599359403711e-07,
+ "kl_p999_max": 1.7834263987614147e-05,
+ "flips_max": 0,
+ "abs_ln_ppl_ratio_max": 0.0001
+}
