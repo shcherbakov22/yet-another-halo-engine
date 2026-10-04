@@ -348,7 +348,7 @@ def decode_free(fmt, mt, kb, B, kind, outdir, done):
 # Same values as the GEMM. YAH_AFRAG=0 leaves them out.
 AFRAG = os.environ.get("YAH_AFRAG", "1") != "0"
 AF_TILE = dict(bm=128, bn=512, wm=1, wn=16, ksub=128, dbuf=False, decahead=False, afrag=True, atiled=True, stg_minwg=0,
-               tallepi=True)
+               tallepi=True, ecoal=True)
 AF_PIPE = dict(wlate=True, bpre=2, b0early=True)
 # IQ3_S: step 1's B prefetch issued with step 0's, before the decode; otherwise the allocator copies one of its fragments
 # right after its load, which drains vmcnt(0) once per phase (IQ4_XS: 200 VGPRs with it, fused IQ3_S ffn: 216)

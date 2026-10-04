@@ -88,6 +88,8 @@ class Tile:
     tokfast: bool = False      # launch order token tiles fastest: the token tiles of a row block run together (L2 shares weights)
     afrag: bool = False        # activations not staged in LDS: the MMA's B fragments load straight from the input (needs dbuf)
     atiled: bool = False       # afrag input in fragment-major tiles: tile (t/16, k/16) is 256 contiguous halves (k fastest)
+    ecoal: bool = False        # tall epilogue: 4 lanes per token (16 rows, 64 contiguous bytes), 8 tokens per access, instead of
+                               # 2 lanes per token 32 bytes apart (fewer, larger global requests for the stores and residual loads)
     respre: int = 0            # kres tall epilogue: issue each slab group's residual loads this many groups ahead (0: at use)
     ffn_inload: bool = False   # mixed ffn: each wave loads its own format's weights at its decode (no carried union)
     ffn: bool = False          # kind "ffn": gate and up fused, weight tile rows 0-63 gate / 64-127 up of the same 64 rows
@@ -1240,9 +1242,28 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
     if masked:
         e("  %et_tok_last = index.sub %tokens, %c1 : index")
     e("  %et_lane = index.rem %tid, %c32 : index")
-    e("  %et_t = index.div %et_lane, %c2 : index")
-    e("  %et_h0 = index.rem %et_lane, %c2 : index")
-    e(f"  %et_h = index.mul %et_h0, %c{sr // 2} : index")
+    co = t.ecoal and not qg and not masked
+    assert not co or sr == 16
+    if co:
+        # lane 4 * t8 + r4: token t8 + 8 q, rows 4 r4 .. 4 r4 + 3 of the slab (one 64-byte row segment per token per access)
+        e("  %et_t = index.div %et_lane, %c4 : index")
+        e("  %et_h0 = index.rem %et_lane, %c4 : index")
+        e("  %et_h = index.mul %et_h0, %c4 : index")
+    else:
+        e("  %et_t = index.div %et_lane, %c2 : index")
+        e("  %et_h0 = index.rem %et_lane, %c2 : index")
+        e(f"  %et_h = index.mul %et_h0, %c{sr // 2} : index")
+
+    def qoff(y, q):
+        # per-access offsets: LDS (slab) and global (output / residual); old mapping: rows + 4 q in both
+        if co:
+            e(f"  %et_ql{y} = index.constant {8 * q * (sr + EPAD)} : index")
+            e(f"  %et_qk{y} = index.constant {8 * q} : index")
+            e(f"  %et_qg{y} = index.mul %et_qk{y}, %m_rows : index")
+            return f"%et_ql{y}", f"%et_qg{y}"
+        e(f"  %et_q{y}c = index.constant {4 * q} : index")
+        return f"%et_q{y}c", f"%et_q{y}c"
+    qo = {}
     e("  %et_tt = index.mul %et_t, %et_cs : index")
     e("  %et_rd = index.add %et_tt, %et_h : index")
     e("  %et_rowb = index.add %m_origin, %et_h : index")
@@ -1258,8 +1279,8 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
         e(f"  %et_ob{q0} = index.add %et_tm{q0}, %et_row{g} : index")
         for q in range(sr // 8):
             y = f"{q0}_{q}"
-            e(f"  %et_q{y}c = index.constant {4 * q} : index")
-            e(f"  %et_oi{y} = index.add %et_ob{q0}, %et_q{y}c : index")
+            qo[y] = qoff(y, q)
+            e(f"  %et_oi{y} = index.add %et_ob{q0}, {qo[y][1]} : index")
             e(f"  %et_rf{y} = vector.load %res_flat[%et_oi{y}] : view<[%out_total]xf32> -> vector<4xf32>")
     if pre:
         # residual loads run `pre` slab groups ahead of their adds: one DRAM round trip per wave, not one per group
@@ -1278,7 +1299,7 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                 e(f"  vector.fragment.store<result> %acc{i * FN + j}, %et_view[%et_r{i}_{j}, %c0] shape [%m, %n] : {V8}, view<{sr}x16xf32, %et_lay>")
             for q in range(sr // 8):
                 y = f"{q0}_{q}"
-                e(f"  %et_ri{y} = index.add %et_rd, %et_q{y}c : index")
+                e(f"  %et_ri{y} = index.add %et_rd, {qo[y][0]} : index")
                 e(f"  %et_v{y} = vector.load %et_flat[%et_ri{y}] : view<{(sr + EPAD) * 16}xf32> -> vector<4xf32>")
                 e(f"  %et_rs{y} = vector.addf %et_rf{y}, %et_v{y} : vector<4xf32>")
                 e(f"  vector.store %et_rs{y}, %out_flat[%et_oi{y}] : vector<4xf32>, view<[%out_total]xf32>")
@@ -1319,10 +1340,10 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                 e(f"  scf.if %et_ok{q0} {{")
             for q in range(sr // 8):
                 y = f"{q0}_{q}"
-                e(f"  %et_q{y}c = index.constant {4 * q} : index")
-                e(f"  %et_ri{y} = index.add %et_rd, %et_q{y}c : index")
+                ql, qg_ = qoff(y, q)
+                e(f"  %et_ri{y} = index.add %et_rd, {ql} : index")
                 e(f"  %et_v{y} = vector.load %et_flat[%et_ri{y}] : view<{(sr + EPAD) * 16}xf32> -> vector<4xf32>")
-                e(f"  %et_oi{y} = index.add %et_ob{q0}, %et_q{y}c : index")
+                e(f"  %et_oi{y} = index.add %et_ob{q0}, {qg_} : index")
                 val = f"%et_v{y}"
                 if kr:
                     e(f"  %et_rf{y} = vector.load %res_flat[%et_oi{y}] : view<[%out_total]xf32> -> vector<4xf32>")
