@@ -31,6 +31,10 @@ Q4FMIX = False
 # Q4DFMA (with Q4FMIX): fptrunc(fma(dsc, q, -dm)) straight from the nibble, without the vector multiply and the opaque 1.0:
 # dsc * q has <= 21 significant bits, so it is exact and the fma sees the same value (and zero sign) as fma(dsc * q, 1, -dm).
 Q4DFMA = True
+# F16PAIR (IQ4_XS): the u bytes (q + 128) as f16 subnormals: w & 0x00ff00ff and (w >> 8) & 0x00ff00ff are pairs c * 2^-24
+# (exact; FP16 denormals are on) for 3 ops per 4 values instead of a v_cvt_f32_ubyteN each; narrowed as
+# fptrunc(fma(dsc * 2^24, c * 2^-24, -128 * dsc)): the scaled dsc is exact, so the fma sees the same exact product.
+F16PAIR = True
 # Q3_FMIX (Q3_K): narrow dsc * q as fptrunc(fma(dsc, q, -0.0)) instead of fptrunc(dsc * q): d * sc * q has <= 19 significant
 # bits, so the product is exact either way, and the -0.0 addend keeps a zero product's sign (q = 0 with dsc < 0 stays -0; the
 # MMA output keeps it too: +0 there changed the GEMM hashes). Selects v_fma_mix{lo,hi} instead of mul + v_cvt_f16_f32.
@@ -172,14 +176,34 @@ def iq4xs_compute(v, gb):
         # The bias rides v_fma_mix's f32 addend (no literal).
         for part in ("lo", "hi"):
             e(f"    %cu{part}{u} = vector.table.lookup %kvtu[%n{part}{u}] : vector<16xi8>, vector<16xi8> -> vector<16xi8>")
-            e(f"    %fu{part}{u} = vector.uitofp %cu{part}{u} : vector<16xi8> to vector<16xf32>")
+            if F16PAIR:
+                e(f"    %cuw{part}{u} = vector.bitcast %cu{part}{u} : vector<16xi8> to vector<4xi32>")
+                for w in range(4):
+                    tw = f"{part}{u}_{w}"
+                    # bytes 0 / 2 and 1 / 3 in the low bits of the two halves: f16 subnormals c * 2^-24 (exact)
+                    e(f"    %cw{tw} = vector.extract %cuw{part}{u}[{w}] : vector<4xi32> -> i32")
+                    e(f"    %cwe{tw} = scalar.andi %cw{tw}, %fpm00ff : i32")
+                    e(f"    %cws{tw} = scalar.shrui %cw{tw}, %c8i_fp : i32")
+                    e(f"    %cwo{tw} = scalar.andi %cws{tw}, %fpm00ff : i32")
+                    for hh, src in ((0, f"%cwe{tw}"), (1, f"%cwo{tw}")):
+                        e(f"    %cwv{tw}_{hh} = vector.from_elements {src} : vector<1xi32>")
+                        e(f"    %cwh{tw}_{hh} = vector.bitcast %cwv{tw}_{hh} : vector<1xi32> to vector<2xf16>")
+            else:
+                e(f"    %fu{part}{u} = vector.uitofp %cu{part}{u} : vector<16xi8> to vector<16xf32>")
         e(f"    %nb{u} = scalar.mulf %dsc{u}, %cm128f_iq : f32")
+        if F16PAIR:
+            e(f"    %dsc24_{u} = scalar.mulf %dsc{u}, %c2p24f_iq : f32")
         # scalar form: fptrunc(fma) pairs feeding from_elements select as v_fma_mix{lo,hi}_f16
         for part in ("lo", "hi"):
             hs = []
             for j in range(16):
-                e(f"    %y{part}{u}_{j} = vector.extract %fu{part}{u}[{j}] : vector<16xf32> -> f32")
-                e(f"    %m{part}{u}_{j} = scalar.fmaf %dsc{u}, %y{part}{u}_{j}, %nb{u} : f32")
+                if F16PAIR:
+                    w, b = divmod(j, 4)
+                    e(f"    %yh{part}{u}_{j} = vector.extract %cwh{part}{u}_{w}_{b % 2}[{b // 2}] : vector<2xf16> -> f16")
+                    e(f"    %y{part}{u}_{j} = scalar.extf %yh{part}{u}_{j} : f16 to f32")
+                else:
+                    e(f"    %y{part}{u}_{j} = vector.extract %fu{part}{u}[{j}] : vector<16xf32> -> f32")
+                e(f"    %m{part}{u}_{j} = scalar.fmaf {'%dsc24_' if F16PAIR else '%dsc'}{u}, %y{part}{u}_{j}, %nb{u} : f32")
                 e(f"    %t{part}{u}_{j} = scalar.fptrunc %m{part}{u}_{j} : f32 to f16")
                 hs.append(f"%t{part}{u}_{j}")
             e(f"    %h{part}{u} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
@@ -1041,7 +1065,8 @@ def iq4xs_setup():
     L += [f"  %kvu{i} = scalar.constant {(v + 128) - 256 if v + 128 > 127 else v + 128} : i8" for i, v in enumerate(IQ4_KVALUES)]
     L.append("  %kvtu = vector.from_elements " + ", ".join(f"%kvu{i}" for i in range(16)) + " : vector<16xi8>")
     L += ["  %c128f_iq = scalar.constant 128.0 : f32", "  %c128v_iq = vector.splat %c128f_iq : vector<16xf32>",
-          "  %cm128f_iq = scalar.constant -128.0 : f32"]
+          "  %cm128f_iq = scalar.constant -128.0 : f32", "  %c2p24f_iq = scalar.constant 16777216.0 : f32",
+          "  %fpm00ff = scalar.constant 16711935 : i32", "  %c8i_fp = scalar.constant 8 : i32"]
     L += ["  %c15b = scalar.constant 15 : i8", "  %c4b = scalar.constant 4 : i8",
           "  %m15v = vector.splat %c15b : vector<16xi8>", "  %s4v = vector.splat %c4b : vector<16xi8>"]
     return L
