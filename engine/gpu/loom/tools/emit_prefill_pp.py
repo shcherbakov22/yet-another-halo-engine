@@ -368,14 +368,14 @@ AF = {
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),   # -12.1%
     ("iq3s", "kres", 320, 68): dict(AF_PIPE3),                                   # -8.6%
     ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4),                    # -10.4%
-    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=2),                   # -8.2%
-    ("q4k", "kres", 320, 68): dict(AF_KQ),                                      # -10.4%
+    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=2, respre=2),         # -8.2%
+    ("q4k", "kres", 320, 68): dict(AF_KQ, respre=2),                            # -10.4%
     ("q4k", "swiglu", 1088, 20): dict(AF_KQ, swepi=False),                      # -7.7%
     # attention o-proj / DeltaNet ssm_out (K = 6144; input: the attention output, postnorm_t.hal)
     ("iq3s", "kres", 320, 24): dict(AF_PIPE3),                                   # -8.8%
-    ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4),                   # -8.5%
+    ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=2),         # -8.5%
     ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4),                    # -8.8%
-    ("q4k", "kres", 320, 24): dict(AF_KQ),                                      # -5.3%
+    ("q4k", "kres", 320, 24): dict(AF_KQ, respre=2),                            # -5.3%
     # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
     ("iq3s", "kstore", 640, 20): dict(AF_PIPE3),                                 # -9.6%
     ("iq4xs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=2),                  # -10.3%
