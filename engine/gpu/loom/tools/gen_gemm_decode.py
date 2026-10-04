@@ -24,6 +24,9 @@ VDECW_FR = False
 # two shift-adds (n | n << 7, t | t << 14: the bits are disjoint, so OR is the add). Per byte, s = 0: g ^ 0x80 = g + 128;
 # s = 1: (g ^ 0x7f) + 1 = 128 - g (grid magnitudes 1..127: no borrow, no carry). Same bytes as ((g ^ -s) + s) ^ 0x80.
 IQ3_SGN2 = False
+# IQ2_W (IQ2_XXS / IQ2_XS): the IQ3 word path (VDEC_W, IQ3_U8F, VDECW_FR) for the IQ2 grids too. Grid magnitudes are 8 / 25 / 43
+# (nonzero, < 128) and d * (2n + 1) / 8 * mag has <= 22 significant bits: the same exactness argument, bit-identical.
+IQ2_W = False
 # Q4FMIX (Q4_K/Q5_K): narrow as fptrunc(fma(e, 1, -dm)) instead of fptrunc(e - dm). The product by 1 is exact: bit-identical.
 # It selects v_fma_mix{lo,hi}. v_cvt_f16_f32 writes only v0..v127: with 128 VGPRs of accumulators live, each result spills one.
 # The 1.0 comes from gb & ~gb so the canonicalizer cannot fold the fma back into a subf.
@@ -786,7 +789,7 @@ def iq2xxs_compute(v, gb):
             e(f"    %sidl_{t} = index.max %sidx_{t}, %c0 : index")
             e(f"    %sidc_{t} = index.min %sidl_{t}, %c127 : index")
             e(f"    %ks8_{t} = view.load %ksigns_view[%sidc_{t}] : view<128xi8> -> i8")
-            _vdec_pair(e, t, f"%gw0_{t}", f"%gw1_{t}", f"%ks8_{t}", f"%dsc_v8_{u}", f"%col{u}", u, li)
+            _vdec_pair(e, t, f"%gw0_{t}", f"%gw1_{t}", f"%ks8_{t}", f"%dsc_v8_{u}", f"%col{u}", u, li, f"%dsc{u}" if IQ2_W else None)
     return L
 
 
@@ -859,12 +862,14 @@ def iq2xs_compute(v, gb):
             e(f"    %sidl_{t} = index.max %sidx_{t}, %c0 : index")
             e(f"    %sidc_{t} = index.min %sidl_{t}, %c127 : index")
             e(f"    %ks8_{t} = view.load %ksigns_view[%sidc_{t}] : view<128xi8> -> i8")
-            _vdec_pair(e, t, f"%gw0_{t}", f"%gw1_{t}", f"%ks8_{t}", f"%dsc_v8_{l // 2}_{u}", f"%col{u}", u, l)
+            _vdec_pair(e, t, f"%gw0_{t}", f"%gw1_{t}", f"%ks8_{t}", f"%dsc_v8_{l // 2}_{u}", f"%col{u}", u, l,
+                       f"%dsc{l // 2}_{u}" if IQ2_W else None)
     return L
 
 
 def iq2xs_setup():
-    return (["  %fhalf = scalar.constant 0.5 : f32", "  %fquarter = scalar.constant 0.25 : f32",
+    return (["  %c14i_vdw = scalar.constant 14 : i32", "  %c80x4_iq3 = scalar.constant -2139062144 : i32", "  %cm128f_iq3 = scalar.constant -128.0 : f32",
+             "  %fhalf = scalar.constant 0.5 : f32", "  %fquarter = scalar.constant 0.25 : f32",
              "  %c1023 = index.constant 1023 : index",
              "  %c16i_2 = scalar.constant 16 : i32", "  %c65535i_2 = scalar.constant 65535 : i32",
              "  %c511i_2 = scalar.constant 511 : i32", "  %c9i_2 = scalar.constant 9 : i32",
@@ -875,7 +880,9 @@ def iq2xs_setup():
 
 
 def iq2xxs_setup():
-    return (["  %fhalf = scalar.constant 0.5 : f32", "  %fquarter = scalar.constant 0.25 : f32",
+    return (["  %c14i_vdw = scalar.constant 14 : i32", "  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32", "  %vdw_ff = scalar.constant 255 : i32",
+             "  %c80x4_iq3 = scalar.constant -2139062144 : i32", "  %cm128f_iq3 = scalar.constant -128.0 : f32",
+             "  %fhalf = scalar.constant 0.5 : f32", "  %fquarter = scalar.constant 0.25 : f32",
              "  %c511 = index.constant 511 : index"]
             + _stage_table("grid", "%grid_na", 512, "i32", 4)
             + _stage_table("ksigns", "%ksigns_na", 128, "i8", 1))
