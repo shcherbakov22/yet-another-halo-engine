@@ -994,10 +994,12 @@ class LoomPrefill {
 
   void RunDeltaNet(std::uint32_t l, const std::string& pre, bool qkv_af, bool gate_af) {
     const std::uint32_t si = l - l / cfg_.full_attention_interval;
-    RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af);
-    RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
+    // alpha / beta first: they read the norm's row-major copy (21 MB), which the qkv / gate GEMMs would evict from the
+    // last-level cache (0.18 vs ~0.39 M cycles each)
     RunKstore(pre + "ssm_alpha.weight", *alpha_);
     RunKstore(pre + "ssm_beta.weight", *beta_);
+    RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af);
+    RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
     const hrx_buffer_ref_t st{state_->handle, std::size_t{si} * kTs * kState * kState * 4,
                               std::size_t{kTs} * kState * kState * 4};
