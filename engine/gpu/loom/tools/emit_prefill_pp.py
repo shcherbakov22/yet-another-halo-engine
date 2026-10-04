@@ -102,6 +102,35 @@ def postnorm_tiled(text):
     return text
 
 
+def postnorm_heads(text, h0, nh, B):
+    """Restrict yah_ssm_postnorm_fp16 to heads h0 .. h0 + nh - 1 (config head_count = B * nh rows): row r is token r / nh,
+    head h0 + r % nh, i.e. flat row (r / nh) * 48 + h0 + r % nh of the full [B][48][128] buffers. Same math per row."""
+    def r(a, b):
+        nonlocal text
+        assert text.count(a) == 1, a[:60]
+        text = text.replace(a, b)
+    r("  %io_total = index.mul %head_count, %c128 : index\n",
+      f"  %pn_full = index.constant {48 * B * 128} : index\n"
+      "  %io_total = index.add %pn_full, %c0 : index\n")
+    r("  %head = index.add %head0, %c0 : index\n  %in_range = index.cmp ult, %head, %head_count : index\n",
+      f"  %pn_nh = index.constant {nh} : index\n"
+      f"  %pn_h0 = index.constant {h0} : index\n"
+      "  %pn_c48 = index.constant 48 : index\n"
+      "  %pn_tok = index.div %head0, %pn_nh : index\n"
+      "  %pn_hr = index.rem %head0, %pn_nh : index\n"
+      "  %pn_h = index.add %pn_hr, %pn_h0 : index\n"
+      "  %pn_f = index.mul %pn_tok, %pn_c48 : index\n"
+      "  %head = index.add %pn_f, %pn_h : index\n"
+      "  %in_range = index.cmp ult, %head0, %head_count : index\n")
+    return text
+
+
+# DNSPLIT: DeltaNet as two dispatches, heads 0-39 (80 workgroups: two full rounds of 40 slots) and 40-47 (16), with the
+# postnorm split the same way; the second part writes its own output buffer, so the first part's postnorm depends only on
+# the first DeltaNet part and runs beside the second (whose 16 workgroups fill 16 of 40 slots). Same math per head.
+DNSPLIT = (40, 8)
+
+
 def conv_n16(text):
     """yah_ssm_conv_kq handing DeltaNet (gen_gdn_chunk CONV16) its f16 inputs: conv_out holds f16(v) for the v channels and
     f16(k * inv_k), f16(q * q_scale) for the q / k channels, the f32 products and rounding DeltaNet did itself on the f32
@@ -651,6 +680,14 @@ def main():
         conv_src = os.path.join(tmp, "yah_ssm_conv_kq_n16.loom")
         open(conv_src, "w").write(text)
     geom.append(("rowsplit.hal", 0, 2, 0))
+    dn_parts = []
+    if B % 32 == 0 and DNSPLIT:
+        ha, hb = DNSPLIT
+        for tag, h0, nh in (("a", 0, ha), ("b", ha, hb)):
+            src = os.path.join(tmp, f"yah_deltanet_{tag}.loom")
+            open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
+            dn_parts.append((tag, h0, nh, src))
+        geom.append(("dnsplit", 0, ha, hb))
 
     # loom_forward_pp reads the launch geometry from dispatch.txt instead of recomputing the grid.
     # So the dispatch site and the compiled kernel cannot disagree; a mismatch is silent and wrong, not a crash.
@@ -705,6 +742,13 @@ def main():
     # the DeltaNet postnorm, fragment-major for an afrag ssm_out
     postnorm_t_src = os.path.join(tmp, "yah_ssm_postnorm_tiled.loom")
     open(postnorm_t_src, "w").write(postnorm_tiled(open(os.path.join(E.LOOM, "yah_ssm_postnorm_gate_f16.loom")).read()))
+    pn_parts = []
+    for tag, h0, nh, _ in dn_parts:
+        base = open(os.path.join(E.LOOM, "yah_ssm_postnorm_gate_f16.loom")).read()
+        for t_, txt in (("", postnorm_heads(base, h0, nh, B)), ("_t", postnorm_tiled(postnorm_heads(base, h0, nh, B)))):
+            src = os.path.join(tmp, f"yah_ssm_postnorm{t_}_{tag}.loom")
+            open(src, "w").write(txt)
+            pn_parts.append((f"postnorm{t_}_{tag}.hal", src, nh))
     fixed = [
         ("yah_residual_add_1d_f32.loom", "accum.hal",
          ["yah_residual_1d.dim=%d" % (5120 * B)]),
@@ -732,6 +776,11 @@ def main():
           "yah_deltanet.num_heads=48"]),
         ("yah_ssm_postnorm_gate_f16.loom", "postnorm.hal",
          ["yah_ssm_postnorm_fp16.head_count=%d" % (48 * B)]),
+        *[(src, f"rowsplit_{tag}.hal",
+           ["yah_deltanet.batch=%d" % B, "yah_deltanet.qkv_size=10240",
+            "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
+            "yah_deltanet.num_heads=48"]) for tag, _, _, src in dn_parts],
+        *[(src, hal, ["yah_ssm_postnorm_fp16.head_count=%d" % (nh * B)]) for hal, src, nh in pn_parts],
         ("yah_unpack_qg_f32.loom", "unpack.hal",
          ["yah_unpack_qg.batch=%d" % B, "yah_unpack_qg.num_heads=24",
           "yah_unpack_qg.head_dim=256"]),
