@@ -399,13 +399,13 @@ AF = {
     ("iq3s", "swiglu", 1088, 20): dict(AF_PIPE3, lhs_stream=2, swepi=False),     # -11.6%
     ("iq4xs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),    # -10.9%
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),   # -12.1%
-    ("iq3s", "kres", 320, 68): dict(AF_PIPE3),                                  # -8.6%
+    ("iq3s", "kres", 320, 68): dict(AF_PIPE3, persist=dict(b0early=True, lhs_stream=2)), # -8.6%
     ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -10.4%
     ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=2, respre=1, persist=True), # -8.2%
     ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),             # -10.4%
     ("q4k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),                     # -7.7%
     # attention o-proj / DeltaNet ssm_out (K = 6144; input: the attention output, postnorm_t.hal)
-    ("iq3s", "kres", 320, 24): dict(AF_PIPE3),                                  # -8.8%
+    ("iq3s", "kres", 320, 24): dict(AF_PIPE3, persist=dict(b0early=True, lhs_stream=2)), # -8.8%
     ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -8.5%
     ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -8.8%
     ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True),             # -5.3%
@@ -494,8 +494,10 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
             rows.append(r)
     if persist and kind == "kres" and B // t.bn > 1 and 2 * kb >= gen_kres_persist.SLICES:
         # the persistent kres (gen_kres_persist): grid y = 1, each workgroup runs every token tile of its row block
-        text = gen_kres_persist.persist(TG.gen(fmt, "kres", t, False),
-                                        TG.gen(fmt, "kstore", dataclasses.replace(t, respre=0), False), B // t.bn)
+        # persist: True, or a dict of knobs for the persistent variant (its slice loads need registers: IQ3_S drops b0early 2)
+        pt = dataclasses.replace(t, **persist) if isinstance(persist, dict) else t
+        text = gen_kres_persist.persist(TG.gen(fmt, "kres", pt, False),
+                                        TG.gen(fmt, "kstore", dataclasses.replace(pt, respre=0), False), B // t.bn)
         r = _emit_gen(lambda f, k: text, t.bn, fmt, mt, kb, B, out[:-4] + ".af.p.hal", outdir, kind, t.rowgrp)
         if r:
             rows.append(r)
