@@ -428,6 +428,16 @@ def iq3s_compute(v, gb):
             gws.append(f"%gw_{t}")
         for pp in range(4):
             e(f"    %sgb8_{u}_{pp} = vector.extract {sg}[{pp}] : vector<4xi8> -> i8")
+            if _sgtab():
+                W = IQ3_SGTAB_W
+                e(f"    %sgbi_{u}_{pp} = scalar.extui %sgb8_{u}_{pp} : i8 to i32")
+                e(f"    %sgbx_{u}_{pp} = index.cast %sgbi_{u}_{pp} : i32 to index")
+                e(f"    %sgbc_{u}_{pp} = index.assume %sgbx_{u}_{pp} [range(%sgbx_{u}_{pp}, 0, 255)] : index")
+                e(f"    %sgi_{u}_{pp} = index.mul %sgbc_{u}_{pp}, %sgt_cw : index")
+                e(f"    %sgt_{u}_{pp} = vector.load %sgt_view[%sgi_{u}_{pp}] : view<{256 * W}xi32> -> vector<{W}xi32>")
+                _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], None, f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}",
+                           sgt=f"%sgt_{u}_{pp}")
+                continue
             _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], f"%sgb8_{u}_{pp}", f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}")
     return L
 
@@ -451,7 +461,7 @@ def iq3s_setup():
             "    %gv = view.load %grid_g[%gidx] : view<512xi32> -> i32",
             "    view.store %gv, %grid_view[%gidx] : i32, view<512xi32>",
             "    scf.yield %gm : index",
-            "  }"]
+            "  }"] + (_sign_table(256, from_ksigns=False) if _sgtab() else [])
 
 
 def iq3xxs_loads(p, blk, gb):
@@ -559,27 +569,29 @@ def _sgtab():
     return IQ3_SGTAB and IQ3_SGN2 and IQ3_U8F and VDECW_FR and VDEC_W
 
 
-def _sign_table():
-    """The IQ3_SGTAB table: 128 entries of (s0, s1) or (k0, s0, k1, s1) from ksigns (see IQ3_SGTAB), written in a loop of
+def _sign_table(n=128, from_ksigns=True):
+    """The IQ3_SGTAB table: n entries of (s0, s1) or (k0, s0, k1, s1) of sign byte ksigns[i] (IQ3_XXS) or i itself (IQ3_S),
+    see IQ3_SGTAB; written in a loop of
     32-entry steps so any workgroup of at least one wave covers it (entry min(i + tid, 127): duplicates write the same words);
     the first K phase's leading barrier publishes it."""
     W = IQ3_SGTAB_W
     L = [f"  %sgt_cw = index.constant {W} : index",
-         "  %sgt_g = buffer.view %ksigns_na[%base] : buffer -> view<128xi8>",
-         f"  %sgt_bytes = index.constant {512 * W} : offset",
+         *(["  %sgt_g = buffer.view %ksigns_na[%base] : buffer -> view<128xi8>"] if from_ksigns else []),
+         f"  %sgt_bytes = index.constant {4 * n * W} : offset",
          "  %sgt_l = buffer.alloca<workgroup> align(16) %sgt_bytes : buffer",
-         f"  %sgt_view = buffer.view %sgt_l[%base] : buffer -> view<{128 * W}xi32>",
-         "  %sgt_max = index.constant 127 : index",
+         f"  %sgt_view = buffer.view %sgt_l[%base] : buffer -> view<{n * W}xi32>",
+         f"  %sgt_max = index.constant {n - 1} : index",
          "  %sgt_step = index.constant 32 : index",
-         "  %sgt_cnt = index.constant 128 : index",
+         f"  %sgt_cnt = index.constant {n} : index",
          "  %sgt_c4i = scalar.constant 4 : i32", "  %sgt_c7i = scalar.constant 7 : i32", "  %sgt_c14i = scalar.constant 14 : i32",
          "  %sgt_c15i = scalar.constant 15 : i32", "  %sgt_ones = scalar.constant 16843009 : i32",
          "  %sgt_k80 = scalar.constant -2139062144 : i32",
          "  %sgt_sink = scf.for %sgt_i = [%c0 to %sgt_cnt step %sgt_step](%sgt_m = %c0 : index) -> (index) {",
          "    %sgt_x0 = index.add %sgt_i, %tid : index",
          "    %sgt_x = index.min %sgt_x0, %sgt_max : index",
-         "    %sgt_b8 = view.load %sgt_g[%sgt_x] : view<128xi8> -> i8",
-         "    %sgt_b = scalar.extui %sgt_b8 : i8 to i32"]
+         *(["    %sgt_b8 = view.load %sgt_g[%sgt_x] : view<128xi8> -> i8",
+            "    %sgt_b = scalar.extui %sgt_b8 : i8 to i32"] if from_ksigns else
+           ["    %sgt_b = index.cast %sgt_x : index to i32"])]
     ws = []
     for h in range(2):
         src = "%sgt_b" if h == 0 else "%sgt_bh"
@@ -595,7 +607,7 @@ def _sign_table():
         ws += [f"%sgt_k{h}", f"%sgt_s{h}"] if W == 4 else [f"%sgt_s{h}"]
     L += [f"    %sgt_e = vector.from_elements {', '.join(ws)} : vector<{W}xi32>",
           "    %sgt_xi = index.mul %sgt_x, %sgt_cw : index",
-          f"    vector.store %sgt_e, %sgt_view[%sgt_xi] : vector<{W}xi32>, view<{128 * W}xi32>",
+          f"    vector.store %sgt_e, %sgt_view[%sgt_xi] : vector<{W}xi32>, view<{n * W}xi32>",
           "    scf.yield %sgt_m : index",
           "  }"]
     return L
