@@ -172,10 +172,10 @@ def iq4xs_compute(v, gb):
         q = next(it)
         e(f"    %g{u} = scalar.addi {gb}, %c{u}i : i32")
         e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
-        e(f"    %sh2_{u} = scalar.shli %g{u}, %c1i : i32")
         if IQ4_SC4:
             # scales_l nibble g is bits 4g .. 4g + 3 of the header's second word (byte g/2, nibble g%2); the high bits
             # join with one v_lshl_add (disjoint bits)
+            e(f"    %sh2_{u} = scalar.shli %g{u}, %c1i : i32")
             e(f"    %sh4_{u} = scalar.shli %g{u}, %c2i : i32")
             e(f"    %slw{u} = scalar.shrui %hdw1, %sh4_{u} : i32")
             e(f"    %sc_l{u} = scalar.andi %slw{u}, %c15i : i32")
@@ -185,6 +185,7 @@ def iq4xs_compute(v, gb):
         else:
             e(f"    %gp{u} = scalar.andi %g{u}, %c1i : i32")
             e(f"    %sh4_{u} = scalar.shli %gp{u}, %c2i : i32")
+            e(f"    %sh2_{u} = scalar.shli %g{u}, %c1i : i32")
             # scales_l[g/2] is byte g/2 of the header's second word
             e(f"    %slg{u} = scalar.shrui %g{u}, %c1i : i32")
             e(f"    %sls{u} = scalar.shli %slg{u}, %c3i : i32")
@@ -287,7 +288,16 @@ def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None, sgt=None):
         if sgn2 and sgt is None:
             e(f"    %c128i_sg2_{t} = scalar.constant 128 : i32")
             e(f"    %c16384i_sg2_{t} = scalar.constant 16384 : i32")
+        if sgt is not None and IQ3_SGTAB_W == 1:
+            e(f"    %wsw_{t} = vector.extract {sgt}[0] : vector<1xi32> -> i32")
+            e(f"    %wsw1_{t} = scalar.shrui %wsw_{t}, %c4i : i32")
         for h, gw in ((0, gw0), (1, gw1)):
+            if sgt is not None and IQ3_SGTAB_W == 1:
+                e(f"    %ws1{h}_{t} = scalar.andi {'%wsw_' if h == 0 else '%wsw1_'}{t}, %vdw_ones : i32")
+                e(f"    %wsk{h}_{t} = scalar.subi %c80x4_iq3, %ws1{h}_{t} : i32")
+                e(f"    %wsx{h}_{t} = scalar.xori {gw}, %wsk{h}_{t} : i32")
+                e(f"    %wu{h}_{t} = scalar.addi %wsx{h}_{t}, %ws1{h}_{t} : i32")
+                continue
             if sgt is not None and IQ3_SGTAB_W == 2:
                 e(f"    %ws1{h}_{t} = vector.extract {sgt}[{h}] : vector<2xi32> -> i32")
                 e(f"    %wsk{h}_{t} = scalar.subi %c80x4_iq3, %ws1{h}_{t} : i32")
@@ -491,21 +501,23 @@ def iq3s_compute(v, gb):
             e(f"    %gid_{t} = index.assume %gix_{t} [range(%gix_{t}, 0, 511)] : index")
             e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<512xi32> -> i32")
             gws.append(f"%gw_{t}")
-        if _sgtab() and IQ3_GADDR and IQ3_SGTAB_W == 2:
+        if _sgtab() and IQ3_GADDR and IQ3_SGTAB_W in (1, 2):
             e(f"    %sgw1_{u} = vector.bitcast {sg} : vector<4xi8> to vector<1xi32>")
             e(f"    %sgw_{u} = vector.extract %sgw1_{u}[0] : vector<1xi32> -> i32")
         for pp in range(4):
-            if _sgtab() and IQ3_GADDR and IQ3_SGTAB_W == 2:   # byte offset (word >> (8 pp - 3)) & 0x7f8
+            if _sgtab() and IQ3_GADDR and IQ3_SGTAB_W in (1, 2):   # byte offset (word >> (8 pp - sh)) & (255 << sh)
+                W = IQ3_SGTAB_W; sh = 2 if W == 1 else 3; top = 255 << sh
                 if pp == 0:
-                    e(f"    %sbs_{u}_{pp} = scalar.shli %sgw_{u}, %c3i_ga : i32")
+                    e(f"    %sbs_{u}_{pp} = scalar.shli %sgw_{u}, %c{sh}i_ga : i32")
                 else:
-                    e(f"    %sbc_{u}_{pp} = scalar.constant {8 * pp - 3} : i32")
+                    e(f"    %sbc_{u}_{pp} = scalar.constant {8 * pp - sh} : i32")
                     e(f"    %sbs_{u}_{pp} = scalar.shrui %sgw_{u}, %sbc_{u}_{pp} : i32")
-                e(f"    %sby_{u}_{pp} = scalar.andi %sbs_{u}_{pp}, %c2040i_ga : i32")
+                e(f"    %sbm_{u}_{pp} = scalar.constant {top} : i32")
+                e(f"    %sby_{u}_{pp} = scalar.andi %sbs_{u}_{pp}, %sbm_{u}_{pp} : i32")
                 e(f"    %sbx_{u}_{pp} = index.cast %sby_{u}_{pp} : i32 to index")
-                e(f"    %sbd_{u}_{pp} = index.assume %sbx_{u}_{pp} [range(%sbx_{u}_{pp}, 0, 2040)] : index")
-                e(f"    %sgb_{u}_{pp} = vector.load %sgt_bview[%sbd_{u}_{pp}] : view<2048xi8> -> vector<8xi8>")
-                e(f"    %sgt_{u}_{pp} = vector.bitcast %sgb_{u}_{pp} : vector<8xi8> to vector<2xi32>")
+                e(f"    %sbd_{u}_{pp} = index.assume %sbx_{u}_{pp} [range(%sbx_{u}_{pp}, 0, {top})] : index")
+                e(f"    %sgb_{u}_{pp} = vector.load %sgt_bview[%sbd_{u}_{pp}] : view<{1024 * W}xi8> -> vector<{4 * W}xi8>")
+                e(f"    %sgt_{u}_{pp} = vector.bitcast %sgb_{u}_{pp} : vector<{4 * W}xi8> to vector<{W}xi32>")
                 _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], None, f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}",
                            sgt=f"%sgt_{u}_{pp}")
                 continue
@@ -625,17 +637,19 @@ def iq3xxs_compute(v, gb):
             e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<256xi32> -> i32")
             gws.append(f"%gw_{t}")
         for pp in range(4):
-            if _sgtab() and IQ3_GADDR and IQ3_SGTAB_W == 2:
+            if _sgtab() and IQ3_GADDR and IQ3_SGTAB_W in (1, 2):
+                W = IQ3_SGTAB_W; sh = 2 if W == 1 else 3; top = 127 << sh
                 if pp == 0:
-                    e(f"    %sbs_{u}_{pp} = scalar.shli %aux{u}, %c3i_ga : i32")
+                    e(f"    %sbs_{u}_{pp} = scalar.shli %aux{u}, %c{sh}i_ga : i32")
                 else:
-                    e(f"    %sbc_{u}_{pp} = scalar.constant {7 * pp - 3} : i32")
+                    e(f"    %sbc_{u}_{pp} = scalar.constant {7 * pp - sh} : i32")
                     e(f"    %sbs_{u}_{pp} = scalar.shrui %aux{u}, %sbc_{u}_{pp} : i32")
-                e(f"    %sby_{u}_{pp} = scalar.andi %sbs_{u}_{pp}, %c1016i_ga : i32")
+                e(f"    %sbm_{u}_{pp} = scalar.constant {top} : i32")
+                e(f"    %sby_{u}_{pp} = scalar.andi %sbs_{u}_{pp}, %sbm_{u}_{pp} : i32")
                 e(f"    %sbx_{u}_{pp} = index.cast %sby_{u}_{pp} : i32 to index")
-                e(f"    %sbd_{u}_{pp} = index.assume %sbx_{u}_{pp} [range(%sbx_{u}_{pp}, 0, 1016)] : index")
-                e(f"    %sgb_{u}_{pp} = vector.load %sgt_bview[%sbd_{u}_{pp}] : view<1024xi8> -> vector<8xi8>")
-                e(f"    %sgt_{u}_{pp} = vector.bitcast %sgb_{u}_{pp} : vector<8xi8> to vector<2xi32>")
+                e(f"    %sbd_{u}_{pp} = index.assume %sbx_{u}_{pp} [range(%sbx_{u}_{pp}, 0, {top})] : index")
+                e(f"    %sgb_{u}_{pp} = vector.load %sgt_bview[%sbd_{u}_{pp}] : view<{512 * W}xi8> -> vector<{4 * W}xi8>")
+                e(f"    %sgt_{u}_{pp} = vector.bitcast %sgb_{u}_{pp} : vector<{4 * W}xi8> to vector<{W}xi32>")
                 _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], None, f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}",
                            sgt=f"%sgt_{u}_{pp}")
                 continue
@@ -724,6 +738,9 @@ def _sign_table(n=128, from_ksigns=True):
               f"    %sgt_s{h} = scalar.andi %sgt_p{h}, %sgt_ones : i32",
               f"    %sgt_k{h} = scalar.subi %sgt_k80, %sgt_s{h} : i32"]
         ws += [f"%sgt_k{h}", f"%sgt_s{h}"] if W == 4 else [f"%sgt_s{h}"]
+    if W == 1:   # both spread nibbles in one word: s0 in bit 0, s1 in bit 4 of each byte
+        L += ["    %sgt_s1h = scalar.shli %sgt_s1, %sgt_c4i : i32", "    %sgt_e1 = scalar.ori %sgt_s0, %sgt_s1h : i32"]
+        ws = ["%sgt_e1"]
     L += [f"    %sgt_e = vector.from_elements {', '.join(ws)} : vector<{W}xi32>",
           "    %sgt_xi = index.mul %sgt_x, %sgt_cw : index",
           f"    vector.store %sgt_e, %sgt_view[%sgt_xi] : vector<{W}xi32>, view<{n * W}xi32>",
@@ -1279,7 +1296,7 @@ def f16_compute(v, gb):
 
 def iq4xs_setup():
     L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
-    L += ["  %c16i_sc4 = scalar.constant 16 : i32"]
+    L += ["  %c16i_sc4 = scalar.constant 16 : i32"] if IQ4_SC4 else []
     L += ["  %c15b_iq = scalar.constant 15 : i8", "  %c4b_iq = scalar.constant 4 : i8",
           "  %c16i_h = scalar.constant 16 : i32", "  %c255i_h = scalar.constant 255 : i32",
           "  %c0f4_iq = scalar.constant 252645135 : i32", "  %m0f4_iq = vector.splat %c0f4_iq : vector<4xi32>",

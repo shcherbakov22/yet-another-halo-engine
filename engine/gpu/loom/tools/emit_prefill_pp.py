@@ -435,7 +435,7 @@ AF = {
     ("q5k", "kstore", 384, 20): dict(AF_KQP, ksl=True),                         # -12%
     ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True),   # -4.6%
     # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
-    ("iq3s", "kqg", 768, 20): dict(AF_PIPE3, sgtab=True, f16p=True, gaddr=True),             # -8.4%
+    ("iq3s", "kqg", 768, 20): dict(AF_PIPE3, lhs_stream=1, sgtab=True, f16p=True, gaddr=True),  # -8.4%; lhs_stream=1 -0.9%
     ("iq4xs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=2),                     # -9.5%
     ("iq3xxs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True),        # -9.3%
     ("q4k", "kqg", 768, 20): dict(AF_KQP),                                      # -6.7%
@@ -459,7 +459,9 @@ AF = {
 AF_FFN = {
     "iq3s": dict(AF_PIPE, lhs_stream=2, swepi=False, f16p=True),
     "iq4xs": dict(AF_PIPE, lhs_stream=2, swepi=False),
-    "iq3xxs": dict(AF_PIPE, lhs_stream=2, swepi=False, f16p=True),
+    # IQ3_XXS: the packed sign table (sgtw=1: both spread nibbles in one word, 512 B) with gaddr and lhs_stream=1 -0.5%;
+    # the two-word table loses +1.3% here (LDS bank conflicts 13.9 -> 23.8 M cycles, LDS issue waits +62%)
+    "iq3xxs": dict(AF_PIPE, lhs_stream=1, swepi=False, f16p=True, sgtab=True, sgtw=1, gaddr=True),
 }
 
 
