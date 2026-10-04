@@ -387,6 +387,7 @@ AF = {
     ("iq3xxs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=4),                 # -10.9%
     ("q4k", "kstore", 384, 20): dict(AF_KQ),                                    # -6.0%
     ("q3k", "kstore", 384, 20): dict(AF_KQ),                                    # -6.4%
+    ("q5k", "kstore", 384, 20): dict(AF_KQ, ksl=True, wlate=True, bpre=2, b0early=True),   # -12%
     ("q5k", "kres", 320, 24): dict(AF_KQ, ksl=True, wlate=True, respre=1),      # -4.6%
     # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
     ("iq3s", "kqg", 768, 20): dict(AF_PIPE3),                                    # -8.4%
