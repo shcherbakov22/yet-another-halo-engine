@@ -38,6 +38,9 @@ IQ3_F16P = False
 # loop VALU 194 -> 187; one process A/B -0.15..-0.76% (kqg / swiglu +0.1..+0.2%), but pp2048 back to back neutral
 # (IQ4_XS families -0.03% drift-corrected, swiglu +0.66%): off
 IQ4_SC4 = False
+# Q3_F16S (Q3_K): quants as signed f16 subnormal pairs (see q3k_compute): loop VALU 281 -> 230; one process A/B
+# kstore -0.55..-0.99%, kqg -0.14%
+Q3_F16S = True
 IQ3_F16S = False   # set per tile (gen_gemm_tile Tile.f16s), see _vdec_pair_f16s
 IQ3_GADDR = False             # set per tile (gen_gemm_tile Tile.gaddr), see the grid / sign lookups in iq3*_compute
 IQ3_F16P_PERM = True          # the odd-byte pair as one v_perm (vector.shuffle with a zero word) instead of shift + and
@@ -1489,6 +1492,51 @@ def q3k_compute(v, gb):
             # on 32-bit words: per byte (q >> 2sp) & 3 | ((hm >> g) & 1) << 2, minus 4 as (x | 0x80) - 4 ^ 0x80 (no borrow)
             e(f"    %q3qw{t} = vector.bitcast {q} : vector<16xi8> to vector<4xi32>")
             e(f"    %q3hw{t} = vector.bitcast {hm} : vector<16xi8> to vector<4xi32>")
+            if Q3_F16S:
+                # quant = low + 4 bit - 4: nb = !bit per byte, |quant| = (low ^ 3 nb) + nb, sign byte nb << 7, interleaved
+                # into signed f16 subnormal pairs +-|quant| * 2^-24 (exact; quant 0 is +0 as sitofp gives)
+                e(f"    %q3lw{t} = vector.shrui %q3qw{t}, %q3lsw{u} : vector<4xi32>")
+                e(f"    %q3low{t} = vector.andi %q3lw{t}, %q3m3w : vector<4xi32>")
+                e(f"    %q3bw{t} = vector.shrui %q3hw{t}, %q3bsw{u} : vector<4xi32>")
+                e(f"    %q3bit{t} = vector.andi %q3bw{t}, %q3m1w : vector<4xi32>")
+                e(f"    %q3nb{t} = vector.xori %q3bit{t}, %q3m1w : vector<4xi32>")
+                e(f"    %q3n3{t} = vector.muli %q3nb{t}, %q3c3w : vector<4xi32>")   # bytes 0 / 3, no carries
+                e(f"    %q3mx{t} = vector.xori %q3low{t}, %q3n3{t} : vector<4xi32>")
+                e(f"    %q3magw{t} = vector.addi %q3mx{t}, %q3nb{t} : vector<4xi32>")
+                e(f"    %q3sgnw{t} = vector.shli %q3nb{t}, %q3c7w : vector<4xi32>")
+                e(f"    %q3l8{t} = scalar.addi {lo8}, %c0i : i32")
+                e(f"    %q3l4s{t} = scalar.shrui %q3l8{t}, %q3s4{u} : i32")
+                e(f"    %q3l4{t} = scalar.andi %q3l4s{t}, %c15i : i32")
+                e(f"    %q3h8{t} = scalar.addi {hi8}, %c0i : i32")
+                e(f"    %q3h2s{t} = scalar.shrui %q3h8{t}, %q3s2{u} : i32")
+                e(f"    %q3h2{t} = scalar.andi %q3h2s{t}, %c3i : i32")
+                e(f"    %q3h4{t} = scalar.shli %q3h2{t}, %c4i : i32")
+                e(f"    %q3s6{t} = scalar.ori %q3l4{t}, %q3h4{t} : i32")
+                e(f"    %q3sc{t} = scalar.subi %q3s6{t}, %c32i : i32")
+                e(f"    %q3scf{t} = scalar.sitofp %q3sc{t} : i32 to f32")
+                e(f"    %q3dsc{t} = scalar.mulf %d, %q3scf{t} : f32")
+                e(f"    %q3d24{t} = scalar.mulf %q3dsc{t}, %q3c24f : f32")
+                hs = []
+                for w in range(4):
+                    e(f"    %q3mw{t}_{w} = vector.extract %q3magw{t}[{w}] : vector<4xi32> -> i32")
+                    e(f"    %q3sw{t}_{w} = vector.extract %q3sgnw{t}[{w}] : vector<4xi32> -> i32")
+                    e(f"    %q3pw{t}_{w} = vector.from_elements %q3mw{t}_{w}, %q3sw{t}_{w} : vector<2xi32>")
+                    e(f"    %q3pb{t}_{w} = vector.bitcast %q3pw{t}_{w} : vector<2xi32> to vector<8xi8>")
+                    for nm, sel in (("e", "0, 4, 2, 6"), ("o", "1, 5, 3, 7")):
+                        e(f"    %q3q{nm}{t}_{w} = vector.shuffle<[{sel}, 0, 0, 0, 0]> %q3pb{t}_{w} : vector<8xi8>")
+                        e(f"    %q3r{nm}{t}_{w} = vector.bitcast %q3q{nm}{t}_{w} : vector<8xi8> to vector<2xi32>")
+                        e(f"    %q3x{nm}{t}_{w} = vector.extract %q3r{nm}{t}_{w}[0] : vector<2xi32> -> i32")
+                        e(f"    %q3v{nm}{t}_{w} = vector.from_elements %q3x{nm}{t}_{w} : vector<1xi32>")
+                        e(f"    %q3f{nm}{t}_{w} = vector.bitcast %q3v{nm}{t}_{w} : vector<1xi32> to vector<2xf16>")
+                for j in range(16):
+                    w, b = divmod(j, 4)
+                    e(f"    %q3yh{t}_{j} = vector.extract %q3f{'e' if b % 2 == 0 else 'o'}{t}_{w}[{b // 2}] : vector<2xf16> -> f16")
+                    e(f"    %q3y{t}_{j} = scalar.extf %q3yh{t}_{j} : f16 to f32")
+                    e(f"    %q3m{t}_{j} = scalar.fmaf %q3d24{t}, %q3y{t}_{j}, %q3cm0f : f32")
+                    e(f"    %q3h{t}_{j} = scalar.fptrunc %q3m{t}_{j} : f32 to f16")
+                    hs.append(f"%q3h{t}_{j}")
+                e(f"    %h{hn}{u} = vector.from_elements {', '.join(hs)} : vector<16xf16>")
+                continue
             e(f"    %q3lw{t} = vector.shrui %q3qw{t}, %q3lsw{u} : vector<4xi32>")
             e(f"    %q3low{t} = vector.andi %q3lw{t}, %q3m3w : vector<4xi32>")
             e(f"    %q3bw{t} = vector.shrui %q3hw{t}, %q3bsw{u} : vector<4xi32>")
@@ -1529,7 +1577,10 @@ def q3k_compute(v, gb):
 
 
 def q3k_setup():
-    return ["  %q3cm0f = scalar.constant -0.0 : f32", "  %q3c54i = scalar.constant 54 : i32", "  %q3c96i = scalar.constant 96 : i32",
+    f16s = ["  %q3c24f = scalar.constant 16777216.0 : f32", "  %q3c3i_w = scalar.constant 3 : i32",
+            "  %q3c3w = vector.splat %q3c3i_w : vector<4xi32>", "  %q3c7i_w = scalar.constant 7 : i32",
+            "  %q3c7w = vector.splat %q3c7i_w : vector<4xi32>"]
+    return (f16s if Q3_F16S else []) + ["  %q3cm0f = scalar.constant -0.0 : f32", "  %q3c54i = scalar.constant 54 : i32", "  %q3c96i = scalar.constant 96 : i32",
             "  %q3c3b = scalar.constant 3 : i8", "  %q3c1b = scalar.constant 1 : i8",
             "  %q3c2b = scalar.constant 2 : i8", "  %q3c4b = scalar.constant 4 : i8",
             "  %q3m3v = vector.splat %q3c3b : vector<16xi8>", "  %q3m1v = vector.splat %q3c1b : vector<16xi8>",
