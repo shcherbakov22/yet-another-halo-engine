@@ -397,42 +397,47 @@ AF_KQP = dict(AF_KQ, **AF_PIPE, lhs_stream=4)
 # +0.5 / +0.2% and the fragment-major ffn / swiglu +0.7 / +2.2% keep the spread.
 # f16p (IQ3 decode bytes as f16 subnormal pairs, one v_perm for the odd bytes; -11..-15 loop VALU): IQ3_S kstore 1088 /
 # kres 320x68 / kqg / swiglu -0.25..-0.55%, fused ffn IQ3_XXS / IQ3_S -0.35%; IQ3_XXS kstore / kqg neutral, kres +1.8% (not).
+# gaddr (IQ3 grid / sign-table lookups at pre-scaled byte offsets on byte views of the LDS tables: IQ3_XXS -15, IQ3_S
+# -17..-23 loop VALU; one process A/B 2026-10-04): IQ3_XXS kstore -0.3..-0.8%, kqg -0.25%, kres -0.6..-1.2%, swiglu -0.7%;
+# IQ3_S kstore 640 / kqg -0.25..-0.3%, kres -0.8..-1.0%. Not: IQ3_S kstore 384 (200-208 VGPRs at every lhs_stream, +12%),
+# IQ3_S kstore 1088 / swiglu and both fused ffn (neutral).
 # tallepi (kstore / kres): the LDS epilogue in 16-row slabs; the fragment stores cost the K = 6144 kres 15%.
 AF = {
     ("iq3s", "kstore", 1088, 20): dict(AF_PIPE3, lhs_stream=2, f16p=True),                  # -9.1%
     ("iq4xs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=2),                 # -12.9%
-    ("iq3xxs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True),                # -11.3%
+    ("iq3xxs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True),    # -11.3%
     ("q3k", "kstore", 1088, 20): dict(AF_KQP),                                  # -7.2%
     ("iq3s", "swiglu", 1088, 20): dict(AF_PIPE3, lhs_stream=2, swepi=False, f16p=True),     # -11.6%
     ("iq4xs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),    # -10.9%
-    ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),   # -12.1%
-    ("iq3s", "kres", 320, 68): dict(AF_PIPE3, sgtab=True, f16p=True, persist=dict(b0early=True, lhs_stream=2)), # -8.6%
+    ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False, gaddr=True),   # -12.1%
+    ("iq3s", "kres", 320, 68): dict(AF_PIPE3, sgtab=True, f16p=True, gaddr=True,
+                                    persist=dict(b0early=True, lhs_stream=2)),               # -8.6%
     ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -10.4%
-    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, sgtab=True, respre=1, persist=True), # -8.2%
+    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, respre=1, persist=True), # -8.2%
     ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),             # -10.4%
     ("q4k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),                     # -7.7%
     # attention o-proj / DeltaNet ssm_out (K = 6144; input: the attention output, postnorm_t.hal)
-    ("iq3s", "kres", 320, 24): dict(AF_PIPE3, persist=dict(b0early=True, lhs_stream=2)), # -8.8%
-    ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=1, sgtab=True, respre=1, persist=True), # -8.5%
+    ("iq3s", "kres", 320, 24): dict(AF_PIPE3, gaddr=True, persist=dict(b0early=True, lhs_stream=2)), # -8.8%
+    ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True, respre=1, persist=True), # -8.5%
     ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -8.8%
     ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True),             # -5.3%
     # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
-    ("iq3s", "kstore", 640, 20): dict(AF_PIPE3),                                 # -9.6%
+    ("iq3s", "kstore", 640, 20): dict(AF_PIPE3, gaddr=True),                     # -9.6%
     ("iq4xs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=2),                  # -10.3%
-    ("iq3xxs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True),                 # -11.4%
+    ("iq3xxs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True),     # -11.4%
     ("q4k", "kstore", 640, 20): dict(AF_KQP),                                   # -7.4%
     ("q3k", "kstore", 640, 20): dict(AF_KQP),                                   # -7.7%
     ("iq3s", "kstore", 384, 20): dict(AF_PIPE3, lhs_stream=4, sgtab=True),       # -9.4%
     ("iq4xs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=2),                  # -9.9%
-    ("iq3xxs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True),                 # -10.9%
+    ("iq3xxs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True),     # -10.9%
     ("q4k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.0%
     ("q3k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.4%
     ("q5k", "kstore", 384, 20): dict(AF_KQP, ksl=True),                         # -12%
     ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True),   # -4.6%
     # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
-    ("iq3s", "kqg", 768, 20): dict(AF_PIPE3, sgtab=True, f16p=True),                         # -8.4%
+    ("iq3s", "kqg", 768, 20): dict(AF_PIPE3, sgtab=True, f16p=True, gaddr=True),             # -8.4%
     ("iq4xs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=2),                     # -9.5%
-    ("iq3xxs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True),                    # -9.3%
+    ("iq3xxs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True, gaddr=True),        # -9.3%
     ("q4k", "kqg", 768, 20): dict(AF_KQP),                                      # -6.7%
     ("q3k", "kqg", 768, 20): dict(AF_KQP),                                      # -5.0%
     ("q5k", "kqg", 768, 20): dict(AF_KQP, ksl=True),                            # -10.8%

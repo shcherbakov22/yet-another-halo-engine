@@ -94,6 +94,8 @@ class Tile:
                                # v_cvt_f32_ubyteN (-11..-15 loop VALU)
     sgtab: bool = False        # IQ3_XXS: sign words from the gen_gemm_decode.IQ3_SGTAB LDS table (with lhs_stream=1; not
                                # the fused ffn / swiglu, whose fragment-major-output forms lose +1.3%)
+    gaddr: bool = False        # IQ3: grid / sign-table lookups at pre-scaled byte offsets on byte views
+                               # (gen_gemm_decode.IQ3_GADDR; -15..-23 loop VALU)
     esr: int = 16              # tall epilogue slab rows (32 with ecoal: 8 lanes per token, full 128-byte rows per access)
     respre: int = 0            # kres tall epilogue: issue each slab group's residual loads this many groups ahead (0: at use)
     ffn_inload: bool = False   # mixed ffn: each wave loads its own format's weights at its decode (no carried union)
@@ -197,6 +199,7 @@ def configure(fmt, t):
     G.IQ3_SGN2 = t.w3
     G.IQ3_SGTAB = t.sgtab
     G.IQ3_F16P = t.f16p
+    G.IQ3_GADDR = t.gaddr
     # IQ2: the same word path and sign chain (IQ2_W): -5.6% clock-free
     G.IQ2_W = fmt in ("iq2xxs", "iq2xs")
     if G.IQ2_W:

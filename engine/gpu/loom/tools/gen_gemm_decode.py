@@ -34,6 +34,7 @@ IQ3_SGTAB_W = 2
 # (w >> 8) & 0x00ff00ff = u * 2^-24, exact) read by v_fma_mix with dsc * 2^24 (exact) instead of v_cvt_f32_ubyteN:
 # fma(dsc * 2^24, u * 2^-24, -128 dsc) has the same exact product as fma(dsc, u, -128 dsc): bit-identical.
 IQ3_F16P = False
+IQ3_GADDR = False             # set per tile (gen_gemm_tile Tile.gaddr), see the grid / sign lookups in iq3*_compute
 IQ3_F16P_PERM = True          # the odd-byte pair as one v_perm (vector.shuffle with a zero word) instead of shift + and
 # IQ2_W (IQ2_XXS / IQ2_XS): the IQ3 word path (VDEC_W, IQ3_U8F, VDECW_FR) for the IQ2 grids too. Grid magnitudes are 8 / 25 / 43
 # (nonzero, < 128) and d * (2n + 1) / 8 * mag has <= 22 significant bits: the same exactness argument, bit-identical.
@@ -449,6 +450,23 @@ def iq3s_compute(v, gb):
         for lw in range(8):
             t = f"{u}_{lw}"
             e(f"    %qwd_{t} = vector.extract %qsw{u}[{lw // 4}] : vector<2xi32> -> i32")
+            if IQ3_GADDR:   # byte offset ((w >> (8k - 2)) & 0x3fc) + (qh bit lw) * 1024 (disjoint bits: one v_lshl_add)
+                k8 = 8 * (lw % 4)
+                if k8 == 0:
+                    e(f"    %qsh_{t} = scalar.shli %qwd_{t}, %c2i_ga : i32")
+                else:
+                    e(f"    %qshc_{t} = scalar.constant {k8 - 2} : i32")
+                    e(f"    %qsh_{t} = scalar.shrui %qwd_{t}, %qshc_{t} : i32")
+                e(f"    %qby_{t} = scalar.andi %qsh_{t}, %c1020i_ga : i32")
+                e(f"    %hbb_{t} = scalar.bitfield.extractu %qhb{u} {{offset = {lw}, width = 1}} : i32 -> i32")
+                e(f"    %gbo_{t} = scalar.fmai %hbb_{t}, %c1024i_ga, %qby_{t} : i32")
+                e(f"    %gbx_{t} = index.cast %gbo_{t} : i32 to index")
+                e(f"    %gbd_{t} = index.assume %gbx_{t} [range(%gbx_{t}, 0, 2044)] : index")
+                e(f"    %gwb_{t} = vector.load %grid_bview[%gbd_{t}] : view<2048xi8> -> vector<4xi8>")
+                e(f"    %gwv_{t} = vector.bitcast %gwb_{t} : vector<4xi8> to vector<1xi32>")
+                e(f"    %gw_{t} = vector.extract %gwv_{t}[0] : vector<1xi32> -> i32")
+                gws.append(f"%gw_{t}")
+                continue
             e(f"    %qsh_{t} = scalar.shrui %qwd_{t}, %c{8 * (lw % 4)}i : i32")
             e(f"    %qlo_{t} = scalar.andi %qsh_{t}, %c255i : i32")
             e(f"    %hb0_{t} = scalar.shrui %qhb{u}, %c{lw}i : i32")
@@ -459,7 +477,24 @@ def iq3s_compute(v, gb):
             e(f"    %gid_{t} = index.assume %gix_{t} [range(%gix_{t}, 0, 511)] : index")
             e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<512xi32> -> i32")
             gws.append(f"%gw_{t}")
+        if _sgtab() and IQ3_GADDR and IQ3_SGTAB_W == 2:
+            e(f"    %sgw1_{u} = vector.bitcast {sg} : vector<4xi8> to vector<1xi32>")
+            e(f"    %sgw_{u} = vector.extract %sgw1_{u}[0] : vector<1xi32> -> i32")
         for pp in range(4):
+            if _sgtab() and IQ3_GADDR and IQ3_SGTAB_W == 2:   # byte offset (word >> (8 pp - 3)) & 0x7f8
+                if pp == 0:
+                    e(f"    %sbs_{u}_{pp} = scalar.shli %sgw_{u}, %c3i_ga : i32")
+                else:
+                    e(f"    %sbc_{u}_{pp} = scalar.constant {8 * pp - 3} : i32")
+                    e(f"    %sbs_{u}_{pp} = scalar.shrui %sgw_{u}, %sbc_{u}_{pp} : i32")
+                e(f"    %sby_{u}_{pp} = scalar.andi %sbs_{u}_{pp}, %c2040i_ga : i32")
+                e(f"    %sbx_{u}_{pp} = index.cast %sby_{u}_{pp} : i32 to index")
+                e(f"    %sbd_{u}_{pp} = index.assume %sbx_{u}_{pp} [range(%sbx_{u}_{pp}, 0, 2040)] : index")
+                e(f"    %sgb_{u}_{pp} = vector.load %sgt_bview[%sbd_{u}_{pp}] : view<2048xi8> -> vector<8xi8>")
+                e(f"    %sgt_{u}_{pp} = vector.bitcast %sgb_{u}_{pp} : vector<8xi8> to vector<2xi32>")
+                _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], None, f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}",
+                           sgt=f"%sgt_{u}_{pp}")
+                continue
             e(f"    %sgb8_{u}_{pp} = vector.extract {sg}[{pp}] : vector<4xi8> -> i8")
             if _sgtab():
                 W = IQ3_SGTAB_W
@@ -484,9 +519,13 @@ def iq3s_setup():
             "  %vdw_ff = scalar.constant 255 : i32",
             "  %c80x4_iq3 = scalar.constant -2139062144 : i32", "  %cm128f_iq3 = scalar.constant -128.0 : f32",
             "  %c14i_vdw = scalar.constant 14 : i32",
+            "  %c2i_ga = scalar.constant 2 : i32", "  %c1020i_ga = scalar.constant 1020 : i32",
+            "  %c3i_ga = scalar.constant 3 : i32", "  %c1024i_ga = scalar.constant 1024 : i32",
+            "  %c2040i_ga = scalar.constant 2040 : i32",
             "  %grid_bytes = index.constant 2048 : offset",
             "  %grid_l = buffer.alloca<workgroup> align(16) %grid_bytes : buffer",
             "  %grid_view = buffer.view %grid_l[%base] : buffer -> view<512xi32>",
+            *(["  %grid_bview = buffer.view %grid_l[%base] : buffer -> view<2048xi8>"] if IQ3_GADDR else []),
             f"  %cgstep = index.constant {64 * NW} : index",
             "  %gsink = scf.for %gi = [%c0 to %c512 step %cgstep](%gm = %c0 : index) -> (index) {",
             "    %gidx0 = index.add %gi, %tid : index",
@@ -549,13 +588,43 @@ def iq3xxs_compute(v, gb):
         for lw in range(8):
             t = f"{u}_{lw}"
             e(f"    %qwd_{t} = vector.extract %qsw{u}[{lw // 4}] : vector<2xi32> -> i32")
-            e(f"    %qsh_{t} = scalar.shrui %qwd_{t}, %c{8 * (lw % 4)}i : i32")
-            e(f"    %qlo_{t} = scalar.andi %qsh_{t}, %c255i : i32")
+            if IQ3_GADDR:   # byte offset (w >> (8k - 2)) & 0x3fc, then / 4: the load's * 4 can fold into the mask
+                k8 = 8 * (lw % 4)
+                if k8 == 0:
+                    e(f"    %qsh_{t} = scalar.shli %qwd_{t}, %c2i_ga : i32")
+                else:
+                    e(f"    %qshc_{t} = scalar.constant {k8 - 2} : i32")
+                    e(f"    %qsh_{t} = scalar.shrui %qwd_{t}, %qshc_{t} : i32")
+                e(f"    %qby_{t} = scalar.andi %qsh_{t}, %c1020i_ga : i32")
+                e(f"    %gbx_{t} = index.cast %qby_{t} : i32 to index")
+                e(f"    %gbd_{t} = index.assume %gbx_{t} [range(%gbx_{t}, 0, 1020)] : index")
+                e(f"    %gwb_{t} = vector.load %grid_bview[%gbd_{t}] : view<1024xi8> -> vector<4xi8>")
+                e(f"    %gwv_{t} = vector.bitcast %gwb_{t} : vector<4xi8> to vector<1xi32>")
+                e(f"    %gw_{t} = vector.extract %gwv_{t}[0] : vector<1xi32> -> i32")
+                gws.append(f"%gw_{t}")
+                continue
+            else:
+                e(f"    %qsh_{t} = scalar.shrui %qwd_{t}, %c{8 * (lw % 4)}i : i32")
+                e(f"    %qlo_{t} = scalar.andi %qsh_{t}, %c255i : i32")
             e(f"    %gix_{t} = index.cast %qlo_{t} : i32 to index")
             e(f"    %gid_{t} = index.assume %gix_{t} [range(%gix_{t}, 0, 255)] : index")
             e(f"    %gw_{t} = view.load %grid_view[%gid_{t}] : view<256xi32> -> i32")
             gws.append(f"%gw_{t}")
         for pp in range(4):
+            if _sgtab() and IQ3_GADDR and IQ3_SGTAB_W == 2:
+                if pp == 0:
+                    e(f"    %sbs_{u}_{pp} = scalar.shli %aux{u}, %c3i_ga : i32")
+                else:
+                    e(f"    %sbc_{u}_{pp} = scalar.constant {7 * pp - 3} : i32")
+                    e(f"    %sbs_{u}_{pp} = scalar.shrui %aux{u}, %sbc_{u}_{pp} : i32")
+                e(f"    %sby_{u}_{pp} = scalar.andi %sbs_{u}_{pp}, %c1016i_ga : i32")
+                e(f"    %sbx_{u}_{pp} = index.cast %sby_{u}_{pp} : i32 to index")
+                e(f"    %sbd_{u}_{pp} = index.assume %sbx_{u}_{pp} [range(%sbx_{u}_{pp}, 0, 1016)] : index")
+                e(f"    %sgb_{u}_{pp} = vector.load %sgt_bview[%sbd_{u}_{pp}] : view<1024xi8> -> vector<8xi8>")
+                e(f"    %sgt_{u}_{pp} = vector.bitcast %sgb_{u}_{pp} : vector<8xi8> to vector<2xi32>")
+                _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], None, f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}",
+                           sgt=f"%sgt_{u}_{pp}")
+                continue
             e(f"    %sid0_{u}_{pp} = scalar.shrui %aux{u}, %c{7 * pp}i : i32")
             e(f"    %sid_{u}_{pp} = scalar.andi %sid0_{u}_{pp}, %c127i : i32")
             e(f"    %sidx_{u}_{pp} = index.cast %sid_{u}_{pp} : i32 to index")
@@ -593,8 +662,10 @@ def _stage_table(name, src, n, ty, bytes_per):
 def iq3xxs_setup():
     return ["  %vdw_spread = scalar.constant 2113665 : i32", "  %vdw_ones = scalar.constant 16843009 : i32", "  %vdw_ff = scalar.constant 255 : i32",
             "  %c80x4_iq3 = scalar.constant -2139062144 : i32", "  %cm128f_iq3 = scalar.constant -128.0 : f32",
-            "  %c14i_vdw = scalar.constant 14 : i32"] + ((["  %fhalf = scalar.constant 0.5 : f32"])
+            "  %c14i_vdw = scalar.constant 14 : i32", "  %c2i_ga = scalar.constant 2 : i32", "  %c1020i_ga = scalar.constant 1020 : i32",
+            "  %c3i_ga = scalar.constant 3 : i32", "  %c1016i_ga = scalar.constant 1016 : i32"] + ((["  %fhalf = scalar.constant 0.5 : f32"])
             + _stage_table("grid", "%grid_na", 256, "i32", 4)
+            + (["  %grid_bview = buffer.view %grid_l[%base] : buffer -> view<1024xi8>"] if IQ3_GADDR else [])
             + (_sign_table() if _sgtab() else _stage_table("ksigns", "%ksigns_na", 128, "i8", 1)))
 
 
@@ -613,6 +684,7 @@ def _sign_table(n=128, from_ksigns=True):
          f"  %sgt_bytes = index.constant {4 * n * W} : offset",
          "  %sgt_l = buffer.alloca<workgroup> align(16) %sgt_bytes : buffer",
          f"  %sgt_view = buffer.view %sgt_l[%base] : buffer -> view<{n * W}xi32>",
+         *([f"  %sgt_bview = buffer.view %sgt_l[%base] : buffer -> view<{4 * n * W}xi8>"] if IQ3_GADDR else []),
          f"  %sgt_max = index.constant {n - 1} : index",
          "  %sgt_step = index.constant 32 : index",
          f"  %sgt_cnt = index.constant {n} : index",
