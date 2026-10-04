@@ -34,6 +34,10 @@ IQ3_SGTAB_W = 2
 # (w >> 8) & 0x00ff00ff = u * 2^-24, exact) read by v_fma_mix with dsc * 2^24 (exact) instead of v_cvt_f32_ubyteN:
 # fma(dsc * 2^24, u * 2^-24, -128 dsc) has the same exact product as fma(dsc, u, -128 dsc): bit-identical.
 IQ3_F16P = False
+# IQ4_SC4 (IQ4_XS): the low scale nibble as (scales_l word >> 4g) & 15 and the 6-bit scale with one v_lshl_add (same ints):
+# loop VALU 194 -> 187; one process A/B -0.15..-0.76% (kqg / swiglu +0.1..+0.2%), but pp2048 back to back neutral
+# (IQ4_XS families -0.03% drift-corrected, swiglu +0.66%): off
+IQ4_SC4 = False
 IQ3_GADDR = False             # set per tile (gen_gemm_tile Tile.gaddr), see the grid / sign lookups in iq3*_compute
 IQ3_F16P_PERM = True          # the odd-byte pair as one v_perm (vector.shuffle with a zero word) instead of shift + and
 # IQ2_W (IQ2_XXS / IQ2_XS): the IQ3 word path (VDEC_W, IQ3_U8F, VDECW_FR) for the IQ2 grids too. Grid magnitudes are 8 / 25 / 43
@@ -168,20 +172,30 @@ def iq4xs_compute(v, gb):
         q = next(it)
         e(f"    %g{u} = scalar.addi {gb}, %c{u}i : i32")
         e(f"    %gl{u} = scalar.addi %gl_i, %c{u}i : i32")
-        e(f"    %gp{u} = scalar.andi %g{u}, %c1i : i32")
-        e(f"    %sh4_{u} = scalar.shli %gp{u}, %c2i : i32")
         e(f"    %sh2_{u} = scalar.shli %g{u}, %c1i : i32")
-        # scales_l[g/2] is byte g/2 of the header's second word
-        e(f"    %slg{u} = scalar.shrui %g{u}, %c1i : i32")
-        e(f"    %sls{u} = scalar.shli %slg{u}, %c3i : i32")
-        e(f"    %slw{u} = scalar.shrui %hdw1, %sls{u} : i32")
-        e(f"    %slb{u} = scalar.andi %slw{u}, %c255i_h : i32")
-        e(f"    %sc_sh{u} = scalar.shrui %slb{u}, %sh4_{u} : i32")
-        e(f"    %sc_l{u} = scalar.andi %sc_sh{u}, %c15i : i32")
-        e(f"    %sc_ha{u} = scalar.shrui %shv, %sh2_{u} : i32")
-        e(f"    %sc_h{u} = scalar.andi %sc_ha{u}, %c3i : i32")
-        e(f"    %sc_h4{u} = scalar.shli %sc_h{u}, %c4i : i32")
-        e(f"    %sc6_{u} = scalar.ori %sc_l{u}, %sc_h4{u} : i32")
+        if IQ4_SC4:
+            # scales_l nibble g is bits 4g .. 4g + 3 of the header's second word (byte g/2, nibble g%2); the high bits
+            # join with one v_lshl_add (disjoint bits)
+            e(f"    %sh4_{u} = scalar.shli %g{u}, %c2i : i32")
+            e(f"    %slw{u} = scalar.shrui %hdw1, %sh4_{u} : i32")
+            e(f"    %sc_l{u} = scalar.andi %slw{u}, %c15i : i32")
+            e(f"    %sc_ha{u} = scalar.shrui %shv, %sh2_{u} : i32")
+            e(f"    %sc_h{u} = scalar.andi %sc_ha{u}, %c3i : i32")
+            e(f"    %sc6_{u} = scalar.fmai %sc_h{u}, %c16i_sc4, %sc_l{u} : i32")
+        else:
+            e(f"    %gp{u} = scalar.andi %g{u}, %c1i : i32")
+            e(f"    %sh4_{u} = scalar.shli %gp{u}, %c2i : i32")
+            # scales_l[g/2] is byte g/2 of the header's second word
+            e(f"    %slg{u} = scalar.shrui %g{u}, %c1i : i32")
+            e(f"    %sls{u} = scalar.shli %slg{u}, %c3i : i32")
+            e(f"    %slw{u} = scalar.shrui %hdw1, %sls{u} : i32")
+            e(f"    %slb{u} = scalar.andi %slw{u}, %c255i_h : i32")
+            e(f"    %sc_sh{u} = scalar.shrui %slb{u}, %sh4_{u} : i32")
+            e(f"    %sc_l{u} = scalar.andi %sc_sh{u}, %c15i : i32")
+            e(f"    %sc_ha{u} = scalar.shrui %shv, %sh2_{u} : i32")
+            e(f"    %sc_h{u} = scalar.andi %sc_ha{u}, %c3i : i32")
+            e(f"    %sc_h4{u} = scalar.shli %sc_h{u}, %c4i : i32")
+            e(f"    %sc6_{u} = scalar.ori %sc_l{u}, %sc_h4{u} : i32")
         e(f"    %sc{u} = scalar.subi %sc6_{u}, %c32i : i32")
         e(f"    %sc_f{u} = scalar.sitofp %sc{u} : i32 to f32")
         e(f"    %dsc{u} = scalar.mulf %d, %sc_f{u} : f32")
@@ -1265,6 +1279,7 @@ def f16_compute(v, gb):
 
 def iq4xs_setup():
     L = [f"  %kv{i} = scalar.constant {v} : i8" for i, v in enumerate(IQ4_KVALUES)]
+    L += ["  %c16i_sc4 = scalar.constant 16 : i32"]
     L += ["  %c15b_iq = scalar.constant 15 : i8", "  %c4b_iq = scalar.constant 4 : i8",
           "  %c16i_h = scalar.constant 16 : i32", "  %c255i_h = scalar.constant 255 : i32",
           "  %c0f4_iq = scalar.constant 252645135 : i32", "  %m0f4_iq = vector.splat %c0f4_iq : vector<4xi32>",
