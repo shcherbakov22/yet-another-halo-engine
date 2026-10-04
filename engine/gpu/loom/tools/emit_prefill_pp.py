@@ -17,6 +17,7 @@ import emit_prefill as E  # noqa: E402
 import gen_attn_fa  # noqa: E402
 import gen_deltanet_hip  # noqa: E402
 import gen_gdn_chunk  # noqa: E402
+import gen_kres_persist  # noqa: E402
 import gen_half_norm  # noqa: E402
 import gen_kvq  # noqa: E402
 
@@ -399,15 +400,15 @@ AF = {
     ("iq4xs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),    # -10.9%
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),   # -12.1%
     ("iq3s", "kres", 320, 68): dict(AF_PIPE3),                                  # -8.6%
-    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1),          # -10.4%
-    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=2, respre=1),         # -8.2%
-    ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1),                           # -10.4%
+    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -10.4%
+    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=2, respre=1, persist=True), # -8.2%
+    ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),             # -10.4%
     ("q4k", "swiglu", 1088, 20): dict(AF_KQP, swepi=False),                     # -7.7%
     # attention o-proj / DeltaNet ssm_out (K = 6144; input: the attention output, postnorm_t.hal)
     ("iq3s", "kres", 320, 24): dict(AF_PIPE3),                                  # -8.8%
-    ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1),         # -8.5%
-    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1),          # -8.8%
-    ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1),                           # -5.3%
+    ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -8.5%
+    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -8.8%
+    ("q4k", "kres", 320, 24): dict(AF_KQP, respre=1, persist=True),             # -5.3%
     # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
     ("iq3s", "kstore", 640, 20): dict(AF_PIPE3),                                 # -9.6%
     ("iq4xs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=2),                  # -10.3%
@@ -420,7 +421,7 @@ AF = {
     ("q4k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.0%
     ("q3k", "kstore", 384, 20): dict(AF_KQP),                                   # -6.4%
     ("q5k", "kstore", 384, 20): dict(AF_KQP, ksl=True),                         # -12%
-    ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1),                 # -4.6%
+    ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True),   # -4.6%
     # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
     ("iq3s", "kqg", 768, 20): dict(AF_PIPE3),                                    # -8.4%
     ("iq4xs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=2),                     # -9.5%
@@ -481,12 +482,21 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     knobs = AF.get((fmt, kind, mt, kb))
     if not AFRAG or knobs is None or B % AF_TILE["bn"]:
         return []
+    knobs = dict(knobs)
+    persist = knobs.pop("persist", False)
     t = dataclasses.replace(TG.default_tile(fmt, kind, kb), **AF_TILE, **knobs)
     rows = []
     for suffix, tt in [(".af.hal", t)] + ([(".af.to.hal", dataclasses.replace(t, tout=True))] if kind == "swiglu" else []):
         TG.check(tt)
         r = _emit_gen(lambda f, k: TG.gen(f, k, tt, False), tt.bn, fmt, mt, kb, B, out[:-4] + suffix, outdir, kind,
                       tt.rowgrp)
+        if r:
+            rows.append(r)
+    if persist and kind == "kres" and B // t.bn > 1 and 2 * kb >= gen_kres_persist.SLICES:
+        # the persistent kres (gen_kres_persist): grid y = 1, each workgroup runs every token tile of its row block
+        text = gen_kres_persist.persist(TG.gen(fmt, "kres", t, False),
+                                        TG.gen(fmt, "kstore", dataclasses.replace(t, respre=0), False), B // t.bn)
+        r = _emit_gen(lambda f, k: text, t.bn, fmt, mt, kb, B, out[:-4] + ".af.p.hal", outdir, kind, t.rowgrp)
         if r:
             rows.append(r)
     return rows

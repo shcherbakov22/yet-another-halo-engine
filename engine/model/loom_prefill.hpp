@@ -880,8 +880,11 @@ class LoomPrefill {
       const std::size_t M = t->dims[1];
       const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 4}, g);
       if (!df.empty()) DfAhead(b);
-      Dispatch(Exe(fused), (std::string("yah_ffn_gemm_") + (df.empty() ? f.name : "f16") + "_kres").c_str(),
-               MTiles(*t) / g.rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+      // the persistent kres (".af.p.hal": each workgroup runs every token tile of its row block, grid y = 1) unless trimmed
+      const std::string pers = af ? AfHal(fused0, ".af.p.hal") : "";
+      const bool use_p = !pers.empty() && tt == g.tt;
+      Dispatch(Exe(use_p ? pers : fused), (std::string("yah_ffn_gemm_") + (df.empty() ? f.name : "f16") + "_kres").c_str(),
+               MTiles(*t) / g.rowgrp, use_p ? 1 : tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
       if (!df.empty()) DfNext();
       std::swap(hidden_, hidden2_);
       return;
