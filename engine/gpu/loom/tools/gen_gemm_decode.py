@@ -35,9 +35,9 @@ IQ3_SGTAB_W = 2
 # fma(dsc * 2^24, u * 2^-24, -128 dsc) has the same exact product as fma(dsc, u, -128 dsc): bit-identical.
 IQ3_F16P = False
 # IQ4_SC4 (IQ4_XS): the low scale nibble as (scales_l word >> 4g) & 15 and the 6-bit scale with one v_lshl_add (same ints):
-# loop VALU 194 -> 187; one process A/B -0.15..-0.76% (kqg / swiglu +0.1..+0.2%), but pp2048 back to back neutral
-# (IQ4_XS families -0.03% drift-corrected, swiglu +0.66%): off
-IQ4_SC4 = False
+# loop VALU 194 -> 187; alone one process A/B -0.15..-0.76% but pp2048 neutral (IQ4_XS families -0.03%); on with
+# IQ4_PERM
+IQ4_SC4 = True
 # Q3_F16S (Q3_K): quants as signed f16 subnormal pairs (see q3k_compute): loop VALU 281 -> 230; one process A/B
 # kstore -0.55..-0.99%, kqg -0.14%
 Q3_F16S = True
@@ -54,6 +54,9 @@ Q4FMIX = False
 # Q4DFMA (with Q4FMIX): fptrunc(fma(dsc, q, -dm)) straight from the nibble, without the vector multiply and the opaque 1.0:
 # dsc * q has <= 21 significant bits, so it is exact and the fma sees the same value (and zero sign) as fma(dsc * q, 1, -dm).
 Q4DFMA = True
+# IQ4_PERM (IQ4_XS F16PAIR): the odd-byte pair as one v_perm instead of shift + and; with IQ4_SC4 loop VALU
+# 194 -> 175, one process A/B -0.1..-1.0% (kstore 64 +0.3%)
+IQ4_PERM = True
 # Q4_F16P (Q4_K / Q5_K, with Q4DFMA): the quants as f16 subnormal pairs instead of a v_cvt_f32_ubyteN each: Q4_K loop
 # VALU 169 -> 158 (+4 movs), Q5_K 204 -> 202; one process A/B Q4_K -0.4..+0.7% (kres +0.4 / +0.7%): off
 Q4_F16P = False
@@ -222,8 +225,15 @@ def iq4xs_compute(v, gb):
                     # bytes 0 / 2 and 1 / 3 in the low bits of the two halves: f16 subnormals c * 2^-24 (exact)
                     e(f"    %cw{tw} = vector.extract %cuw{part}{u}[{w}] : vector<4xi32> -> i32")
                     e(f"    %cwe{tw} = scalar.andi %cw{tw}, %fpm00ff : i32")
-                    e(f"    %cws{tw} = scalar.shrui %cw{tw}, %c8i_fp : i32")
-                    e(f"    %cwo{tw} = scalar.andi %cws{tw}, %fpm00ff : i32")
+                    if IQ4_PERM:   # bytes 1 / 3 with zero high bytes: one v_perm_b32 (shuffle with a zero word)
+                        e(f"    %cwz{tw} = vector.from_elements %cw{tw}, %c0i : vector<2xi32>")
+                        e(f"    %cwb{tw} = vector.bitcast %cwz{tw} : vector<2xi32> to vector<8xi8>")
+                        e(f"    %cwq{tw} = vector.shuffle<[1, 4, 3, 4, 4, 4, 4, 4]> %cwb{tw} : vector<8xi8>")
+                        e(f"    %cwr{tw} = vector.bitcast %cwq{tw} : vector<8xi8> to vector<2xi32>")
+                        e(f"    %cwo{tw} = vector.extract %cwr{tw}[0] : vector<2xi32> -> i32")
+                    else:
+                        e(f"    %cws{tw} = scalar.shrui %cw{tw}, %c8i_fp : i32")
+                        e(f"    %cwo{tw} = scalar.andi %cws{tw}, %fpm00ff : i32")
                     for hh, src in ((0, f"%cwe{tw}"), (1, f"%cwo{tw}")):
                         e(f"    %cwv{tw}_{hh} = vector.from_elements {src} : vector<1xi32>")
                         e(f"    %cwh{tw}_{hh} = vector.bitcast %cwv{tw}_{hh} : vector<1xi32> to vector<2xf16>")
