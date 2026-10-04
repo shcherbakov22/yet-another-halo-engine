@@ -24,6 +24,12 @@ VDECW_FR = False
 # two shift-adds (n | n << 7, t | t << 14: the bits are disjoint, so OR is the add). Per byte, s = 0: g ^ 0x80 = g + 128;
 # s = 1: (g ^ 0x7f) + 1 = 128 - g (grid magnitudes 1..127: no borrow, no carry). Same bytes as ((g ^ -s) + s) ^ 0x80.
 IQ3_SGN2 = False
+# IQ3_SGTAB (with the IQ3_SGN2 path): the sign words come from a 2 KB LDS table built in the prologue from ksigns: entry i is
+# (k0, s0, k1, s1) with s_h = the sign nibble h of ksigns[i] spread to one bit per byte and k_h = 0x80808080 - s_h, the same
+# integers the per-pair spread computes; one 16-byte load per sign byte replaces the extract / spread / subtract chain.
+IQ3_SGTAB = False             # set per tile (gen_gemm_tile Tile.sgtab)
+# IQ3_SGTAB_W: words per table entry: 4 = (k0, s0, k1, s1); 2 = (s0, s1) with k = 0x80808080 - s in the loop (fewer registers)
+IQ3_SGTAB_W = 2
 # IQ2_W (IQ2_XXS / IQ2_XS): the IQ3 word path (VDEC_W, IQ3_U8F, VDECW_FR) for the IQ2 grids too. Grid magnitudes are 8 / 25 / 43
 # (nonzero, < 128) and d * (2n + 1) / 8 * mag has <= 22 significant bits: the same exactness argument, bit-identical.
 IQ2_W = False
@@ -248,18 +254,32 @@ def _ldd(e, p, blk):
     e(f"    %{p}dh = view.load %w_f16_view[%{p}d_idx] : view<[%w_halfs]xf16> -> f16")
 
 
-def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None):
+def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None, sgt=None):
     """Decode the 8 elements one sign byte covers (grid words lw=2p and 2p+1) and store them to the LDS tile.
     mags = bytes of [gw0, gw1], s = sign bits LSB first, mag = (g ^ -s) + s in i8 (exact: grid magnitudes are < 128)."""
     if VDEC_W:
         # On the two grid words: s1 = sign bit i in byte i (nibble * 0x00204081), m = s1 * 255, mag = (g ^ m) + s1.
         # Per byte that is 256 - g for a set bit, no carry since grid magnitudes are > 0. (i8 vectors lower element by element.)
-        e(f"    %wsb_{t} = scalar.extui {sgb8} : i8 to i32")
         sgn2 = IQ3_SGN2 and IQ3_U8F and VDECW_FR and dsc_s is not None
-        if sgn2:
+        assert sgt is None or sgn2, "the sign table feeds the IQ3_SGN2 path"
+        if sgt is None:
+            e(f"    %wsb_{t} = scalar.extui {sgb8} : i8 to i32")
+        if sgn2 and sgt is None:
             e(f"    %c128i_sg2_{t} = scalar.constant 128 : i32")
             e(f"    %c16384i_sg2_{t} = scalar.constant 16384 : i32")
         for h, gw in ((0, gw0), (1, gw1)):
+            if sgt is not None and IQ3_SGTAB_W == 2:
+                e(f"    %ws1{h}_{t} = vector.extract {sgt}[{h}] : vector<2xi32> -> i32")
+                e(f"    %wsk{h}_{t} = scalar.subi %c80x4_iq3, %ws1{h}_{t} : i32")
+                e(f"    %wsx{h}_{t} = scalar.xori {gw}, %wsk{h}_{t} : i32")
+                e(f"    %wu{h}_{t} = scalar.addi %wsx{h}_{t}, %ws1{h}_{t} : i32")
+                continue
+            if sgt is not None:
+                e(f"    %wsk{h}_{t} = vector.extract {sgt}[{2 * h}] : vector<4xi32> -> i32")
+                e(f"    %ws1{h}_{t} = vector.extract {sgt}[{2 * h + 1}] : vector<4xi32> -> i32")
+                e(f"    %wsx{h}_{t} = scalar.xori {gw}, %wsk{h}_{t} : i32")
+                e(f"    %wu{h}_{t} = scalar.addi %wsx{h}_{t}, %ws1{h}_{t} : i32")
+                continue
             if h:
                 e(f"    %wsn{h}_{t}0 = scalar.shrui %wsb_{t}, %c4i : i32")
             else:
@@ -497,6 +517,13 @@ def iq3xxs_compute(v, gb):
             e(f"    %sid_{u}_{pp} = scalar.andi %sid0_{u}_{pp}, %c127i : i32")
             e(f"    %sidx_{u}_{pp} = index.cast %sid_{u}_{pp} : i32 to index")
             e(f"    %sidc_{u}_{pp} = index.assume %sidx_{u}_{pp} [range(%sidx_{u}_{pp}, 0, 127)] : index")
+            if _sgtab():
+                W = IQ3_SGTAB_W
+                e(f"    %sgi_{u}_{pp} = index.mul %sidc_{u}_{pp}, %sgt_cw : index")
+                e(f"    %sgt_{u}_{pp} = vector.load %sgt_view[%sgi_{u}_{pp}] : view<{128 * W}xi32> -> vector<{W}xi32>")
+                _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], None, f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}",
+                           sgt=f"%sgt_{u}_{pp}")
+                continue
             e(f"    %ks8_{u}_{pp} = view.load %ksigns_view[%sidc_{u}_{pp}] : view<128xi8> -> i8")
             _vdec_pair(e, f"{u}_{pp}", gws[2 * pp], gws[2 * pp + 1], f"%ks8_{u}_{pp}", f"%dsc_v8_{u}", f"%col{u}", u, pp, f"%dsc{u}")
     return L
@@ -525,7 +552,53 @@ def iq3xxs_setup():
             "  %c80x4_iq3 = scalar.constant -2139062144 : i32", "  %cm128f_iq3 = scalar.constant -128.0 : f32",
             "  %c14i_vdw = scalar.constant 14 : i32"] + ((["  %fhalf = scalar.constant 0.5 : f32"])
             + _stage_table("grid", "%grid_na", 256, "i32", 4)
-            + _stage_table("ksigns", "%ksigns_na", 128, "i8", 1))
+            + (_sign_table() if _sgtab() else _stage_table("ksigns", "%ksigns_na", 128, "i8", 1)))
+
+
+def _sgtab():
+    return IQ3_SGTAB and IQ3_SGN2 and IQ3_U8F and VDECW_FR and VDEC_W
+
+
+def _sign_table():
+    """The IQ3_SGTAB table: 128 entries of (s0, s1) or (k0, s0, k1, s1) from ksigns (see IQ3_SGTAB), written in a loop of
+    32-entry steps so any workgroup of at least one wave covers it (entry min(i + tid, 127): duplicates write the same words);
+    the first K phase's leading barrier publishes it."""
+    W = IQ3_SGTAB_W
+    L = [f"  %sgt_cw = index.constant {W} : index",
+         "  %sgt_g = buffer.view %ksigns_na[%base] : buffer -> view<128xi8>",
+         f"  %sgt_bytes = index.constant {512 * W} : offset",
+         "  %sgt_l = buffer.alloca<workgroup> align(16) %sgt_bytes : buffer",
+         f"  %sgt_view = buffer.view %sgt_l[%base] : buffer -> view<{128 * W}xi32>",
+         "  %sgt_max = index.constant 127 : index",
+         "  %sgt_step = index.constant 32 : index",
+         "  %sgt_cnt = index.constant 128 : index",
+         "  %sgt_c4i = scalar.constant 4 : i32", "  %sgt_c7i = scalar.constant 7 : i32", "  %sgt_c14i = scalar.constant 14 : i32",
+         "  %sgt_c15i = scalar.constant 15 : i32", "  %sgt_ones = scalar.constant 16843009 : i32",
+         "  %sgt_k80 = scalar.constant -2139062144 : i32",
+         "  %sgt_sink = scf.for %sgt_i = [%c0 to %sgt_cnt step %sgt_step](%sgt_m = %c0 : index) -> (index) {",
+         "    %sgt_x0 = index.add %sgt_i, %tid : index",
+         "    %sgt_x = index.min %sgt_x0, %sgt_max : index",
+         "    %sgt_b8 = view.load %sgt_g[%sgt_x] : view<128xi8> -> i8",
+         "    %sgt_b = scalar.extui %sgt_b8 : i8 to i32"]
+    ws = []
+    for h in range(2):
+        src = "%sgt_b" if h == 0 else "%sgt_bh"
+        if h:
+            L.append("    %sgt_bh = scalar.shrui %sgt_b, %sgt_c4i : i32")
+        L += [f"    %sgt_n{h} = scalar.andi {src}, %sgt_c15i : i32",
+              f"    %sgt_t7{h} = scalar.shli %sgt_n{h}, %sgt_c7i : i32",
+              f"    %sgt_t{h} = scalar.ori %sgt_n{h}, %sgt_t7{h} : i32",
+              f"    %sgt_p14{h} = scalar.shli %sgt_t{h}, %sgt_c14i : i32",
+              f"    %sgt_p{h} = scalar.ori %sgt_t{h}, %sgt_p14{h} : i32",
+              f"    %sgt_s{h} = scalar.andi %sgt_p{h}, %sgt_ones : i32",
+              f"    %sgt_k{h} = scalar.subi %sgt_k80, %sgt_s{h} : i32"]
+        ws += [f"%sgt_k{h}", f"%sgt_s{h}"] if W == 4 else [f"%sgt_s{h}"]
+    L += [f"    %sgt_e = vector.from_elements {', '.join(ws)} : vector<{W}xi32>",
+          "    %sgt_xi = index.mul %sgt_x, %sgt_cw : index",
+          f"    vector.store %sgt_e, %sgt_view[%sgt_xi] : vector<{W}xi32>, view<{128 * W}xi32>",
+          "    scf.yield %sgt_m : index",
+          "  }"]
+    return L
 
 
 def q4k_loads(p, blk, gb, q5=False):

@@ -181,6 +181,8 @@ Decode:
 - Decode conv fused into DeltaNet (ping-pong conv state): 60.87 -> 60.59 ms.
 - Quantized KV in decode: 30K 74.10 -> 70.56 ms (kv8a16).
 
+- IQ3_XXS sign table (2026-10-04, `gen_gemm_decode.IQ3_SGTAB`, tile knob `sgtab`): the per-pair sign spread (extract, mask, two shift-adds, and) replaced by a 1 KB LDS table of the spread words built in the prologue from ksigns (same integers), with lhs_stream=1 (deeper A streaming splits the A-fragment tuples at the 192-VGPR tier). Loop VALU 202 -> 171; one-process A/B kstore -0.7..-1.0%, kres -1.0%, kqg -0.2%; the fragment-major-output fused ffn / swiglu lose +1.3% and keep the old path. pp2048 back to back -0.20% SQ cycles, GPU references identical. A first table builder wrote entry min(tid, 127) and left part of the table unwritten in the non-afrag kernels' smaller workgroups (wrong pp hidden rows): the builder loops in 32-entry steps.
+
 ## Tried and lost
 
 One line each: what, the number, why.

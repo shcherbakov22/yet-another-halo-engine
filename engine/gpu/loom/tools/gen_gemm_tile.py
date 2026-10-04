@@ -90,6 +90,8 @@ class Tile:
     atiled: bool = False       # afrag input in fragment-major tiles: tile (t/16, k/16) is 256 contiguous halves (k fastest)
     ecoal: bool = False        # tall epilogue: 4 lanes per token (16 rows, 64 contiguous bytes), 8 tokens per access, instead of
                                # 2 lanes per token 32 bytes apart (fewer, larger global requests for the stores and residual loads)
+    sgtab: bool = False        # IQ3_XXS: sign words from the gen_gemm_decode.IQ3_SGTAB LDS table (with lhs_stream=1; not
+                               # the fused ffn / swiglu, whose fragment-major-output forms lose +1.3%)
     esr: int = 16              # tall epilogue slab rows (32 with ecoal: 8 lanes per token, full 128-byte rows per access)
     respre: int = 0            # kres tall epilogue: issue each slab group's residual loads this many groups ahead (0: at use)
     ffn_inload: bool = False   # mixed ffn: each wave loads its own format's weights at its decode (no carried union)
@@ -191,6 +193,7 @@ def configure(fmt, t):
     # the shorter sign chain: IQ3_XXS -0.6% (ffn, kres, swiglu); IQ3_S -0.6..-0.9% with HRX patch 0008 (+0.7..2.5% before it:
     # the allocator's concat fallback copied an A fragment once per phase)
     G.IQ3_SGN2 = t.w3
+    G.IQ3_SGTAB = t.sgtab
     # IQ2: the same word path and sign chain (IQ2_W): -5.6% clock-free
     G.IQ2_W = fmt in ("iq2xxs", "iq2xs")
     if G.IQ2_W:
