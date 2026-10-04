@@ -185,8 +185,9 @@ def configure(fmt, t):
     G.GPL = 1
     G.Q4_HDR = fmt in ("q4k", "q5k")
     G.VDEC_W = G.IQ3_U8F = G.VDECW_FR = t.w3
-    # IQ3_S: the shorter sign chain tips the allocator into A-fragment copies (+0.7..2.5%); IQ3_XXS -0.6% (ffn, kres, swiglu)
-    G.IQ3_SGN2 = t.w3 and fmt == "iq3xxs"
+    # the shorter sign chain: IQ3_XXS -0.6% (ffn, kres, swiglu); IQ3_S -0.6..-0.9% with HRX patch 0008 (+0.7..2.5% before it:
+    # the allocator's concat fallback copied an A fragment once per phase)
+    G.IQ3_SGN2 = t.w3
     # IQ2: the same word path and sign chain (IQ2_W): -5.6% clock-free
     G.IQ2_W = fmt in ("iq2xxs", "iq2xs")
     if G.IQ2_W:

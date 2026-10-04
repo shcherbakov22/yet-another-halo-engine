@@ -38,6 +38,8 @@ Q4DFMA = True
 # (exact; FP16 denormals are on) for 3 ops per 4 values instead of a v_cvt_f32_ubyteN each; narrowed as
 # fptrunc(fma(dsc * 2^24, c * 2^-24, -128 * dsc)): the scaled dsc is exact, so the fma sees the same exact product.
 F16PAIR = True
+# Q4_SEL (Q4_K / Q5_K): the scale / min unpack as both forms + select instead of a divergent scf.if (same integers)
+Q4_SEL = True
 # Q3_FMIX (Q3_K): narrow dsc * q as fptrunc(fma(dsc, q, -0.0)) instead of fptrunc(dsc * q): d * sc * q has <= 19 significant
 # bits, so the product is exact either way, and the -0.0 addend keeps a zero product's sign (q = 0 with dsc < 0 stays -0; the
 # MMA output keeps it too: +0 there changed the GEMM hashes). Selects v_fma_mix{lo,hi} instead of mul + v_cvt_f16_f32.
@@ -636,11 +638,16 @@ def q4k_compute(v, gb, q5=False):
             e(f"    %lb_{u} = scalar.extui {lb} : i8 to i32")
             e(f"    %lc_{u} = scalar.extui {lc} : i8 to i32")
         e(f"    %slo{u} = scalar.cmpi slt, %g{u}, %c4i : i32")
-        e(f"    %sc{u}, %mn{u} = scf.if %slo{u} -> (i32, i32) {{")
-        e(f"      %s_a{u} = scalar.andi %la_{u}, %c63i : i32")
-        e(f"      %m_a{u} = scalar.andi %lb_{u}, %c63i : i32")
-        e(f"      scf.yield %s_a{u}, %m_a{u} : i32, i32")
-        e("    } else {")
+        if Q4_SEL:
+            # both scale / min forms and a select: the same integers without the divergent branch (exec save / restore)
+            e(f"    %s_a{u} = scalar.andi %la_{u}, %c63i : i32")
+            e(f"    %m_a{u} = scalar.andi %lb_{u}, %c63i : i32")
+        else:
+            e(f"    %sc{u}, %mn{u} = scf.if %slo{u} -> (i32, i32) {{")
+            e(f"      %s_a{u} = scalar.andi %la_{u}, %c63i : i32")
+            e(f"      %m_a{u} = scalar.andi %lb_{u}, %c63i : i32")
+            e(f"      scf.yield %s_a{u}, %m_a{u} : i32, i32")
+            e("    } else {")
         e(f"      %lbl{u} = scalar.andi %lb_{u}, %c15i : i32")
         e(f"      %lch{u} = scalar.shrui %lc_{u}, %c6i : i32")
         e(f"      %lch4{u} = scalar.shli %lch{u}, %c4i : i32")
@@ -649,8 +656,12 @@ def q4k_compute(v, gb, q5=False):
         e(f"      %lah{u} = scalar.shrui %la_{u}, %c6i : i32")
         e(f"      %lah4{u} = scalar.shli %lah{u}, %c4i : i32")
         e(f"      %m_b{u} = scalar.ori %lbh{u}, %lah4{u} : i32")
-        e(f"      scf.yield %s_b{u}, %m_b{u} : i32, i32")
-        e("    }")
+        if Q4_SEL:
+            e(f"    %sc{u} = scf.select %slo{u}, %s_a{u}, %s_b{u} : i32")
+            e(f"    %mn{u} = scf.select %slo{u}, %m_a{u}, %m_b{u} : i32")
+        else:
+            e(f"      scf.yield %s_b{u}, %m_b{u} : i32, i32")
+            e("    }")
         e(f"    %scf{u} = scalar.sitofp %sc{u} : i32 to f32")
         e(f"    %mf{u} = scalar.sitofp %mn{u} : i32 to f32")
         e(f"    %dsc{u} = scalar.mulf %d, %scf{u} : f32")
