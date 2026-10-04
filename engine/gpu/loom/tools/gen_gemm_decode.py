@@ -38,6 +38,7 @@ IQ3_F16P = False
 # loop VALU 194 -> 187; one process A/B -0.15..-0.76% (kqg / swiglu +0.1..+0.2%), but pp2048 back to back neutral
 # (IQ4_XS families -0.03% drift-corrected, swiglu +0.66%): off
 IQ4_SC4 = False
+IQ3_F16S = False   # set per tile (gen_gemm_tile Tile.f16s), see _vdec_pair_f16s
 IQ3_GADDR = False             # set per tile (gen_gemm_tile Tile.gaddr), see the grid / sign lookups in iq3*_compute
 IQ3_F16P_PERM = True          # the odd-byte pair as one v_perm (vector.shuffle with a zero word) instead of shift + and
 # IQ2_W (IQ2_XXS / IQ2_XS): the IQ3 word path (VDEC_W, IQ3_U8F, VDECW_FR) for the IQ2 grids too. Grid magnitudes are 8 / 25 / 43
@@ -275,9 +276,70 @@ def _ldd(e, p, blk):
     e(f"    %{p}dh = view.load %w_f16_view[%{p}d_idx] : view<[%w_halfs]xf16> -> f16")
 
 
+def _vdec_pair_f16s(e, t, gw0, gw1, sgb8, col, p, dsc_s, sgt):
+    """IQ3_F16S: grid magnitude bytes g (all > 0) and sign bytes s7 (0x80 / 0) into signed f16 subnormal pairs with one
+    v_perm each: [g0, s0, g2, s2] and [g1, s1, g3, s3] are the halves +-g * 2^-24 (exact), so
+    fptrunc(fma(dsc * 2^24, +-g * 2^-24, +0)) is the exact dsc * (+-g) rounded once, as the biased form
+    fma(dsc * 2^24, (128 +- g) * 2^-24, -128 * dsc) gives, and +0 for dsc = +-0 as there."""
+    s7 = []
+    if sgt is not None and IQ3_SGTAB_W == 2:      # the table holds s << 7
+        for h in range(2):
+            e(f"    %ss7{h}_{t} = vector.extract {sgt}[{h}] : vector<2xi32> -> i32")
+            s7.append(f"%ss7{h}_{t}")
+    elif sgt is not None and IQ3_SGTAB_W == 1:    # the table holds s0 << 7 | s1 << 3
+        e(f"    %ssw_{t} = vector.extract {sgt}[0] : vector<1xi32> -> i32")
+        e(f"    %ss70_{t} = scalar.andi %ssw_{t}, %c80x4_iq3 : i32")
+        e(f"    %ssw4_{t} = scalar.shli %ssw_{t}, %c4i : i32")
+        e(f"    %ss71_{t} = scalar.andi %ssw4_{t}, %c80x4_iq3 : i32")
+        s7 = [f"%ss70_{t}", f"%ss71_{t}"]
+    else:
+        assert sgt is None
+        e(f"    %wsb_{t} = scalar.extui {sgb8} : i8 to i32")
+        e(f"    %c128i_sg2_{t} = scalar.constant 128 : i32")
+        e(f"    %c16384i_sg2_{t} = scalar.constant 16384 : i32")
+        for h in range(2):
+            if h:
+                e(f"    %wsn{h}_{t}0 = scalar.shrui %wsb_{t}, %c4i : i32")
+            else:
+                e(f"    %wsn{h}_{t}0 = scalar.addi %wsb_{t}, %c0i : i32")
+            e(f"    %wsn{h}_{t} = scalar.andi %wsn{h}_{t}0, %c15i : i32")
+            e(f"    %wst{h}_{t} = scalar.fmai %wsn{h}_{t}, %c128i_sg2_{t}, %wsn{h}_{t} : i32")
+            e(f"    %wsp{h}_{t} = scalar.fmai %wst{h}_{t}, %c16384i_sg2_{t}, %wst{h}_{t} : i32")
+            e(f"    %wsq{h}_{t} = scalar.shli %wsp{h}_{t}, %c7i : i32")
+            e(f"    %ss7{h}_{t} = scalar.andi %wsq{h}_{t}, %c80x4_iq3 : i32")
+            s7.append(f"%ss7{h}_{t}")
+    e(f"    %f16p24_{t} = scalar.constant 16777216.0 : f32")
+    e(f"    %ud24_{t} = scalar.mulf {dsc_s}, %f16p24_{t} : f32")
+    e(f"    %uz_{t} = scalar.constant 0.0 : f32")
+    for h, gw in ((0, gw0), (1, gw1)):
+        e(f"    %sgw{h}_{t} = vector.from_elements {gw}, {s7[h]} : vector<2xi32>")
+        e(f"    %sgb{h}_{t} = vector.bitcast %sgw{h}_{t} : vector<2xi32> to vector<8xi8>")
+        for nm, sel in (("e", "0, 4, 2, 6"), ("o", "1, 5, 3, 7")):
+            e(f"    %sgq{nm}{h}_{t} = vector.shuffle<[{sel}, 0, 0, 0, 0]> %sgb{h}_{t} : vector<8xi8>")
+            e(f"    %sgr{nm}{h}_{t} = vector.bitcast %sgq{nm}{h}_{t} : vector<8xi8> to vector<2xi32>")
+            e(f"    %sgx{nm}{h}_{t} = vector.extract %sgr{nm}{h}_{t}[0] : vector<2xi32> -> i32")
+            e(f"    %sgv{nm}{h}_{t} = vector.from_elements %sgx{nm}{h}_{t} : vector<1xi32>")
+            e(f"    %uph{nm}{h}_{t} = vector.bitcast %sgv{nm}{h}_{t} : vector<1xi32> to vector<2xf16>")
+    hs = []
+    for j in range(8):
+        h, b = divmod(j, 4)
+        e(f"    %uyh_{t}_{j} = vector.extract %uph{'e' if b % 2 == 0 else 'o'}{h}_{t}[{b // 2}] : vector<2xf16> -> f16")
+        e(f"    %uy_{t}_{j} = scalar.extf %uyh_{t}_{j} : f16 to f32")
+        e(f"    %um_{t}_{j} = scalar.fmaf %ud24_{t}, %uy_{t}_{j}, %uz_{t} : f32")
+        e(f"    %uh_{t}_{j} = scalar.fptrunc %um_{t}_{j} : f32 to f16")
+        hs.append(f"%uh_{t}_{j}")
+    e(f"    %vh_{t} = vector.from_elements {', '.join(hs)} : vector<8xf16>")
+    e(f"    %vc_{t} = index.constant {8 * p} : index")
+    e(f"    %vco_{t} = index.add {col}, %vc_{t} : index")
+    e(f"    vector.store %vh_{t}, %wl_view[%drow, %vco_{t}] : vector<8xf16>, view<{LR}x{ROWP}xf16>")
+
+
 def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None, sgt=None):
     """Decode the 8 elements one sign byte covers (grid words lw=2p and 2p+1) and store them to the LDS tile.
     mags = bytes of [gw0, gw1], s = sign bits LSB first, mag = (g ^ -s) + s in i8 (exact: grid magnitudes are < 128)."""
+    if IQ3_F16S:
+        assert VDEC_W and IQ3_U8F and dsc_s is not None
+        return _vdec_pair_f16s(e, t, gw0, gw1, sgb8, col, p, dsc_s, sgt)
     if VDEC_W:
         # On the two grid words: s1 = sign bit i in byte i (nibble * 0x00204081), m = s1 * 255, mag = (g ^ m) + s1.
         # Per byte that is 256 - g for a set bit, no carry since grid magnitudes are > 0. (i8 vectors lower element by element.)
@@ -738,9 +800,16 @@ def _sign_table(n=128, from_ksigns=True):
               f"    %sgt_s{h} = scalar.andi %sgt_p{h}, %sgt_ones : i32",
               f"    %sgt_k{h} = scalar.subi %sgt_k80, %sgt_s{h} : i32"]
         ws += [f"%sgt_k{h}", f"%sgt_s{h}"] if W == 4 else [f"%sgt_s{h}"]
-    if W == 1:   # both spread nibbles in one word: s0 in bit 0, s1 in bit 4 of each byte
+    if W == 1 and IQ3_F16S:   # s0 in bit 7, s1 in bit 3 of each byte
+        L += ["    %sgt_s07 = scalar.shli %sgt_s0, %sgt_c7i : i32", "    %sgt_c3i = scalar.constant 3 : i32",
+              "    %sgt_s13 = scalar.shli %sgt_s1, %sgt_c3i : i32", "    %sgt_e1 = scalar.ori %sgt_s07, %sgt_s13 : i32"]
+        ws = ["%sgt_e1"]
+    elif W == 1:   # both spread nibbles in one word: s0 in bit 0, s1 in bit 4 of each byte
         L += ["    %sgt_s1h = scalar.shli %sgt_s1, %sgt_c4i : i32", "    %sgt_e1 = scalar.ori %sgt_s0, %sgt_s1h : i32"]
         ws = ["%sgt_e1"]
+    elif W == 2 and IQ3_F16S:   # the sign bytes at bit 7
+        L += [f"    %sgt_s7{h} = scalar.shli %sgt_s{h}, %sgt_c7i : i32" for h in range(2)]
+        ws = ["%sgt_s70", "%sgt_s71"]
     L += [f"    %sgt_e = vector.from_elements {', '.join(ws)} : vector<{W}xi32>",
           "    %sgt_xi = index.mul %sgt_x, %sgt_cw : index",
           f"    vector.store %sgt_e, %sgt_view[%sgt_xi] : vector<{W}xi32>, view<{n * W}xi32>",
