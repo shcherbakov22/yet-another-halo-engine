@@ -395,16 +395,18 @@ AF_KQP = dict(AF_KQ, **AF_PIPE, lhs_stream=4)
 # fragment-major-output form loses +1.3% with the table although its loop drops 32 VALU; nor swiglu (same, +1.3% in pp2048).
 # IQ3_S (256-entry table of the block's sign bytes): kres 320x68 -0.7%, kqg -1.0%, kstore 384 -0.5%; kstore 1088 / 640
 # +0.5 / +0.2% and the fragment-major ffn / swiglu +0.7 / +2.2% keep the spread.
+# f16p (IQ3 decode bytes as f16 subnormal pairs, one v_perm for the odd bytes; -11..-15 loop VALU): IQ3_S kstore 1088 /
+# kres 320x68 / kqg / swiglu -0.25..-0.55%, fused ffn IQ3_XXS / IQ3_S -0.35%; IQ3_XXS kstore / kqg neutral, kres +1.8% (not).
 # tallepi (kstore / kres): the LDS epilogue in 16-row slabs; the fragment stores cost the K = 6144 kres 15%.
 AF = {
-    ("iq3s", "kstore", 1088, 20): dict(AF_PIPE3, lhs_stream=2),                  # -9.1%
+    ("iq3s", "kstore", 1088, 20): dict(AF_PIPE3, lhs_stream=2, f16p=True),                  # -9.1%
     ("iq4xs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=2),                 # -12.9%
     ("iq3xxs", "kstore", 1088, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True),                # -11.3%
     ("q3k", "kstore", 1088, 20): dict(AF_KQP),                                  # -7.2%
-    ("iq3s", "swiglu", 1088, 20): dict(AF_PIPE3, lhs_stream=2, swepi=False),     # -11.6%
+    ("iq3s", "swiglu", 1088, 20): dict(AF_PIPE3, lhs_stream=2, swepi=False, f16p=True),     # -11.6%
     ("iq4xs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),    # -10.9%
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),   # -12.1%
-    ("iq3s", "kres", 320, 68): dict(AF_PIPE3, sgtab=True, persist=dict(b0early=True, lhs_stream=2)), # -8.6%
+    ("iq3s", "kres", 320, 68): dict(AF_PIPE3, sgtab=True, f16p=True, persist=dict(b0early=True, lhs_stream=2)), # -8.6%
     ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1, persist=True), # -10.4%
     ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=1, sgtab=True, respre=1, persist=True), # -8.2%
     ("q4k", "kres", 320, 68): dict(AF_KQP, respre=1, persist=True),             # -10.4%
@@ -428,7 +430,7 @@ AF = {
     ("q5k", "kstore", 384, 20): dict(AF_KQP, ksl=True),                         # -12%
     ("q5k", "kres", 320, 24): dict(AF_KQP, ksl=True, respre=1, persist=True),   # -4.6%
     # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
-    ("iq3s", "kqg", 768, 20): dict(AF_PIPE3, sgtab=True),                         # -8.4%
+    ("iq3s", "kqg", 768, 20): dict(AF_PIPE3, sgtab=True, f16p=True),                         # -8.4%
     ("iq4xs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=2),                     # -9.5%
     ("iq3xxs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=1, sgtab=True),                    # -9.3%
     ("q4k", "kqg", 768, 20): dict(AF_KQP),                                      # -6.7%
@@ -450,9 +452,9 @@ AF = {
 # values as kstore + swiglu. vs the two afrag GEMMs, clock-free (2026-10-03, fast reciprocal in both): IQ3_S -3.5%,
 # IQ4_XS -0.9%, IQ3_XXS -3.1%.
 AF_FFN = {
-    "iq3s": dict(AF_PIPE, lhs_stream=2, swepi=False),
+    "iq3s": dict(AF_PIPE, lhs_stream=2, swepi=False, f16p=True),
     "iq4xs": dict(AF_PIPE, lhs_stream=2, swepi=False),
-    "iq3xxs": dict(AF_PIPE, lhs_stream=2, swepi=False),
+    "iq3xxs": dict(AF_PIPE, lhs_stream=2, swepi=False, f16p=True),
 }
 
 

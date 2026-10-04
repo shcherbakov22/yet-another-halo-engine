@@ -30,6 +30,11 @@ IQ3_SGN2 = False
 IQ3_SGTAB = False             # set per tile (gen_gemm_tile Tile.sgtab)
 # IQ3_SGTAB_W: words per table entry: 4 = (k0, s0, k1, s1); 2 = (s0, s1) with k = 0x80808080 - s in the loop (fewer registers)
 IQ3_SGTAB_W = 2
+# IQ3_F16P (IQ3_U8F path): the biased bytes u of each sign-applied word as f16 subnormal pairs (w & 0x00ff00ff,
+# (w >> 8) & 0x00ff00ff = u * 2^-24, exact) read by v_fma_mix with dsc * 2^24 (exact) instead of v_cvt_f32_ubyteN:
+# fma(dsc * 2^24, u * 2^-24, -128 dsc) has the same exact product as fma(dsc, u, -128 dsc): bit-identical.
+IQ3_F16P = False
+IQ3_F16P_PERM = True          # the odd-byte pair as one v_perm (vector.shuffle with a zero word) instead of shift + and
 # IQ2_W (IQ2_XXS / IQ2_XS): the IQ3 word path (VDEC_W, IQ3_U8F, VDECW_FR) for the IQ2 grids too. Grid magnitudes are 8 / 25 / 43
 # (nonzero, < 128) and d * (2n + 1) / 8 * mag has <= 22 significant bits: the same exactness argument, bit-identical.
 IQ2_W = False
@@ -324,14 +329,42 @@ def _vdec_pair(e, t, gw0, gw1, sgb8, dsc_v8, col, u, p, dsc_s=None, sgt=None):
         if not (IQ3_SGN2 and VDECW_FR):
             e(f"    %wu0_{t} = scalar.xori %wm0_{t}, %c80x4_iq3 : i32")
             e(f"    %wu1_{t} = scalar.xori %wm1_{t}, %c80x4_iq3 : i32")
-        e(f"    %vuw_{t} = vector.from_elements %wu0_{t}, %wu1_{t} : vector<2xi32>")
-        e(f"    %vub_{t} = vector.bitcast %vuw_{t} : vector<2xi32> to vector<8xi8>")
-        e(f"    %vuf_{t} = vector.uitofp %vub_{t} : vector<8xi8> to vector<8xf32>")
         e(f"    %unb_{t} = scalar.mulf {dsc_s}, %cm128f_iq3 : f32")
+        if IQ3_F16P:
+            e(f"    %f16pm_{t} = scalar.constant 16711935 : i32")
+            e(f"    %f16p8_{t} = scalar.constant 8 : i32")
+            e(f"    %f16p24_{t} = scalar.constant 16777216.0 : f32")
+            e(f"    %ud24_{t} = scalar.mulf {dsc_s}, %f16p24_{t} : f32")
+            e(f"    %upz_{t} = scalar.constant 0 : i32")
+            for h in range(2):
+                e(f"    %upe{h}_{t} = scalar.andi %wu{h}_{t}, %f16pm_{t} : i32")
+                if IQ3_F16P_PERM:
+                    # bytes 1 / 3 into the low byte of each half, zero high bytes: one v_perm_b32 with a zero word
+                    e(f"    %upw{h}_{t} = vector.from_elements %wu{h}_{t}, %upz_{t} : vector<2xi32>")
+                    e(f"    %upb{h}_{t} = vector.bitcast %upw{h}_{t} : vector<2xi32> to vector<8xi8>")
+                    e(f"    %upq{h}_{t} = vector.shuffle<[1, 4, 3, 4, 4, 4, 4, 4]> %upb{h}_{t} : vector<8xi8>")
+                    e(f"    %upr{h}_{t} = vector.bitcast %upq{h}_{t} : vector<8xi8> to vector<2xi32>")
+                    e(f"    %upo{h}_{t} = vector.extract %upr{h}_{t}[0] : vector<2xi32> -> i32")
+                else:
+                    e(f"    %ups{h}_{t} = scalar.shrui %wu{h}_{t}, %f16p8_{t} : i32")
+                    e(f"    %upo{h}_{t} = scalar.andi %ups{h}_{t}, %f16pm_{t} : i32")
+                for nm in ("e", "o"):
+                    e(f"    %upv{nm}{h}_{t} = vector.from_elements %up{nm}{h}_{t} : vector<1xi32>")
+                    e(f"    %uph{nm}{h}_{t} = vector.bitcast %upv{nm}{h}_{t} : vector<1xi32> to vector<2xf16>")
+        else:
+            e(f"    %vuw_{t} = vector.from_elements %wu0_{t}, %wu1_{t} : vector<2xi32>")
+            e(f"    %vub_{t} = vector.bitcast %vuw_{t} : vector<2xi32> to vector<8xi8>")
+            e(f"    %vuf_{t} = vector.uitofp %vub_{t} : vector<8xi8> to vector<8xf32>")
         hs = []
         for j in range(8):
-            e(f"    %uy_{t}_{j} = vector.extract %vuf_{t}[{j}] : vector<8xf32> -> f32")
-            e(f"    %um_{t}_{j} = scalar.fmaf {dsc_s}, %uy_{t}_{j}, %unb_{t} : f32")
+            if IQ3_F16P:
+                h, b = divmod(j, 4)
+                e(f"    %uyh_{t}_{j} = vector.extract %uph{'e' if b % 2 == 0 else 'o'}{h}_{t}[{b // 2}] : vector<2xf16> -> f16")
+                e(f"    %uy_{t}_{j} = scalar.extf %uyh_{t}_{j} : f16 to f32")
+                e(f"    %um_{t}_{j} = scalar.fmaf %ud24_{t}, %uy_{t}_{j}, %unb_{t} : f32")
+            else:
+                e(f"    %uy_{t}_{j} = vector.extract %vuf_{t}[{j}] : vector<8xf32> -> f32")
+                e(f"    %um_{t}_{j} = scalar.fmaf {dsc_s}, %uy_{t}_{j}, %unb_{t} : f32")
             e(f"    %uh_{t}_{j} = scalar.fptrunc %um_{t}_{j} : f32 to f16")
             hs.append(f"%uh_{t}_{j}")
         e(f"    %vh_{t} = vector.from_elements {', '.join(hs)} : vector<8xf16>")
