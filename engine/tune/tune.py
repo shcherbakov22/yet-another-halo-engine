@@ -177,6 +177,15 @@ def roles_of(src):
 def bench(model, table_dir, jobs, work, tag, counters=True):
     """Run jobs [(kernel, tile, hal, roles, tokens, reps)] in one gemm_bench process; return [(cycles, hash)] per job
     (wall ms instead of cycles without counters)."""
+    # Refuse dispatches the hardware rejects: the workgroup's waves per SIMD x VGPRs must fit the 1536-entry wave32 file
+    # and LDS 64 KB. gfx1151 answers an oversized dispatch with a queue teardown that faults the CP and wedges the GPU.
+    for k, t, hal, *_ in jobs:
+        notes = subprocess.run([READELF, "--notes", hal], capture_output=True, text=True).stdout
+        vgpr = int(re.search(r"\.vgpr_count:\s*(\d+)", notes).group(1))
+        lds = int(re.search(r"\.group_segment_fixed_size:\s*(\d+)", notes).group(1))
+        per_simd = -(-(t.wm * t.wn) // 4)
+        if per_simd * vgpr > 1536 or lds > 65536:
+            raise SystemExit(f"refused {hal}: {t.wm * t.wn} waves x {vgpr} VGPRs, LDS {lds} exceed a WGP")
     jf = os.path.join(work, tag + ".jobs")
     with open(jf, "w") as f:
         for k, t, hal, roles, n, reps in jobs:
