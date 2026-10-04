@@ -1,0 +1,46 @@
+Concat placement: when reserving a concat's result span would cross a residency tier, the allocator placed one source
+alone instead. The result needs the same span when it becomes live, so the crossing was only deferred, and the
+misplaced halves made the concat a materialized copy (8 v_mov + a wait on the loads, once per k phase in the afrag
+GEMMs). Keep the reservation when the result's own placement reaches the same tier. Bit-identical results; with the
+IQ3_S sign chain it enables, prefill cycles -0.35% on gfx1151.
+
+diff --git a/loom/src/loom/codegen/low/allocation/concat_reservation.c b/loom/src/loom/codegen/low/allocation/concat_reservation.c
+index 2da740a8d..d20468381 100644
+--- a/loom/src/loom/codegen/low/allocation/concat_reservation.c
++++ b/loom/src/loom/codegen/low/allocation/concat_reservation.c
+@@ -745,7 +745,35 @@ iree_status_t loom_low_allocation_concat_reservation_find(
+             loom_target_residency_evaluate_tier_with_direct_resource_override(
+                 context->residency, current_units_by_reg_class, reg_class_id,
+                 source_location_end);
++        // The source fallback only avoids the lower tier if the result itself
++        // can later be placed below that tier: the result interval needs its
++        // full span when it becomes live. When the result's own ordinary
++        // placement already reaches the reservation's tier, the fallback only
++        // defers the same crossing and leaves a materialized concat (copies of
++        // both halves plus a wait on their loads) behind.
++        bool result_crossing_is_unavoidable = false;
+         if (result_tier < source_tier) {
++          uint32_t result_free_base = 0;
++          if (loom_low_allocation_search_find_free_location(
++                  context, result_interval, capacity, &result_free_base)) {
++            const loom_low_allocation_assignment_t result_free_assignment = {
++                .descriptor_reg_class_id = reg_class_id,
++                .location_kind = capacity.location_kind,
++                .location_base = result_free_base,
++                .location_count = result_interval->unit_count,
++            };
++            const uint32_t result_free_end =
++                iree_max(source_location_end,
++                         loom_low_allocation_storage_assignment_pressure_extent(
++                             context->descriptor_set, &result_free_assignment));
++            const uint32_t result_free_tier =
++                loom_target_residency_evaluate_tier_with_direct_resource_override(
++                    context->residency, current_units_by_reg_class,
++                    reg_class_id, result_free_end);
++            result_crossing_is_unavoidable = result_free_tier <= result_tier;
++          }
++        }
++        if (result_tier < source_tier && !result_crossing_is_unavoidable) {
+           *out_assignment = source_assignment;
+           out_assignment->value_id = source_interval->value_id;
+           out_assignment->value_class = source_interval->value_class;

@@ -23,6 +23,7 @@ Each patch says at its top what it is for. They apply idempotently, so one that 
 | `0005-gfx1151-f16-wmma-operand-placement` | the f16 WMMA spreads its operands over the register banks (upstream does it for bf16 only): prefill GEMM cycles -2.6% |
 | `0006-dispatch-timestamps-callback` | dispatch device timestamps to an in-process callback (`hrx_device_profile_dispatches_*`), used by the shelved prefill calibration |
 | `0007-amdgpu-u24-address-multiplies` | address multiplies use full-rate `v_mul_u32_u24` when value facts prove 24-bit operands: prefill cycles -0.26%, bit-identical |
+| `0008-loom-concat-reservation-unavoidable-tier` | the allocator keeps a concat's result reservation when its residency-tier crossing is unavoidable, instead of placing one half alone and copying both into the tuple later (8 `v_mov` + a load wait per k phase in afrag GEMMs); bit-identical, enables the IQ3_S sign chain |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 
