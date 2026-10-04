@@ -175,9 +175,17 @@ int main(int argc, char** argv) {
         weight_names = j.tensor + j.kind;
       }
       LoomBuffer grid;
-      const bool needs_grid = j.fmt == "iq3s" || j.fmt == "iq3xxs" || j.fmt == "iq2xxs" || j.fmt == "iq2xs";
+      // a mixed ffn ("<gate>:<up>") binds the grid of whichever of its formats has one (the generator allows only one)
+      std::string gfmt = j.fmt;
+      for (std::size_t a = 0, b; a <= j.fmt.size(); a = b + 1) {
+        b = j.fmt.find(':', a);
+        if (b == std::string::npos) b = j.fmt.size();
+        const std::string f = j.fmt.substr(a, b - a);
+        if (f == "iq3s" || f == "iq3xxs" || f == "iq2xxs" || f == "iq2xs") gfmt = f;
+      }
+      const bool needs_grid = gfmt == "iq3s" || gfmt == "iq3xxs" || gfmt == "iq2xxs" || gfmt == "iq2xs";
       if (needs_grid) {
-        const auto g = ReadFile(tables + "/grid_" + j.fmt + ".bin");
+        const auto g = ReadFile(tables + "/grid_" + gfmt + ".bin");
         grid = gpu.Allocate(g.size());
         gpu.H2D(grid, g.data(), g.size());
       }
