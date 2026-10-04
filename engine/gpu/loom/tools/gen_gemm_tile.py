@@ -90,6 +90,7 @@ class Tile:
     atiled: bool = False       # afrag input in fragment-major tiles: tile (t/16, k/16) is 256 contiguous halves (k fastest)
     ecoal: bool = False        # tall epilogue: 4 lanes per token (16 rows, 64 contiguous bytes), 8 tokens per access, instead of
                                # 2 lanes per token 32 bytes apart (fewer, larger global requests for the stores and residual loads)
+    esr: int = 16              # tall epilogue slab rows (32 with ecoal: 8 lanes per token, full 128-byte rows per access)
     respre: int = 0            # kres tall epilogue: issue each slab group's residual loads this many groups ahead (0: at use)
     ffn_inload: bool = False   # mixed ffn: each wave loads its own format's weights at its decode (no carried union)
     ffn: bool = False          # kind "ffn": gate and up fused, weight tile rows 0-63 gate / 64-127 up of the same 64 rows
@@ -388,7 +389,11 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             e("  %a_ktiles = index.div %ktot, %c16 : index")
             e("  %a_tlay = encoding.layout.strided [%c1, %c16] : encoding<layout>")
     # LDS: decoded weight tile and staged activation tile
-    e(f"  %wl_bytes = index.constant {BM * G.ROWP * 2 * (2 if DECAHEAD or DBUF or dq else 1)} : offset")
+    wl_b = BM * G.ROWP * 2 * (2 if DECAHEAD or DBUF or dq else 1)
+    # the tall epilogue's slab rows (kstore / kres; coalesced only): its slabs live in the weight tile
+    esr = t.esr if t.tallepi and t.ecoal and not (ff or sw or qg or masked) else 16
+    wl_b = max(wl_b, NWAVE * (esr + EPAD) * 16 * 4) if esr != 16 else wl_b
+    e(f"  %wl_bytes = index.constant {wl_b} : offset")
     e(f"  %wl_tb = index.constant {BM * G.ROWP * 2} : index")
     e("  %wl = buffer.alloca<workgroup> align(16) %wl_bytes : buffer")
     e(f"  %wl_view = buffer.view %wl[%base] : buffer -> view<{BM}x{G.ROWP}xf16>")
@@ -1035,7 +1040,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("}")
         return "\n".join(L) + "\n"
     if t.tallepi:
-        _lds_epilogue_tall(e, t, kr, V8, masked=masked, qg=qg)
+        _lds_epilogue_tall(e, t, kr, V8, masked=masked, qg=qg, sr=esr)
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
@@ -1243,11 +1248,13 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
         e("  %et_tok_last = index.sub %tokens, %c1 : index")
     e("  %et_lane = index.rem %tid, %c32 : index")
     co = t.ecoal and not qg and not masked
-    assert not co or sr == 16
+    assert co or sr == 16
+    lpt = sr // 4            # lanes per token (16 rows: 4, 64 B; 32 rows: 8, 128 B)
+    tpa = 32 // lpt          # tokens per access
     if co:
-        # lane 4 * t8 + r4: token t8 + 8 q, rows 4 r4 .. 4 r4 + 3 of the slab (one 64-byte row segment per token per access)
-        e("  %et_t = index.div %et_lane, %c4 : index")
-        e("  %et_h0 = index.rem %et_lane, %c4 : index")
+        # lane lpt * t8 + r: token t8 + tpa q, rows 4 r .. 4 r + 3 of the slab (one contiguous row segment per token per access)
+        e(f"  %et_t = index.div %et_lane, %c{lpt} : index")
+        e(f"  %et_h0 = index.rem %et_lane, %c{lpt} : index")
         e("  %et_h = index.mul %et_h0, %c4 : index")
     else:
         e("  %et_t = index.div %et_lane, %c2 : index")
@@ -1257,8 +1264,8 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
     def qoff(y, q):
         # per-access offsets: LDS (slab) and global (output / residual); old mapping: rows + 4 q in both
         if co:
-            e(f"  %et_ql{y} = index.constant {8 * q * (sr + EPAD)} : index")
-            e(f"  %et_qk{y} = index.constant {8 * q} : index")
+            e(f"  %et_ql{y} = index.constant {tpa * q * (sr + EPAD)} : index")
+            e(f"  %et_qk{y} = index.constant {tpa * q} : index")
             e(f"  %et_qg{y} = index.mul %et_qk{y}, %m_rows : index")
             return f"%et_ql{y}", f"%et_qg{y}"
         e(f"  %et_q{y}c = index.constant {4 * q} : index")

@@ -348,7 +348,7 @@ def decode_free(fmt, mt, kb, B, kind, outdir, done):
 # Same values as the GEMM. YAH_AFRAG=0 leaves them out.
 AFRAG = os.environ.get("YAH_AFRAG", "1") != "0"
 AF_TILE = dict(bm=128, bn=512, wm=1, wn=16, ksub=128, dbuf=False, decahead=False, afrag=True, atiled=True, stg_minwg=0,
-               tallepi=True, ecoal=True)
+               tallepi=True, ecoal=True, esr=32)
 AF_PIPE = dict(wlate=True, bpre=2, b0early=True)
 # IQ3_S: step 1's B prefetch issued with step 0's, before the decode; otherwise the allocator copies one of its fragments
 # right after its load, which drains vmcnt(0) once per phase (IQ4_XS: 200 VGPRs with it, fused IQ3_S ffn: 216)
@@ -366,16 +366,16 @@ AF = {
     ("iq3s", "swiglu", 1088, 20): dict(AF_PIPE3, lhs_stream=2, swepi=False),     # -11.6%
     ("iq4xs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),    # -10.9%
     ("iq3xxs", "swiglu", 1088, 20): dict(AF_PIPE, lhs_stream=2, swepi=False),   # -12.1%
-    ("iq3s", "kres", 320, 68): dict(AF_PIPE3),                                   # -8.6%
-    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4),                    # -10.4%
-    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=2, respre=2),         # -8.2%
-    ("q4k", "kres", 320, 68): dict(AF_KQ, respre=2),                            # -10.4%
+    ("iq3s", "kres", 320, 68): dict(AF_PIPE3),                                  # -8.6%
+    ("iq4xs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=4, respre=1),          # -10.4%
+    ("iq3xxs", "kres", 320, 68): dict(AF_PIPE, lhs_stream=2, respre=1),         # -8.2%
+    ("q4k", "kres", 320, 68): dict(AF_KQ, respre=1),                            # -10.4%
     ("q4k", "swiglu", 1088, 20): dict(AF_KQ, swepi=False),                      # -7.7%
     # attention o-proj / DeltaNet ssm_out (K = 6144; input: the attention output, postnorm_t.hal)
-    ("iq3s", "kres", 320, 24): dict(AF_PIPE3),                                   # -8.8%
-    ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=2),         # -8.5%
-    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4),                    # -8.8%
-    ("q4k", "kres", 320, 24): dict(AF_KQ, respre=2),                            # -5.3%
+    ("iq3s", "kres", 320, 24): dict(AF_PIPE3),                                  # -8.8%
+    ("iq3xxs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1),         # -8.5%
+    ("iq4xs", "kres", 320, 24): dict(AF_PIPE, lhs_stream=4, respre=1),          # -8.8%
+    ("q4k", "kres", 320, 24): dict(AF_KQ, respre=1),                            # -5.3%
     # DeltaNet qkv (10240 rows) / gate (6144 rows); input: norm_rt.hal (alpha / beta keep the row-major copy)
     ("iq3s", "kstore", 640, 20): dict(AF_PIPE3),                                 # -9.6%
     ("iq4xs", "kstore", 640, 20): dict(AF_PIPE, lhs_stream=2),                  # -10.3%
@@ -387,7 +387,7 @@ AF = {
     ("iq3xxs", "kstore", 384, 20): dict(AF_PIPE, lhs_stream=4),                 # -10.9%
     ("q4k", "kstore", 384, 20): dict(AF_KQ),                                    # -6.0%
     ("q3k", "kstore", 384, 20): dict(AF_KQ),                                    # -6.4%
-    ("q5k", "kres", 320, 24): dict(AF_KQ, ksl=True, wlate=True),                # -4.6%
+    ("q5k", "kres", 320, 24): dict(AF_KQ, ksl=True, wlate=True, respre=1),      # -4.6%
     # attention q (kqg: 12288 rows, q / gate split) and k / v (1024 rows); input: attn_norm (norm_t / norm_rt)
     ("iq3s", "kqg", 768, 20): dict(AF_PIPE3),                                    # -8.4%
     ("iq4xs", "kqg", 768, 20): dict(AF_PIPE, lhs_stream=2),                     # -9.5%
