@@ -24,6 +24,7 @@ Each patch says at its top what it is for. They apply idempotently, so one that 
 | `0006-dispatch-timestamps-callback` | dispatch device timestamps to an in-process callback (`hrx_device_profile_dispatches_*`), used by the shelved prefill calibration |
 | `0007-amdgpu-u24-address-multiplies` | address multiplies use full-rate `v_mul_u32_u24` when value facts prove 24-bit operands: prefill cycles -0.26%, bit-identical |
 | `0008-loom-concat-reservation-unavoidable-tier` | the allocator keeps a concat's result reservation when its residency-tier crossing is unavoidable, instead of placing one half alone and copying both into the tuple later (8 `v_mov` + a load wait per k phase in afrag GEMMs); bit-identical, enables the IQ3_S sign chain |
+| `0009-loom-omit-dead-fma-mix-seeds` | after allocation, drops the `v_mov_b32 0` that seeds an f16 pair built by `v_fma_mixlo` + `v_fma_mixhi` (no bit of it is ever read), keeping the schedule and registers; afrag kstore cycles -1.0%, bit-identical |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 
