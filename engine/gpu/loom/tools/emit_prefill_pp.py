@@ -265,8 +265,20 @@ OCC3_FROM = 86016   # first context position whose chunk's attention runs 3 work
 OCC3_LDS = 33792    # the LDS floor that caps a WGP at 3 attention workgroups (128 KB / 4 < 33 KB)
 
 
+# From KT2_FROM keys of context on (fp16 attention), a chunk runs the 32-key-tile role-split kernel (gen_attn_fa KT2):
+# 3 workgroups per WGP, one barrier pair / reduction / rescale vote per 32 keys; -0.8% at 16K, -1.8% at 32K, -3..-5.6% at
+# 88K..126K vs the 4-workgroup kernel / the deep twin (standalone); not bit-identical (the running max moves per 32 keys).
+KT2_FROM = int(os.environ.get("YAH_KT2_FROM", "16384"))
+KT2_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=1, PVF=2, KT2=True, KT2_IL=1)
+KT2_VGPR = 240   # 3 workgroups per WGP: 6 waves x 240 (VGPRs allocate in granules of 24 on gfx1151)
+
+
 def deep(path):
     return path.replace(".loom", "_deep.loom")
+
+
+def kt2(path):
+    return path.replace(".loom", "_kt2.loom")
 
 
 def alt(path):
@@ -757,9 +769,12 @@ def main():
 
     def write_attn(path):
         A = gen_attn_fa
-        keys = ("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS)
+        keys = ("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS) + tuple(KT2_FLAGS)
         saved = {k: getattr(A, k) for k in keys}
-        for name, flags in ((path, {}), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS))):
+        twins = [(path, {}), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS))]
+        if not A.KDEC:   # the KT2 twin (fp16 sources only)
+            twins.append((kt2(path), dict(KT2_FLAGS, LDS_MIN=OCC3_LDS)))
+        for name, flags in twins:
             for k, v in flags.items():
                 setattr(A, k, v)
             open(name, "w").write(A.gen())
@@ -933,7 +948,9 @@ def main():
             src = os.path.join(tmp, f"yah_ssm_postnorm{t_}_{tag}.loom")
             open(src, "w").write(txt)
             pn_parts.append((f"postnorm{t_}_{tag}.hal", src, nh))
-    def occ(path, c):   # the 3-workgroup twin for chunks at OCC3_FROM keys of context on
+    def occ(path, c, use_kt2=True):   # the 3-workgroup twins: KT2 from KT2_FROM keys of context on, else PAIR from OCC3_FROM
+        if use_kt2 and c * B >= KT2_FROM and os.path.exists(kt2(path)):
+            return kt2(path)
         return deep(path) if c * B >= OCC3_FROM else path
     fixed = [
         ("yah_residual_add_1d_f32.loom", "accum.hal",
@@ -1035,7 +1052,9 @@ def main():
     # per-lane LDS address math out of the key loop (fp16 -1..-2%; kv4 QROT -0.5% with one extra live register); the
     # kv4 staged-Q build loses 11% and the afrag GEMMs 5-20%, so they compile without it
     def attn_env(loom):
-        loom = loom.replace("_alt.loom", ".loom").replace("_deep.loom", ".loom")
+        if "_kt2" in loom:   # KT2 (fp16 sources only): hoisting capped at 6 new loop-live units (240 VGPRs)
+            return {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "6"}
+        loom = loom.replace("_alt.loom", ".loom").replace("_deep.loom", ".loom").replace("_kt2.loom", ".loom")
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
         if loom in (attn_src, attn_t_src) and (not gen_attn_fa.KDEC or kv8deq):
@@ -1043,9 +1062,16 @@ def main():
         return None
     for loom, outname, configs in fixed:
         E.emit(loom, configs, outname, outdir, attn_env(loom))
+        if outname.startswith("wmma") and "_kt2" in loom:   # KT2 past 240 VGPRs loses its third workgroup: use the old twin
+            hal = os.path.join(outdir, outname)
+            if hal_vgprs(hal) > KT2_VGPR or hal_spills(hal):
+                c = int(re.search(r"_c(\d+)\.hal$", outname).group(1)) if "_c" in outname else 0
+                print("attention %s: KT2 %d VGPRs, %d B spills, re-emitted from the previous twin" % (outname, hal_vgprs(hal), hal_spills(hal)))
+                loom = occ(loom.replace("_kt2.loom", ".loom"), c, use_kt2=False)
+                E.emit(loom, configs, outname, outdir, attn_env(loom))
         if outname.startswith("wmma"):   # attn_guard (deep twins: 3 workgroups per WGP allow 256 VGPRs, never spills)
             hal = os.path.join(outdir, outname)
-            limit = 256 if "_deep" in loom else ATTN_VGPR
+            limit = 256 if "_deep" in loom else KT2_VGPR if "_kt2" in loom else ATTN_VGPR
             if hal_vgprs(hal) > limit or hal_spills(hal):
                 print("attention %s: %d VGPRs, %d B spills, re-emitted without DIAG_SWAP" % (outname, hal_vgprs(hal), hal_spills(hal)))
                 E.emit(alt(loom), configs, outname, outdir, attn_env(loom))
