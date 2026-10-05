@@ -126,6 +126,8 @@ PAIR_BFIRST = False # PAIR: the P.V (B) arm first in the role branch
 PAIR_I32 = True     # PAIR: carry the bank as vector<8xi32>
 PAIR_MID = False    # PAIR: issue the K / V staging loads inside the role arms after their register peak (A: after the
                     # QK MMAs, B: after half the P.V MMAs); the values leave the arms as branch results
+PLDS = False        # P^T exchange through LDS (one store, two loads; no shuffle / half selects)
+PLDS_FENCE = True
 PAIR_PF = 0         # PAIR: explicit fragment prefetch distance in both arms (load frag f+PF before MMA f, fence per MMA)
 PAIR_MID_B = 7      # PAIR_MID: B issues the staging loads after this P.V MMA
 PVF = 2             # PAIR: V fragments in flight in wave B's P.V (a schedule fence every PVF MMAs)
@@ -447,6 +449,16 @@ def gen():
     e("  %tid2 = index.add %tid, %cnt : index")
     e("  %ptid2 = index.add %ptid, %cnt : index")
     e("  %h0 = index.cmp eq, %half, %c0 : index")
+    if PLDS:
+        # P^T exchange through the partner's S-partial plane 0 (read this tile, rewritten by the partner after the tile's last
+        # barrier): lane (n, h) holds keys 8h..8h+7 of column n, stores them at its own S read row ptid (= base + 16h + n)
+        # and reads rows base + n and base + 16 + n
+        e(f"  %pl_vw = buffer.view %pool[%s_o] : buffer -> view<{2 * NT}x8xf16>")
+        e("  %pl_h16 = index.mul %half, %c16 : index")
+        e("  %pl_l0 = index.sub %ptid, %pl_h16 : index")
+        e("  %pl_st = index.add %ptid, %c0 : index")
+        e(f"  %pl_o16 = index.constant {S_OFF + 256} : offset")   # rows + 16 as a view base: an immediate offset
+        e(f"  %pl_vw16 = buffer.view %pool[%pl_o16] : buffer -> view<{2 * NT}x8xf16>")
     # opaque 1.0 / 0.0 (lane & ~lane is 0, unprovable to the folder)
     e("  %lanei = index.cast %lane : index to i32")
     e("  %xm1 = scalar.constant -1 : i32")
@@ -1130,11 +1142,18 @@ def gen():
             e(f"    %pwa = index.add {alb}, %pa_own : index")
             e(f"    view.store %rss, %al_view[%pwa] : f32, view<{PRS2 if SOFT1 else 128}xf32>")
             return None
-        e(f"    %phi = vector.bitcast %ph : {V8H} to {V4I}")
-        e(f"    %ppi, %ppv = kernel.subgroup.shuffle<xor> %phi, %x16, %x32 : {V4I}, i32, i32")
-        e(f"    %pph = vector.bitcast %ppi : {V4I} to {V8H}")
-        e(f"    %plo = scf.select %h0, %ph, %pph : {V8H}")
-        e(f"    %phi2 = scf.select %h0, %pph, %ph : {V8H}")
+        if PLDS:
+            e(f"    vector.store %ph, %pl_vw[%pl_st, %c0] : {V8H}, view<{2 * NT}x8xf16>")
+            if PLDS_FENCE:
+                e("    scf.schedule.fence")
+            e(f"    %plo = vector.load %pl_vw[%pl_l0, %c0] : view<{2 * NT}x8xf16> -> {V8H}")
+            e(f"    %phi2 = vector.load %pl_vw16[%pl_l0, %c0] : view<{2 * NT}x8xf16> -> {V8H}")
+        else:
+            e(f"    %phi = vector.bitcast %ph : {V8H} to {V4I}")
+            e(f"    %ppi, %ppv = kernel.subgroup.shuffle<xor> %phi, %x16, %x32 : {V4I}, i32, i32")
+            e(f"    %pph = vector.bitcast %ppi : {V4I} to {V8H}")
+            e(f"    %plo = scf.select %h0, %ph, %pph : {V8H}")
+            e(f"    %phi2 = scf.select %h0, %pph, %ph : {V8H}")
         e(f"    %pb0 = vector.concat<0> %plo, %phi2 : {V8H}, {V8H} -> {V16H}")
         e(f"    %pb = vector.fragment<rhs> %pb0 shape [%k, %n] : {V16H}")
         # P.V into the (conditionally) rescaled O
