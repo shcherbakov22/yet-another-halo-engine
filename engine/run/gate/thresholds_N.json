@@ -1,16 +1,28 @@
 {
  "tier": "N",
- "note": "quality-neutral bar (user, 2026-10-04): mean KL <= 2e-6, p99.9 <= 1e-4, 0 top-1 flips, |ln PPL ratio| <= 1e-4, against the golden of the current default (~/yah-scratch/golden4); cumulative: gate every candidate together with what already shipped. First set at the HIP engine's distance (5.3e-7 / 1.8e-5), loosened the same day after f16 roundings of single activation tensors measured 1.0-1.3e-6 with 0 flips and flat PPL",
+ "note": "quality-neutral bar (user, 2026-10-05): mean KL <= 2e-6, p99.9 <= 2e-4, 0 top-1 flips, |ln PPL ratio| <= 1e-4 on all 16 windows, against the golden of the current default (~/yah-scratch/golden4); cumulative: gate every candidate together with what already shipped. Calibration: today's engine vs the Oct 1 engine on 12 windows is mean KL 1.95e-6, p99.9 1.8e-4, 0 flips (two legitimate engine versions); 4-window tails undersample p99.9",
  "windows": [
   "00",
   "01",
   "02",
-  "03"
+  "03",
+  "04",
+  "05",
+  "06",
+  "07",
+  "08",
+  "09",
+  "10",
+  "11",
+  "12",
+  "13",
+  "14",
+  "15"
  ],
  "from": 1536,
  "tie": 0.1,
  "kl_mean_max": 2e-06,
- "kl_p999_max": 0.0001,
+ "kl_p999_max": 0.0002,
  "flips_max": 0,
  "abs_ln_ppl_ratio_max": 0.0001
 }
