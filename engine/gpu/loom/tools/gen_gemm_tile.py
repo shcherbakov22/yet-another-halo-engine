@@ -139,6 +139,9 @@ class Tile:
         return self.lanes // self.bn
 
 
+# set per emitted shape by emit_prefill_pp._emit_gen (O16_MT): kstore outputs stored as f16 for f16 consumers
+OUT16 = False
+
 def default_tile(fmt, kind, kb, geom=None):
     """The shipped Tile for fmt / kind at k_blocks kb; geom=(BM, BN, WM, WN) overrides the geometry (16-row tiles)."""
     if geom:
@@ -1145,7 +1148,7 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
         e("  %qg_c512 = index.constant 512 : index")
         e("  %qg_c256 = index.constant 256 : index")
     else:
-        e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
+        e(f"  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]x{'f16' if OUT16 and not kr else 'f32'}>")
     if kr:
         e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
     if masked:
@@ -1223,7 +1226,11 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
                 e(f"    vector.store {val}, %g_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
                 e("  }")
             else:
-                e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
+                if OUT16 and not kr:   # f16 output (emit_prefill_pp.O16_MT: consumers read f16)
+                    e(f"  %es_h{j}_{q} = vector.fptrunc {val} : vector<4xf32> to vector<4xf16>")
+                    e(f"  vector.store %es_h{j}_{q}, %out_flat[%es_oi{j}_{q}] : vector<4xf16>, view<[%out_total]xf16>")
+                else:
+                    e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
         if masked:
             e("  }")
 
@@ -1254,7 +1261,7 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
         e("  %qg_c512 = index.constant 512 : index")
         e("  %qg_c256 = index.constant 256 : index")
     else:
-        e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
+        e(f"  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]x{'f16' if OUT16 and not kr else 'f32'}>")
     if kr:
         e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
     if masked:
@@ -1378,7 +1385,11 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                     e(f"    vector.store {val}, %g_flat[%qg_oi{y}] : vector<4xf32>, view<[%qg_tot]xf32>")
                     e("  }")
                 else:
-                    e(f"  vector.store {val}, %out_flat[%et_oi{y}] : vector<4xf32>, view<[%out_total]xf32>")
+                    if OUT16 and not kr:   # f16 output (emit_prefill_pp.O16_MT: consumers read f16)
+                        e(f"  %et_h16{y} = vector.fptrunc {val} : vector<4xf32> to vector<4xf16>")
+                        e(f"  vector.store %et_h16{y}, %out_flat[%et_oi{y}] : vector<4xf16>, view<[%out_total]xf16>")
+                    else:
+                        e(f"  vector.store {val}, %out_flat[%et_oi{y}] : vector<4xf32>, view<[%out_total]xf32>")
             if masked:
                 e("  }")
 
@@ -1496,7 +1507,7 @@ def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
         e("  %qg_c512 = index.constant 512 : index")
         e("  %qg_c256 = index.constant 256 : index")
     else:
-        e("  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]xf32>")
+        e(f"  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]x{'f16' if OUT16 and not kr else 'f32'}>")
     if kr:
         e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
     if masked:
@@ -1590,7 +1601,11 @@ def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
                 e(f"    vector.store {val}, %g_flat[%qg_oi{j}_{q}] : vector<4xf32>, view<[%qg_tot]xf32>")
                 e("  }")
             else:
-                e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
+                if OUT16 and not kr:   # f16 output (emit_prefill_pp.O16_MT: consumers read f16)
+                    e(f"  %es_h{j}_{q} = vector.fptrunc {val} : vector<4xf32> to vector<4xf16>")
+                    e(f"  vector.store %es_h{j}_{q}, %out_flat[%es_oi{j}_{q}] : vector<4xf16>, view<[%out_total]xf16>")
+                else:
+                    e(f"  vector.store {val}, %out_flat[%es_oi{j}_{q}] : vector<4xf32>, view<[%out_total]xf32>")
         if masked:
             e("  }")
 

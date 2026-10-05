@@ -126,10 +126,52 @@ def postnorm_heads(text, h0, nh, B):
     return text
 
 
+# O16_MT: kstore shapes whose outputs are stored as f16 (their consumers read f16): 640 = attn_qkv (conv, prep_ab), 384 =
+# attn_gate (the DeltaNet z: postnorm). Not bit-exact; gate N (see engine/run/gate) with the f16 qkv + z simulation:
+# mean KL 1.8e-6, p99.9 1.3e-4, 0 flips on 16 windows.
+O16_MT = (640, 384)
+
 # DNSPLIT: DeltaNet as two dispatches, heads 0-39 (80 workgroups: two full rounds of 40 slots) and 40-47 (16), with the
 # postnorm split the same way; the second part writes its own output buffer, so the first part's postnorm depends only on
 # the first DeltaNet part and runs beside the second (whose 16 workgroups fill 16 of 40 slots). Same math per head.
 DNSPLIT = (40, 8)
+
+
+def _rewrite(text, pairs):
+    for a, b in pairs:
+        assert text.count(a) == 1, a
+        text = text.replace(a, b)
+    return text
+
+
+def conv_x16(text):
+    """yah_ssm_conv_kq reading the qkv GEMM's f16 output (O16_MT 640): each tap widened back to f32 at its load."""
+    pairs = [("%x_view = buffer.view %x_noalias[%base] : buffer -> view<[%x_total]xf32>",
+              "%x_view = buffer.view %x_noalias[%base] : buffer -> view<[%x_total]xf16>")]
+    for v in ("s3", "x1", "x2", "x3"):
+        off = "%s3_off" if v == "s3" else f"%{v}_off"
+        pairs.append((f"    %{v} = view.load %x_view[{off}] : view<[%x_total]xf32> -> f32\n",
+                      f"    %{v}h = view.load %x_view[{off}] : view<[%x_total]xf16> -> f16\n"
+                      f"    %{v} = scalar.extf %{v}h : f16 to f32\n"))
+    return _rewrite(text, pairs)
+
+
+def prepab_x16(text):
+    """yah_deltanet_prep_ab reading the qkv GEMM's f16 output for the conv ring (O16_MT 640)."""
+    return _rewrite(text, [
+        ("%qkv_view = buffer.view %qkv_na[%base] : buffer -> view<[%qkv_total]xf32>",
+         "%qkv_view = buffer.view %qkv_na[%base] : buffer -> view<[%qkv_total]xf16>"),
+        ("%v = view.load %qkv_view[%src] : view<[%qkv_total]xf32> -> f32\n",
+         "%vh = view.load %qkv_view[%src] : view<[%qkv_total]xf16> -> f16\n        %v = scalar.extf %vh : f16 to f32\n")])
+
+
+def postnorm_g16(text):
+    """yah_ssm_postnorm_fp16 reading the DeltaNet z gate as the f16 output of its GEMM (O16_MT 384)."""
+    return _rewrite(text, [
+        ("%gate_view = buffer.view %gate_na[%base] : buffer -> view<[%io_total]xf32>",
+         "%gate_view = buffer.view %gate_na[%base] : buffer -> view<[%io_total]xf16>"),
+        ("%g = view.load %gate_view[%off2] : view<[%io_total]xf32> -> f32\n",
+         "%gh = view.load %gate_view[%off2] : view<[%io_total]xf16> -> f16\n      %g = scalar.extf %gh : f16 to f32\n")])
 
 
 def conv_n16(text):
@@ -544,6 +586,8 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
 def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False):
     if B % tile and not masked:
         return None
+    import gen_gemm_tile as _TG
+    _TG.OUT16 = kind == "kstore" and mt in O16_MT
     tt = -(-B // tile)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
@@ -710,11 +754,21 @@ def main():
     dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
     open(dn_src, "w").write(gen_gdn_chunk.gen() if B % 32 == 0 else gen_deltanet_hip.gen())
     # the conv pairs with the DeltaNet kernel: f16 normalized hand-off to the chunked one, f32 conv_out otherwise
-    conv_src = os.path.join(E.LOOM, "yah_ssm_conv_kq_f32.loom")
+    text = open(os.path.join(E.LOOM, "yah_ssm_conv_kq_f32.loom")).read()
+    if 640 in O16_MT:
+        text = conv_x16(text)
     if B % 32 == 0 and gen_gdn_chunk.CONV16:
-        text = conv_n16(open(conv_src).read())
-        conv_src = os.path.join(tmp, "yah_ssm_conv_kq_n16.loom")
-        open(conv_src, "w").write(text)
+        text = conv_n16(text)
+    conv_src = os.path.join(tmp, "yah_ssm_conv_kq.loom")
+    open(conv_src, "w").write(text)
+    prepab_src = os.path.join(tmp, "yah_deltanet_prep_ab.loom")
+    text = open(os.path.join(E.LOOM, "yah_deltanet_prep_ab_f32.loom")).read()
+    open(prepab_src, "w").write(prepab_x16(text) if 640 in O16_MT else text)
+    postnorm_base = open(os.path.join(E.LOOM, "yah_ssm_postnorm_gate_f16.loom")).read()
+    if 384 in O16_MT:
+        postnorm_base = postnorm_g16(postnorm_base)
+    postnorm_src = os.path.join(tmp, "yah_ssm_postnorm.loom")
+    open(postnorm_src, "w").write(postnorm_base)
     geom.append(("rowsplit.hal", 0, 2, 0))
     dn_parts = []
     if B % 32 == 0 and DNSPLIT:
@@ -777,10 +831,10 @@ def main():
     open(normrt_src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled="both"))
     # the DeltaNet postnorm, fragment-major for an afrag ssm_out
     postnorm_t_src = os.path.join(tmp, "yah_ssm_postnorm_tiled.loom")
-    open(postnorm_t_src, "w").write(postnorm_tiled(open(os.path.join(E.LOOM, "yah_ssm_postnorm_gate_f16.loom")).read()))
+    open(postnorm_t_src, "w").write(postnorm_tiled(postnorm_base))
     pn_parts = []
     for tag, h0, nh, _ in dn_parts:
-        base = open(os.path.join(E.LOOM, "yah_ssm_postnorm_gate_f16.loom")).read()
+        base = postnorm_base
         for t_, txt in (("", postnorm_heads(base, h0, nh, B)), ("_t", postnorm_tiled(postnorm_heads(base, h0, nh, B)))):
             src = os.path.join(tmp, f"yah_ssm_postnorm{t_}_{tag}.loom")
             open(src, "w").write(txt)
@@ -802,7 +856,7 @@ def main():
         (conv_src, "convkq.hal",
          ["yah_ssm_conv_kq.batch=%d" % B, "yah_ssm_conv_kq.qkv_dim=10240",
           "yah_ssm_conv_kq.num_key_heads=16"]),
-        ("yah_deltanet_prep_ab_f32.loom", "prepab.hal",
+        (prepab_src, "prepab.hal",
          ["yah_deltanet_prep_ab.batch=%d" % B,
           "yah_deltanet_prep_ab.qkv_size=10240",
           "yah_deltanet_prep_ab.num_heads=48"]),
@@ -810,7 +864,7 @@ def main():
          ["yah_deltanet.batch=%d" % B, "yah_deltanet.qkv_size=10240",
           "yah_deltanet.inner_size=6144", "yah_deltanet.num_key_heads=16",
           "yah_deltanet.num_heads=48"]),
-        ("yah_ssm_postnorm_gate_f16.loom", "postnorm.hal",
+        (postnorm_src, "postnorm.hal",
          ["yah_ssm_postnorm_fp16.head_count=%d" % (48 * B)]),
         *[(src, f"rowsplit_{tag}.hal",
            ["yah_deltanet.batch=%d" % B, "yah_deltanet.qkv_size=10240",
