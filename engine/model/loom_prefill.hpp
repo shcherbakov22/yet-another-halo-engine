@@ -114,6 +114,14 @@ class LoomPrefill {
     if (n_ == 0) throw LoomError("prefill: RunLayers before Embed");
     // The layers go into one graph, so kernels with no data between them (the input projections of a layer, the DeltaNet
     // gate projection and the conv / DeltaNet chain) can run at the same time.
+    if (DumpOn()) {   // YAH_DUMP_ACT: no graph, so RunNorm can synchronize and read its output back
+      if (!df_planned_) PlanDecodeFree(ci);
+      nodes_.clear();
+      df_on_ = false;
+      RecordLayers(ci, hook);
+      gpu_.Synchronize();
+      return;
+    }
     LoomGraph graph(gpu_);
     graph.ReadOnly(weights_);
     for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, ksigns_, eps_, reszero_})
@@ -779,6 +787,7 @@ class LoomPrefill {
     const std::uint32_t rows_per_wg = ws ? ws / 32 / split : 1;
     if (!rows_per_wg || (ws && ws % (32 * split))) throw LoomError("norm.hal: workgroup size does not match norm_split");
     if (B_ % rows_per_wg) throw LoomError("norm.hal: rows per workgroup must divide the chunk");
+    DumpNorm(wname);
     Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1,
              mode == NormOut::kBoth
                  ? std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
@@ -786,6 +795,31 @@ class LoomPrefill {
                  : std::vector<hrx_buffer_ref_t>{Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_),
                                                  Ref(mode == NormOut::kTiled ? *normt_ : *scratch_)});
   }
+  // Debug (YAH_DUMP_ACT=<prefix>, YAH_DUMP_LAYERS=l0,l1,..): the row-major f16 output of each RMSNorm that feeds a GEMM
+  // in those layers (n_ rows x 5120) to <prefix>_<norm weight name>.f16, from an extra norm.hal pass into its own buffer.
+  bool DumpOn() const { return std::getenv("YAH_DUMP_ACT") != nullptr; }
+  void DumpNorm(const std::string& wname) {
+    const char* prefix = std::getenv("YAH_DUMP_ACT");
+    if (!prefix || wname.rfind("blk.", 0) != 0) return;
+    const std::string layer = wname.substr(4, wname.find('.', 4) - 4);
+    const std::string want = std::string(",") + (std::getenv("YAH_DUMP_LAYERS") ? std::getenv("YAH_DUMP_LAYERS") : "") + ",";
+    if (want.find("," + layer + ",") == std::string::npos) return;
+    if (!dumpbuf_) dumpbuf_ = &Alloc(std::size_t{B_} * kHidden * 2);
+    const LoomExecutable& exe = Exe("norm.hal");
+    const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
+    const auto ns = geom_.find("norm_split");
+    const std::uint32_t split = ns != geom_.end() && ns->second.rowgrp ? ns->second.rowgrp : 1;
+    const std::uint32_t rows_per_wg = ws ? ws / 32 / split : 1;
+    Dispatch(exe, "yah_half_norm", B_ / rows_per_wg, 1, 1, 32, 1, 1,
+             {Ref(*hidden_), Ref(*reszero_), TRef(*Find(wname)), Ref(*sumout_), Ref(*dumpbuf_)});
+    gpu_.Synchronize();
+    std::vector<std::uint16_t> host(std::size_t{n_} * kHidden);
+    gpu_.D2H(*dumpbuf_, host.data(), host.size() * 2);
+    std::ofstream(std::string(prefix) + "_" + wname + ".f16", std::ios::binary)
+        .write(reinterpret_cast<const char*>(host.data()), static_cast<std::streamsize>(host.size() * 2));
+  }
+  LoomBuffer* dumpbuf_ = nullptr;
+
   // Decode-free GEMMs (emit_prefill_pp.py decode_free): "dq_<fmt>_<mt>_<kb>.hal" decodes a GEMM's weights to f16 scratch
   // once per chunk with the tile GEMM's own decode (the same f16 values), "gemm_<kind>_f16_<mt>_<kb>.hal" multiplies them
   // without decode. The pass for the next GEMM is recorded right after each GEMM: no edge between them, so they share a
