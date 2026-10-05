@@ -124,6 +124,10 @@ PAIR_MAP = "mod"    # "mod": pair = waves (p, p + 4), one A and one B per SIMD; 
 PAIR_LATE = True    # PAIR: K / V staging loads in phase 2 (fewer VGPRs, but their latency is exposed: off when deployed)
 PAIR_BFIRST = False # PAIR: the P.V (B) arm first in the role branch
 PAIR_I32 = True     # PAIR: carry the bank as vector<8xi32>
+PAIR_MID = False    # PAIR: issue the K / V staging loads inside the role arms after their register peak (A: after the
+                    # QK MMAs, B: after half the P.V MMAs); the values leave the arms as branch results
+PAIR_PF = 0         # PAIR: explicit fragment prefetch distance in both arms (load frag f+PF before MMA f, fence per MMA)
+PAIR_MID_B = 7      # PAIR_MID: B issues the staging loads after this P.V MMA
 PVF = 2             # PAIR: V fragments in flight in wave B's P.V (a schedule fence every PVF MMAs)
 DOWHILE = True      # PAIR: bottom-tested loop (scf.while with the body in the condition region): the post-loop code then
                     # reads the last body outputs, not the loop-header block arguments, which Loom's linear live
@@ -1160,7 +1164,7 @@ def gen():
         BK = "vector<8xi32>" if PAIR_I32 else V8
         rtypes = ", ".join([BK] * 16)
 
-    def pair_pv(slot_rows, slot_al, R, pp, ind):
+    def pair_pv(slot_rows, slot_al, R, pp, ind, mid_cb=None):
         """B: rescale the O bank by A's alpha of that tile (only when some row's max grew, as the A-side branch did),
         P^T from LDS, 16 P.V MMAs. Returns the new bank names."""
         e(f"{ind}%{pp}ai = index.add {slot_al}, %pa_own : index")
@@ -1192,9 +1196,17 @@ def gen():
         e(f"{ind}%{pp}pb0 = vector.concat<0> %{pp}plo, %{pp}phi : {V8H}, {V8H} -> {V16H}")
         e(f"{ind}%{pp}pb = vector.fragment<rhs> %{pp}pb0 shape [%k, %n] : {V16H}")
         outs = []
-        for f in range(16):
+
+        def vload(f):
             e(f"{ind}%{pp}vr{f} = index.constant {16 * f} : index")
             e(f"{ind}%{pp}vf{f} = vector.fragment.load<lhs> %v_view[%{pp}vr{f}, %c0] shape [%m, %k] : view<256x{VT_PITCH}xf16> -> {V16H}")
+        for f in range(PAIR_PF):
+            vload(f)
+        for f in range(16):
+            if not PAIR_PF:
+                vload(f)
+            elif f + PAIR_PF < 16:
+                vload(f + PAIR_PF)
             e(f"{ind}%{pp}oi{f} = vector.fragment<init> {sc[f]} shape [%m, %n] : {V8}")
             e(f"{ind}%{pp}nx{f} = vector.mma %{pp}vf{f}, %{pp}pb, %{pp}oi{f} : {V16H}, {V16H}, {V8}")
             if PAIR_I32:
@@ -1202,8 +1214,10 @@ def gen():
                 outs.append(f"%{pp}nxi{f}")
             else:
                 outs.append(f"%{pp}nx{f}")
-            if f < 15 and (f + 1) % PVF == 0:
+            if f < 15 and ((f + 1) % PVF == 0 or PAIR_PF):
                 e(f"{ind}scf.schedule.fence")
+            if f == PAIR_MID_B and mid_cb:
+                mid_cb()
         return outs
 
     def pair_a(R, ind):
@@ -1212,7 +1226,25 @@ def gen():
             e(f"{ind}%qb16_{c} = vector.bitcast {R[c]} : {BK} to {V16H}")
             e(f"{ind}%qf{c} = vector.fragment<rhs> %qb16_{c} shape [%k, %n] : {V16H}")
         chains = []
-        for h in range(2):
+        if PAIR_PF:
+            def kload(c):
+                e(f"{ind}%kfc{c} = index.constant {16 * c} : index")
+                e(f"{ind}%kf{c} = vector.fragment.load<lhs> %k_view[%c0, %kfc{c}] shape [%m, %k] : view<{KT}x{KT_PITCH}xf16> -> {V16H}")
+            acc = {}
+            for h in range(2):
+                e(f"{ind}%sz{h} = vector.fragment<init> %zeros8 shape [%m, %n] : {V8}")
+                acc[h] = f"%sz{h}"
+            for c in range(PAIR_PF):
+                kload(c)
+            for c in range(16):
+                if c + PAIR_PF < 16:
+                    kload(c + PAIR_PF)
+                e(f"{ind}%sa{c} = vector.mma %kf{c}, %qf{c}, {acc[c // 8]} : {V16H}, {V16H}, {V8}")
+                acc[c // 8] = f"%sa{c}"
+                if c < 15:
+                    e(f"{ind}scf.schedule.fence")
+            chains = [acc[0], acc[1]]
+        for h in range(0 if PAIR_PF else 2):
             e(f"{ind}%sz{h} = vector.fragment<init> %zeros8 shape [%m, %n] : {V8}")
             acc = f"%sz{h}"
             for c in range(8 * h, 8 * h + 8):
@@ -1477,7 +1509,9 @@ def gen():
 
     def pair_tile_head(I):
         e(f"{I}%ks16 = index.add %ks_, %c16 : index")
-        if PAIR_LATE:
+        if PAIR_MID:
+            nk = nv = "mid"
+        elif PAIR_LATE:
             nk = nv = None
         else:
             nk = load_k("%ks16", "nk", I)
@@ -1489,6 +1523,8 @@ def gen():
 
     def pair_tile_tail(nk, nv, I):
         e(f"{I}kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        if nk == "mid":
+            nk, nv = ["%stk0", "%stk1"], ["%stv0", "%stv1"]
         if nk is None:
             nk = load_k("%ks16", "nk", I)
             nv = load_v("%ks_", "nv", I)
@@ -1506,16 +1542,28 @@ def gen():
         e(f"{I}%prev_rows = index.mul %kpar1, %c128p : index")
         e(f"{I}%prev_al = index.mul %kpar1, %c64 : index")
         nb = [f"%nb{f}" for f in range(16)]
+        mid = PAIR_MID
+        stg = {}
+
+        def loads(px):
+            stg[px] = load_k("%ks16", f"nk{px}", I + "  ") + load_v("%ks_", f"nv{px}", I + "  ")
+        xt = (", " + ", ".join([V8H] * 4)) if mid else ""
+
         def arm_a():
             pair_a(rnames, I + "  ")
+            if mid:
+                loads("a")
             emit_softmax_pv(None, True, pair_slot=("%slot_rows", "%slot_al"))
-            e(f"{I}  scf.yield {', '.join(rnames)}, %nmax, %nsum : {rtypes}, f32, f32")
+            xs = (", " + ", ".join(stg["a"])) if mid else ""
+            e(f"{I}  scf.yield {', '.join(rnames)}, %nmax, %nsum{xs} : {rtypes}, f32, f32{xt}")
 
         def arm_b():
-            outs = pair_pv("%prev_rows", "%prev_al", rnames, "bp", I + "  ")
-            e(f"{I}  scf.yield {', '.join(outs)}, %rmax, %rsum : {rtypes}, f32, f32")
+            outs = pair_pv("%prev_rows", "%prev_al", rnames, "bp", I + "  ", (lambda: loads("b")) if mid else None)
+            xs = (", " + ", ".join(stg["b"])) if mid else ""
+            e(f"{I}  scf.yield {', '.join(outs)}, %rmax, %rsum{xs} : {rtypes}, f32, f32{xt}")
         e(f"{I}%isBr = index.cmp ne, %prole, %c0 : index")
-        e(f"{I}{', '.join(nb)}, %qmax, %qsum = scf.if {'%isBr' if PAIR_BFIRST else '%isA'} -> ({rtypes}, f32, f32) {{")
+        xr = ", %stk0, %stk1, %stv0, %stv1" if mid else ""
+        e(f"{I}{', '.join(nb)}, %qmax, %qsum{xr} = scf.if {'%isBr' if PAIR_BFIRST else '%isA'} -> ({rtypes}, f32, f32{xt}) {{")
         (arm_b if PAIR_BFIRST else arm_a)()
         e(f"{I}}} else {{")
         (arm_a if PAIR_BFIRST else arm_b)()
