@@ -15,6 +15,9 @@ Prefill, default set (FA attention, chunked DeltaNet, paged KV; HRX pin a02a5ab9
 | 8192 / 30720 | same, kv8a16 | 13270.9 / 60182.6 ms | - | 2026-10-02 |
 | 8192 / 30720 | same, kv4a16 | 14111.8 / 60315.3 ms | - | 2026-10-02 |
 | 65536 | chunked (2048), fp16 / kv8a16 / kv4a16 | 232.8 / 242.1 / 234.7 s | - | 2026-10-02 |
+| 131072 | chunked (2048), kv4a16, 128K pools | 379.8 s (345 tok/s); its first 65536 tokens 141.2 s | - | 2026-10-05, Bleak House (pg1023) prompt, dispatch timestamps; per chunk 779 -> 245 tok/s, attention 43% of the run and 61% of the last chunk at ~60% of its WMMA floor (63% in counter cycles; L2 hit ~70%, ~2 GB/s past L2); GPU clock 2360 -> ~1600 MHz at 96 C (chassis heat soak). yah-scratch/long128k |
+
+OS power knobs under a 32K prefill (2026-10-05): the CPU cores draw 0.2 W during prefill (RAPL), so there is nothing to take from them; forcing the data fabric down (manual DPM, `pp_dpm_fclk` level 1 or 2, both ~1105 MHz, which also pulls the memory clock 999 -> 821 MHz) saves ~5 W of socket power but the GPU clock stays put at its 95 C hotspot limit and the prefill runs 1.6-3.4% slower; `pp_dpm_mclk` cannot be forced on this APU; platform profiles change nothing.
 
 pp8192 rounds from the same <= 55 C start vary by up to ~5% in wall time with the GPU clock (2.0-2.1 GHz) while their counter cycles match to 0.03%, so compare pp8192 on cycles.
 
