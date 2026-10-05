@@ -111,8 +111,8 @@ GATE_FENCE = True
 # tile's selects pass S through. The branch sits after the K staging and the S partner loads (the mask needs them), so
 # its join drains nothing.
 DIAG_MASK = True
-DIAG_SWAP = False   # the mask branch as 'all lanes unmasked' with the pass-through arm first (layout order)
-KCLAMP_S = False    # K tile rows clamped by one scalar min of the tile start (cap - 16), not a per-lane min
+DIAG_SWAP = True    # the mask branch as 'all lanes unmasked' with the pass-through arm first (layout order)
+KCLAMP_S = True     # K tile rows clamped by one scalar min of the tile start (cap - 16), not a per-lane min
 KVMAJOR = False     # workgroup order KV head slowest (lost: +67% at 96K, see docs/results.md)
 LDS_MIN = 0         # LDS pool floor in bytes (> 32 KB caps a WGP at 3 attention workgroups)
 # DEC_LSHADD: in the int4 / int8 K and V decoders, a left-shifted nibble pair ((w << s) & M) | C becomes

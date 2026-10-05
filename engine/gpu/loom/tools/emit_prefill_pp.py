@@ -9,7 +9,7 @@ HAL names follow emit_prefill.py.
 
 usage: emit_prefill_pp.py <model.gguf> <outdir> [tokens]   (default 2048 tokens)
 """
-import dataclasses, functools, json, os, re, sys, shutil
+import dataclasses, functools, json, os, re, subprocess, sys, shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -267,6 +267,19 @@ OCC3_LDS = 33792    # the LDS floor that caps a WGP at 3 attention workgroups (1
 
 def deep(path):
     return path.replace(".loom", "_deep.loom")
+
+
+def alt(path):
+    return path.replace(".loom", "_alt.loom")
+
+
+ATTN_VGPR = 192   # every attention variant fits here unless the allocator rotates the O accumulators
+
+
+def hal_vgprs(hal):
+    notes = subprocess.run(["/opt/rocm/llvm/bin/llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
+    m = re.search(r"\.vgpr_count:\s*(\d+)", notes)
+    return int(m.group(1)) if m else 0
 
 
 QROT_FROM = 12288   # kv4: the first context position whose chunk rotates Q in its own kernel (see the attention)
@@ -729,13 +742,19 @@ def main():
     # From OCC3_FROM keys of context on, a chunk's attention runs 3 workgroups per WGP (an LDS floor of 33 KB) instead of
     # 4: past ~84K the 4-workgroup kernel falls off a cache cliff (73% -> 60% of the WMMA floor at 126K; 3 workgroups
     # hold ~70% at every depth, but lose ~5% up to 80K). Each attention source has a "_deep" twin for those chunks.
+    # Each source also gets a "_alt" twin without DIAG_SWAP: Loom's allocator can land a variant in its O-accumulator
+    # back-edge rotation (the 8 O tuples one placement off the P.V results: ~128 loop moves, 200+ VGPRs); the emit
+    # loop re-emits such a HAL from the twin (attn_guard).
     def write_attn(path):
-        open(path, "w").write(gen_attn_fa.gen())
-        # KCLAMP_S: the last chunk otherwise lands in the allocator's O-accumulator rotation (146 loop moves)
-        saved = (gen_attn_fa.LDS_MIN, gen_attn_fa.KCLAMP_S)
-        gen_attn_fa.LDS_MIN, gen_attn_fa.KCLAMP_S = OCC3_LDS, True
-        open(deep(path), "w").write(gen_attn_fa.gen())
-        gen_attn_fa.LDS_MIN, gen_attn_fa.KCLAMP_S = saved
+        A = gen_attn_fa
+        saved = (A.LDS_MIN, A.DIAG_SWAP)
+        for lds, name in ((saved[0], path), (OCC3_LDS, deep(path))):
+            A.LDS_MIN = lds
+            A.DIAG_SWAP = saved[1]
+            open(name, "w").write(A.gen())
+            A.DIAG_SWAP = False
+            open(alt(name), "w").write(A.gen())
+        A.LDS_MIN, A.DIAG_SWAP = saved
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     write_attn(attn_src)
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
@@ -1004,7 +1023,7 @@ def main():
     # per-lane LDS address math out of the key loop (fp16 -1..-2%; kv4 QROT -0.5% with one extra live register); the
     # kv4 staged-Q build loses 11% and the afrag GEMMs 5-20%, so they compile without it
     def attn_env(loom):
-        loom = loom.replace("_deep.loom", ".loom")
+        loom = loom.replace("_alt.loom", ".loom").replace("_deep.loom", ".loom")
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
         if loom in (attn_src, attn_t_src) and (not gen_attn_fa.KDEC or kv8deq):
@@ -1012,6 +1031,9 @@ def main():
         return None
     for loom, outname, configs in fixed:
         E.emit(loom, configs, outname, outdir, attn_env(loom))
+        if outname.startswith("wmma") and hal_vgprs(os.path.join(outdir, outname)) > ATTN_VGPR:   # attn_guard
+            print("attention %s: %d VGPRs, re-emitted without DIAG_SWAP" % (outname, hal_vgprs(os.path.join(outdir, outname))))
+            E.emit(alt(loom), configs, outname, outdir, attn_env(loom))
         n += 1
 
     tables = os.path.join(E.LOOM, "tables")
