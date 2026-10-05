@@ -261,6 +261,7 @@ def gemm(fmt, mt, kb, B, out, outdir, kind="kstore"):
     return r
 
 
+QROT_FROM = 12288   # kv4: the first context position whose chunk rotates Q in its own kernel (see the attention)
 MODEL = None  # set by main(): tiles() reads this model's table
 # Decode-free GEMMs (decode_free): off by default (YAH_DECODE_FREE=1): +12% pp2048 as built (2026-10-03): the f16 swiglu
 # epilogue streams its gate in bursts, the K=17408 down projection is memory-bound in f16, and the dequant pass costs
@@ -717,6 +718,26 @@ def main():
         gen_attn_fa.TILED_OUT = False
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
+    # kv4 at depth: the Q rotation in its own kernel (gen_attn_fa QROT) and the attention on direct Q fragments, from the
+    # chunk at QROT_FROM tokens on: 4 workgroups per WGP instead of 3, -4.2% attention at 8K..120K depth (the rotation's
+    # 1.5 M cycles break even at ~8K). dispatch.txt "qrot <first chunk>"; the driver rotates q into its own f16 buffer.
+    qrot_first = -(-QROT_FROM // B) if gen_attn_fa.K4 and kv_paged and NCH > 1 else NCH
+    attn_qr_src = os.path.join(tmp, "yah_attn_hip_qr.loom")
+    attn_qr_t_src = os.path.join(tmp, "yah_attn_hip_qr_t.loom")
+    qrot_src = os.path.join(tmp, "yah_qrot.loom")
+    if qrot_first < NCH:
+        saved = (gen_attn_fa.Q16, gen_attn_fa.QROT, gen_attn_fa.VSWZ_T)
+        # VSWZ_T off: with direct Q the swizzled V staging tips Loom into rotating the O accumulators at the back edge
+        gen_attn_fa.Q16 = gen_attn_fa.QROT = True
+        gen_attn_fa.VSWZ_T = False
+        open(attn_qr_src, "w").write(gen_attn_fa.gen())
+        if af24:
+            gen_attn_fa.TILED_OUT = True
+            open(attn_qr_t_src, "w").write(gen_attn_fa.gen())
+            gen_attn_fa.TILED_OUT = False
+        gen_attn_fa.Q16, gen_attn_fa.QROT, gen_attn_fa.VSWZ_T = saved
+        open(qrot_src, "w").write(gen_attn_fa.gen_qrot())
+        geom.append(("qrot", qrot_first, 0, 0))
     geom.append(("wmma.hal", a_qt, a_hpw, (B + a_qt - 1) // a_qt))
     # Quantized KV (YAH_KV, gen_kvq.kv_bits; engine/run/kvq/README.md).
     # K: int8 (yah_kq8) or H256 + asymmetric int4 (yah_kq4) after yah_kmean centres it; the attention decodes it to f16.
@@ -889,13 +910,14 @@ def main():
             "yah_fused_qk_rope_batched.cache16_elems=%d" % (1024 * B if kv16_scratch else KC),
             *(["yah_fused_qk_rope_batched.cache_start=%d" % (c * B)] if kv16_scratch else []),
             *(["yah_fused_qk_rope_batched.k16_elems=%d" % (1024 * T)] if paged_f16k else [])]) for c in range(NCH)],
-        *[(attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
+        *([(qrot_src, "qrot.hal", ["yah_qrot.token_count=%d" % B])] if qrot_first < NCH else []),
+        *[(attn_qr_src if c >= qrot_first else attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH)],
-        *[(attn_t_src, "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
+        *[(attn_qr_t_src if c >= qrot_first else attn_t_src, "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),

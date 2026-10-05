@@ -523,6 +523,8 @@ class LoomPrefill {
     q_ = &Alloc(B * kAttn * 4);
     // q16 sets: RoPE writes the attention's f16(q / 16) here instead of the f32 query in place
     q16_ = geom_.count("q16") ? &Alloc(B * kAttn * 2) : q_;
+    // kv4 sets at depth (dispatch.txt "qrot <first chunk>"): yah_qrot writes the H256-rotated f16 Q here for the attention
+    if (const auto qr = geom_.find("qrot"); qr != geom_.end()) qr16_ = &Alloc(B * kAttn * 2), qrot_first_ = qr->second.tokens;
     kbuf_ = &Alloc(B * kKv * 4);
     vbuf_ = &Alloc(B * kKv * 4);
     raw_ = &Alloc(B * kInner * 4);
@@ -1029,9 +1031,12 @@ class LoomPrefill {
                {{kv16_->handle, voff, kv_cache_ * 2}, {vt16_->handle, 0, vt_bytes_}});
     }
     if (tail_ == kNoRows) return;  // K / V are written; nothing reads this layer's output
+    const bool qrot = qr16_ && ci >= qrot_first_;
+    if (qrot)
+      Dispatch(Exe("qrot.hal"), "yah_qrot", (B_ * 96 + 255) / 256, 1, 1, 256, 1, 1, {Ref(*q16_), Ref(*qr16_)});
     {
       std::vector<hrx_buffer_ref_t> b = {
-          Ref(*q16_),
+          Ref(qrot ? *qr16_ : *q16_),
           Ref(*gate_),
           attn_kq8_     ? hrx_buffer_ref_t{kq8buf_->handle, q8off, kq_bytes_}
           : paged_f16k_ ? kpool_l
@@ -1115,6 +1120,7 @@ class LoomPrefill {
   std::deque<LoomBuffer> keep_;  // stable addresses
   std::uint32_t B_ = 0, T_ = 0, full_ = 0, pages_ = 0, dn_rowgrp_ = 0, attn_hpw_ = 0, attn_tpw_ = 0;
   std::uint32_t dnsplit_a_ = 0, dnsplit_b_ = 0;  // DeltaNet head split (dispatch.txt "dnsplit"; 0: one dispatch)
+  std::uint32_t qrot_first_ = 0;  // first chunk whose attention reads yah_qrot's rotated Q (dispatch.txt "qrot")
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   LoomGraph* graph_ = nullptr;  // open while RunLayers records
   // The last RunLayers graph's dispatches in node order.
@@ -1139,7 +1145,7 @@ class LoomPrefill {
              *lse_ = nullptr, *eps_ = nullptr, *ffnup_ = nullptr, *gateffn_ = nullptr, *uwstage_ = nullptr,
              *wstage_ = nullptr, *ostage_ = nullptr, *partial_ = nullptr, *hidden2_ = nullptr, *normed_ = nullptr,
              *ptab_ = nullptr, *vt16_ = nullptr, *kq8buf_ = nullptr, *ksbuf_ = nullptr, *kmbuf_ = nullptr,
-             *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr,
+             *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr, *qr16_ = nullptr,
              *normt_ = nullptr;
   std::int64_t keep_rows_ = kAllRows, tail_ = kAllRows, trim_row_ = kAllRows;
 };
