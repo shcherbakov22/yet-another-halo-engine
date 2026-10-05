@@ -261,6 +261,14 @@ def gemm(fmt, mt, kb, B, out, outdir, kind="kstore"):
     return r
 
 
+OCC3_FROM = 86016   # first context position whose chunk's attention runs 3 workgroups per WGP (see emit: write_attn)
+OCC3_LDS = 33792    # the LDS floor that caps a WGP at 3 attention workgroups (128 KB / 4 < 33 KB)
+
+
+def deep(path):
+    return path.replace(".loom", "_deep.loom")
+
+
 QROT_FROM = 12288   # kv4: the first context position whose chunk rotates Q in its own kernel (see the attention)
 MODEL = None  # set by main(): tiles() reads this model's table
 # Decode-free GEMMs (decode_free): off by default (YAH_DECODE_FREE=1): +12% pp2048 as built (2026-10-03): the f16 swiglu
@@ -718,14 +726,24 @@ def main():
     kv_flags = (A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8)
     if kv8deq:   # the main sources are the fp16 paged kernel
         A.K8 = A.KDEC = A.VQ8 = False
+    # From OCC3_FROM keys of context on, a chunk's attention runs 3 workgroups per WGP (an LDS floor of 33 KB) instead of
+    # 4: past ~84K the 4-workgroup kernel falls off a cache cliff (73% -> 60% of the WMMA floor at 126K; 3 workgroups
+    # hold ~70% at every depth, but lose ~5% up to 80K). Each attention source has a "_deep" twin for those chunks.
+    def write_attn(path):
+        open(path, "w").write(gen_attn_fa.gen())
+        # KCLAMP_S: the last chunk otherwise lands in the allocator's O-accumulator rotation (146 loop moves)
+        saved = (gen_attn_fa.LDS_MIN, gen_attn_fa.KCLAMP_S)
+        gen_attn_fa.LDS_MIN, gen_attn_fa.KCLAMP_S = OCC3_LDS, True
+        open(deep(path), "w").write(gen_attn_fa.gen())
+        gen_attn_fa.LDS_MIN, gen_attn_fa.KCLAMP_S = saved
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
-    open(attn_src, "w").write(gen_attn_fa.gen())
+    write_attn(attn_src)
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
     af24 = any(h.startswith("gemm_kres_") and h.endswith("_320_24.af.hal") for h, *_ in geom)
     attn_t_src = os.path.join(tmp, "yah_attn_hip_t.loom")
     if af24:
         gen_attn_fa.TILED_OUT = True
-        open(attn_t_src, "w").write(gen_attn_fa.gen())
+        write_attn(attn_t_src)
         gen_attn_fa.TILED_OUT = False
     A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = kv_flags
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
@@ -750,10 +768,10 @@ def main():
             # VSWZ_T off: with direct Q the swizzled V staging tips Loom into rotating the O accumulators at the back edge
             A.Q16 = A.QROT = True
             A.VSWZ_T = False
-        open(attn_qr_src, "w").write(A.gen())
+        write_attn(attn_qr_src)
         if af24:
             A.TILED_OUT = True
-            open(attn_qr_t_src, "w").write(A.gen())
+            write_attn(attn_qr_t_src)
             A.TILED_OUT = False
         A.Q16, A.QROT, A.VSWZ_T, A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = saved
         open(qrot_src, "w").write(A.gen_qrot())
@@ -884,6 +902,8 @@ def main():
             src = os.path.join(tmp, f"yah_ssm_postnorm{t_}_{tag}.loom")
             open(src, "w").write(txt)
             pn_parts.append((f"postnorm{t_}_{tag}.hal", src, nh))
+    def occ(path, c):   # the 3-workgroup twin for chunks at OCC3_FROM keys of context on
+        return deep(path) if c * B >= OCC3_FROM else path
     fixed = [
         ("yah_residual_add_1d_f32.loom", "accum.hal",
          ["yah_residual_1d.dim=%d" % (5120 * B)]),
@@ -940,13 +960,13 @@ def main():
           for c in range(NCH) if kvdeq
           for src, stem, sym in ((kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
                                  (vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
-        *[(attn_qr_src if c >= qrot_first else attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
+        *[(occ(attn_qr_src if c >= qrot_first else attn_src, c), "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
             "attention_prefill.num_heads=24", "attention_prefill.num_kv_heads=4",
             "attention_prefill.head_dim=256", "attention_prefill.gqa=6"]) for c in range(NCH)],
-        *[(attn_qr_t_src if c >= qrot_first else attn_t_src, "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
+        *[(occ(attn_qr_t_src if c >= qrot_first else attn_t_src, c), "wmma_t.hal" if c == 0 else "wmma_t_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
             "attention_prefill.start_pos=%d" % (c * B),
@@ -984,6 +1004,7 @@ def main():
     # per-lane LDS address math out of the key loop (fp16 -1..-2%; kv4 QROT -0.5% with one extra live register); the
     # kv4 staged-Q build loses 11% and the afrag GEMMs 5-20%, so they compile without it
     def attn_env(loom):
+        loom = loom.replace("_deep.loom", ".loom")
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
         if loom in (attn_src, attn_t_src) and (not gen_attn_fa.KDEC or kv8deq):

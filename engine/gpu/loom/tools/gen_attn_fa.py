@@ -111,6 +111,10 @@ GATE_FENCE = True
 # tile's selects pass S through. The branch sits after the K staging and the S partner loads (the mask needs them), so
 # its join drains nothing.
 DIAG_MASK = True
+DIAG_SWAP = False   # the mask branch as 'all lanes unmasked' with the pass-through arm first (layout order)
+KCLAMP_S = False    # K tile rows clamped by one scalar min of the tile start (cap - 16), not a per-lane min
+KVMAJOR = False     # workgroup order KV head slowest (lost: +67% at 96K, see docs/results.md)
+LDS_MIN = 0         # LDS pool floor in bytes (> 32 KB caps a WGP at 3 attention workgroups)
 # DEC_LSHADD: in the int4 / int8 K and V decoders, a left-shifted nibble pair ((w << s) & M) | C becomes
 # ((w & (M >> s)) << s) + C (the fields do not overlap, so | is +), which Loom selects as v_and_b32 + v_lshl_add_u32:
 # 2 VALU instead of 3, same bits
@@ -317,6 +321,7 @@ def gen():
         e("  %v_flat = buffer.view %v_na[%base] : buffer -> view<[%vtot]xf16>")
     pool = S_OFF + NT * 32 if (Q16 if QDIRECT is None else QDIRECT) else POOL      # QDIRECT: no Q stage / drain slot
     pool = max(pool, K2_OFF + KT * KT_PITCH * 2) if PIPE2 else pool
+    pool = max(pool, LDS_MIN)
     assert pool <= 65536
     e(f"  %pool_bytes = index.constant {pool} : offset")
     e("  %pool = buffer.alloca<workgroup> align(16) %pool_bytes : buffer")
@@ -340,8 +345,19 @@ def gen():
     e("  %nqb = index.div %tpq, %cqt : index")
     e("  %wgl0 = index.mul %wgy, %nqb : index")
     e("  %wgl = index.add %wgl0, %wgx : index")
-    e("  %hp = index.rem %wgl, %npairs : index")
-    e("  %qb0 = index.div %wgl, %npairs : index")
+    if KVMAJOR:   # KV head slowest: co-resident workgroups stream the same K / V (one KV head's pairs fastest)
+        e("  %nkvh_ = config.get @attention_prefill.num_kv_heads : index")
+        e("  %pkv = index.div %npairs, %nkvh_ : index")
+        e("  %kvblk = index.mul %pkv, %nqb : index")
+        e("  %kvh_m = index.div %wgl, %kvblk : index")
+        e("  %kvr = index.rem %wgl, %kvblk : index")
+        e("  %pig_m = index.rem %kvr, %pkv : index")
+        e("  %qb0 = index.div %kvr, %pkv : index")
+        e("  %hp0 = index.mul %kvh_m, %pkv : index")
+        e("  %hp = index.add %hp0, %pig_m : index")
+    else:
+        e("  %hp = index.rem %wgl, %npairs : index")
+        e("  %qb0 = index.div %wgl, %npairs : index")
     e("  %nqb1 = index.sub %nqb, %c1 : index")
     e("  %qb = index.sub %nqb1, %qb0 : index")
     e("  %tid = kernel.workitem.id<x> : index")
@@ -434,6 +450,8 @@ def gen():
     e("  %max_vis = index.min %ctx_end, %vis0 : index")
     e("  %B_1 = index.sub %B, %c1 : index")
     e("  %cap_1 = index.sub %cache_capacity, %c1 : index")
+    if KCLAMP_S:   # (only then: even an unused op perturbs the allocator)
+        e("  %klast = index.sub %cache_capacity, %c16 : index")
     # this lane's query: block wqb = (head0 + wqb%2, tokens qs + (wqb/2)*16 + sub)
     e("  %wqh = index.rem %wqb, %chpw : index")
     e("  %wqt0 = index.div %wqb, %chpw : index")
@@ -653,9 +671,14 @@ def gen():
             e(f"{ind}%{p}sv = view.load %ks_flat[%{p}sa] : view<[%kstot]xi32> -> i32")
             return [f"%{p}kv", f"%{p}sv"]
         names = []
+        if KCLAMP_S:   # rows past ctx_end are zeroed at staging from the unclamped key, so any in-range row will do
+            e(f"{ind}%{p}ksb = index.min {ks}, %klast : index")
         for nn in range(2):
-            e(f"{ind}%{p}kp{nn} = index.add {ks}, %kk{nn} : index")
-            if PAGED:
+            e(f"{ind}%{p}kp{nn} = index.add {f'%{p}ksb' if KCLAMP_S else ks}, %kk{nn} : index")
+            if PAGED and KCLAMP_S:
+                kpc = phys_row(f"%{p}kp{nn}", f"%{p}ksb", p, ind, f"k{nn}")
+                e(f"{ind}%{p}kpc{nn} = index.add {kpc}, %c0 : index")
+            elif PAGED:
                 e(f"{ind}%{p}kpc{nn}0 = index.min %{p}kp{nn}, %cap_1 : index")
                 kpc = phys_row(f"%{p}kpc{nn}0", ks, p, ind, f"k{nn}")
                 e(f"{ind}%{p}kpc{nn} = index.add {kpc}, %c0 : index")
@@ -891,11 +914,20 @@ def gen():
             if DIAG_MASK:
                 # some lane has a key at or past its limit (lim < 8) or a dead row
                 e("    %mc8 = scalar.constant 8 : i32")
-                e("    %mpart = scalar.cmpi slt, %lim, %mc8 : i32")
-                e("    %mdead = index.cmp uge, %r_lq, %B : index")
-                e("    %mneed = scalar.ori %mpart, %mdead : i1")
-                e("    %manyneed = kernel.subgroup.vote.any %mneed : i1")
-                e(f"    %smask = scf.if %manyneed -> ({V8}) {{")
+                if DIAG_SWAP:   # no lane has a key at or past its limit and no dead row: the scores pass through
+                    e("    %mok8 = scalar.cmpi sge, %lim, %mc8 : i32")
+                    e("    %mlive = index.cmp ult, %r_lq, %B : index")
+                    e("    %mok = scalar.andi %mok8, %mlive : i1")
+                    e("    %mallok = kernel.subgroup.vote.all %mok : i1")
+                    e(f"    %smask = scf.if %mallok -> ({V8}) {{")
+                    e(f"      scf.yield %s0 : {V8}")
+                    e("    } else {")
+                else:
+                    e("    %mpart = scalar.cmpi slt, %lim, %mc8 : i32")
+                    e("    %mdead = index.cmp uge, %r_lq, %B : index")
+                    e("    %mneed = scalar.ori %mpart, %mdead : i1")
+                    e("    %manyneed = kernel.subgroup.vote.any %mneed : i1")
+                    e(f"    %smask = scf.if %manyneed -> ({V8}) {{")
                 ind = "      "
             els = []
             for i in range(8):
@@ -908,8 +940,9 @@ def gen():
             if DIAG_MASK:
                 e(f"      %smk = vector.from_elements {', '.join(els)} : {V8}")
                 e(f"      scf.yield %smk : {V8}")
-                e("    } else {")
-                e(f"      scf.yield %s0 : {V8}")
+                if not DIAG_SWAP:
+                    e("    } else {")
+                    e(f"      scf.yield %s0 : {V8}")
                 e("    }")
             else:
                 e(f"    %smask = vector.from_elements {', '.join(els)} : {V8}")
