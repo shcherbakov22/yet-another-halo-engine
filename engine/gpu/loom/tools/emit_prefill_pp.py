@@ -282,6 +282,12 @@ def hal_vgprs(hal):
     return int(m.group(1)) if m else 0
 
 
+def hal_spills(hal):
+    notes = subprocess.run(["/opt/rocm/llvm/bin/llvm-readelf", "--notes", hal], capture_output=True, text=True).stdout
+    m = re.search(r"\.private_segment_fixed_size:\s*(\d+)", notes)
+    return int(m.group(1)) if m else 0
+
+
 QROT_FROM = 12288   # kv4: the first context position whose chunk rotates Q in its own kernel (see the attention)
 MODEL = None  # set by main(): tiles() reads this model's table
 # Decode-free GEMMs (decode_free): off by default (YAH_DECODE_FREE=1): +12% pp2048 as built (2026-10-03): the f16 swiglu
@@ -745,16 +751,22 @@ def main():
     # Each source also gets a "_alt" twin without DIAG_SWAP: Loom's allocator can land a variant in its O-accumulator
     # back-edge rotation (the 8 O tuples one placement off the P.V results: ~128 loop moves, 200+ VGPRs); the emit
     # loop re-emits such a HAL from the twin (attn_guard).
+    # The deep twin is also the role-split kernel (gen_attn_fa PAIR: one wave of each pair runs QK + the softmax once,
+    # the other P.V; bit-identical): at 3 workgroups per WGP it needs no more than the 256 VGPRs that allows.
+    DEEP_FLAGS = dict(PAIR=True, PAIR_LATE=False, QKF=2, PVF=4)
+
     def write_attn(path):
         A = gen_attn_fa
-        saved = (A.LDS_MIN, A.DIAG_SWAP)
-        for lds, name in ((saved[0], path), (OCC3_LDS, deep(path))):
-            A.LDS_MIN = lds
-            A.DIAG_SWAP = saved[1]
+        keys = ("LDS_MIN", "DIAG_SWAP") + tuple(DEEP_FLAGS)
+        saved = {k: getattr(A, k) for k in keys}
+        for name, flags in ((path, {}), (deep(path), dict(DEEP_FLAGS, LDS_MIN=OCC3_LDS))):
+            for k, v in flags.items():
+                setattr(A, k, v)
             open(name, "w").write(A.gen())
             A.DIAG_SWAP = False
             open(alt(name), "w").write(A.gen())
-        A.LDS_MIN, A.DIAG_SWAP = saved
+            for k in keys:
+                setattr(A, k, saved[k])
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     write_attn(attn_src)
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
@@ -1031,9 +1043,14 @@ def main():
         return None
     for loom, outname, configs in fixed:
         E.emit(loom, configs, outname, outdir, attn_env(loom))
-        if outname.startswith("wmma") and hal_vgprs(os.path.join(outdir, outname)) > ATTN_VGPR:   # attn_guard
-            print("attention %s: %d VGPRs, re-emitted without DIAG_SWAP" % (outname, hal_vgprs(os.path.join(outdir, outname))))
-            E.emit(alt(loom), configs, outname, outdir, attn_env(loom))
+        if outname.startswith("wmma"):   # attn_guard (deep twins: 3 workgroups per WGP allow 256 VGPRs, never spills)
+            hal = os.path.join(outdir, outname)
+            limit = 256 if "_deep" in loom else ATTN_VGPR
+            if hal_vgprs(hal) > limit or hal_spills(hal):
+                print("attention %s: %d VGPRs, %d B spills, re-emitted without DIAG_SWAP" % (outname, hal_vgprs(hal), hal_spills(hal)))
+                E.emit(alt(loom), configs, outname, outdir, attn_env(loom))
+                if hal_spills(hal):
+                    raise SystemExit("attention %s still spills: refusing to emit a spilling attention kernel" % outname)
         n += 1
 
     tables = os.path.join(E.LOOM, "tables")
