@@ -615,7 +615,7 @@ class LoomPrefill {
     pool_bytes_ = std::size_t{pages_} * 256 * kKvRow * 2;
     kpool_ = &Alloc(paged_f16k_ ? std::size_t{full_} * pool_bytes_ : 4);
     vtpool_ = &Alloc(paged_f16v_ ? std::size_t{full_} * pool_bytes_ : 4);
-    // kv4 sets (dispatch.txt "kvdeq"): yah_kdeq4 / yah_vdeq4 decode the layer's int4 pools into one f16 pool pair (reused
+    // kv4 / kv8 sets (dispatch.txt "kvdeq"): yah_kdeq / yah_vdeq decode the layer's quantized pools into one f16 pool pair (reused
     // layer to layer) and the attention runs the fp16 kernel on it, as llama.cpp's prefill flash attention does
     if (geom_.count("kvdeq")) {
       if (!attn_kq8_ || !attn_vqt_ || !kv_paged_) throw LoomError("dispatch.txt kvdeq needs the paged kv4 pools");
@@ -1040,9 +1040,11 @@ class LoomPrefill {
     if (tail_ == kNoRows) return;  // K / V are written; nothing reads this layer's output
     if (kdeq_) {  // the context so far, this chunk included, as f16 pools for the fp16 attention
       const std::uint32_t rows = (ci + 1) * B_;
-      Dispatch(ChunkExe("kdeq4", ci), "yah_kdeq4", (rows * 64 + 255) / 256, 1, 1, 256, 1, 1,
+      const char* kd = attn_kq4_ ? "kdeq4" : "kdeq8";
+      const char* vd = attn_kq4_ ? "vdeq4" : "vdeq8";
+      Dispatch(ChunkExe(kd, ci), attn_kq4_ ? "yah_kdeq4" : "yah_kdeq8", (rows * 64 + 255) / 256, 1, 1, 256, 1, 1,
                {{kq8buf_->handle, q8off, kq_bytes_}, {ksbuf_->handle, ksoff, ks_bytes_}, ptab_ref_, Ref(*kdeq_)});
-      Dispatch(ChunkExe("vdeq4", ci), "yah_vdeq4", 4 * ((rows + 15) / 16), 1, 1, 256, 1, 1,
+      Dispatch(ChunkExe(vd, ci), attn_kq4_ ? "yah_vdeq4" : "yah_vdeq8", 4 * ((rows + 15) / 16), 1, 1, 256, 1, 1,
                {{vqbuf_->handle, vqoff, vq_bytes_}, {vqsbuf_->handle, vqsoff, vqs_bytes_}, ptab_ref_, Ref(*vdeq_)});
     }
     const bool qrot = qr16_ && ci >= qrot_first_;

@@ -1283,18 +1283,24 @@ def _deq_common(e, sym):
     e("  %g = index.add %g0, %tid : index")
 
 
-def gen_kdeq4():
+def gen_kdeq(bits=4):
     """yah_kdeq4 (kv4 prefill): the paged int4 K pool -> the paged f16 K pool [physical row][1024] (rows 0..rows-1), with the
     attention's own staging decode (stage_k_ K4: nibble pairs to f16 1 + u/16, one packed fma with the row group's
     (16 s, lo - 16 s)), so the fp16 attention reading it computes what the kv4 attention did. Thread: (row, KV head,
     16-dim chunk). Bindings: kq (i32), kscale (i32), ptab, out (f16)."""
+    assert bits in (4, 8)
+    sym = f"yah_kdeq{bits}"
+    nw = 2 if bits == 4 else 4                  # dwords per 16-dim chunk
+    rw, sw = (128, 32) if bits == 4 else (256, 8)   # code / scale dwords per row
     L = []
     e = L.append
-    _deq_header(e, "gen_kdeq4", "yah_kdeq4", "  %th = index.mul %rows, %c64 : index")
+    _deq_header(e, f"gen_kdeq{bits}", sym, "  %th = index.mul %rows, %c64 : index")
     e("} launch(%kq: buffer, %ks: buffer, %ptab: buffer, %out: buffer) {")
-    _deq_common(e, "yah_kdeq4")
-    e("  %kq32tot = index.mul %pcap, %c128 : index")
-    e("  %kstot = index.mul %pcap, %c32 : index")
+    _deq_common(e, sym)
+    if bits == 8:
+        e("  %c4 = index.constant 4 : index")
+    e(f"  %kq32tot = index.mul %pcap, %c{rw} : index")
+    e(f"  %kstot = index.mul %pcap, %c{sw} : index")
     e("  %otot = index.mul %pcap, %c1024 : index")
     e("  %kq_na, %ks_na, %pt_na, %o_na = buffer.assume.noalias %kq, %ks, %ptab, %out : buffer, buffer, buffer, buffer")
     e("  %kq_flat = buffer.view %kq_na[%base] : buffer -> view<[%kq32tot]xi32>")
@@ -1315,29 +1321,29 @@ def gen_kdeq4():
     e("  %pb = index.mul %pg, %c256 : index")
     e("  %po = index.rem %r, %c256 : index")
     e("  %pr = index.add %pb, %po : index")
-    e("  %kr = index.mul %pr, %c128 : index")
-    e("  %kh = index.mul %h, %c32 : index")
-    e("  %kc = index.mul %ch, %c2 : index")
+    e(f"  %kr = index.mul %pr, %c{rw} : index")
+    e(f"  %kh = index.mul %h, %c{16 * nw} : index")
+    e(f"  %kc = index.mul %ch, %c{nw} : index")
     e("  %ka0 = index.add %kr, %kh : index")
     e("  %ka = index.add %ka0, %kc : index")
-    e("  %kv = vector.load %kq_flat[%ka] : view<[%kq32tot]xi32> -> vector<2xi32>")
-    e("  %sr = index.mul %pr, %c32 : index")
-    e("  %sh8 = index.mul %h, %c8 : index")
-    e("  %sc2 = index.div %ch, %c2 : index")
+    e(f"  %kv = vector.load %kq_flat[%ka] : view<[%kq32tot]xi32> -> vector<{nw}xi32>")
+    e(f"  %sr = index.mul %pr, %c{sw} : index")
+    e(f"  %sh8 = index.mul %h, %c{sw // 4} : index")
+    e(f"  %sc2 = index.div %ch, %c{2 if bits == 4 else 8} : index")
     e("  %sa0 = index.add %sr, %sh8 : index")
     e("  %sa = index.add %sa0, %sc2 : index")
     e("  %sv = view.load %ks_flat[%sa] : view<[%kstot]xi32> -> i32")
-    e("  %kdm = scalar.constant 62915520 : i32")       # 0x03c003c0
+    e(f"  %kdm = scalar.constant {62915520 if bits == 4 else 66847740} : i32")       # 0x03c003c0 / 0x03fc03fc
     e("  %kdgm = scalar.constant 1006648320 : i32")    # 0x3c003c00
     e("  %s1 = vector.from_elements %sv : vector<1xi32>")
     e("  %sh = vector.bitcast %s1 : vector<1xi32> to vector<2xf16>")
     e("  %sS = vector.extract %sh[0] : vector<2xf16> -> f16")
     e("  %sC = vector.extract %sh[1] : vector<2xf16> -> f16")
     ws = []
-    for d in range(2):
-        e(f"  %w{d} = vector.extract %kv[{d}] : vector<2xi32> -> i32")
-        for k, sh in enumerate((6, 2, -2, -6)):
-            dec_pair(e, "  ", f"%g{d}{k}", f"%w{d}", sh, 0x03c003c0, "%kdgm")
+    for d in range(nw):
+        e(f"  %w{d} = vector.extract %kv[{d}] : vector<{nw}xi32> -> i32")
+        for k, sh in enumerate((6, 2, -2, -6) if bits == 4 else (2, -6)):
+            dec_pair(e, "  ", f"%g{d}{k}", f"%w{d}", sh, 0x03c003c0 if bits == 4 else 0x03fc03fc, "%kdgm")
             ws.append(f"%g{d}{k}")
     e(f"  %pk = vector.from_elements {', '.join(ws)} : vector<8xi32>")
     e(f"  %pf = vector.bitcast %pk : vector<8xi32> to {V16H}")
@@ -1357,21 +1363,24 @@ def gen_kdeq4():
     return "\n".join(L) + "\n"
 
 
-def gen_vdeq4():
+def gen_vdeq(bits=4):
     """yah_vdeq4 (kv4 prefill): the paged int4 V^T pool -> the paged f16 V^T pool [KV head][physical tile][256 dims]
     [16 keys] (vtpage's layout), tiles 0..ceil(rows / 16) - 1, with the attention's own staging decode (vq4_unpack). Thread: (KV head,
     tile, dim). Bindings: vq (i32), vstat (i32), ptab, out (f16)."""
+    assert bits in (4, 8)
+    sym = f"yah_vdeq{bits}"
+    nw = 2 if bits == 4 else 4                  # dwords per (tile, dim)
     L = []
     e = L.append
-    _deq_header(e, "gen_vdeq4", "yah_vdeq4",
+    _deq_header(e, f"gen_vdeq{bits}", sym,
                 "  %ntl0 = index.add %rows, %c15 : index\n  %ntl = index.div %ntl0, %c16 : index\n"
                 "  %th0 = index.mul %ntl, %c256 : index\n  %c4 = index.constant 4 : index\n  %th = index.mul %th0, %c4 : index")
     e("} launch(%vq: buffer, %vs: buffer, %ptab: buffer, %out: buffer) {")
-    _deq_common(e, "yah_vdeq4")
+    _deq_common(e, sym)
     e("  %c4 = index.constant 4 : index")
     e("  %vtiles = index.div %pcap, %c16 : index")          # pool tiles per KV head
     e("  %vq4tot0 = index.mul %vtiles, %c1024 : index")
-    e("  %vq4tot = index.mul %vq4tot0, %c2 : index")
+    e(f"  %vq4tot = index.mul %vq4tot0, %c{nw} : index")
     e("  %otl0 = index.add %cap, %c15 : index")
     e("  %otl = index.div %otl0, %c16 : index")              # logical tiles per KV head
     e("  %otot0 = index.mul %vtiles, %c4096 : index")
@@ -1404,8 +1413,8 @@ def gen_vdeq4():
     e("  %vti0 = index.add %vti0a, %pt : index")
     e("  %vti1 = index.mul %vti0, %c256 : index")
     e("  %vti = index.add %vti1, %dim : index")
-    e("  %vda = index.mul %vti, %c2 : index")
-    e("  %vqv = vector.load %vq_flat[%vda] : view<[%vq4tot]xi32> -> vector<2xi32>")
+    e(f"  %vda = index.mul %vti, %c{nw} : index")
+    e(f"  %vqv = vector.load %vq_flat[%vda] : view<[%vq4tot]xi32> -> vector<{nw}xi32>")
     e("  %vst = view.load %vs_flat[%vti] : view<[%vq4tot0]xi32> -> i32")
     e("  %v4g = scalar.constant 1006648320 : i32")    # 0x3c003c00
     e("  %vs1 = vector.from_elements %vst : vector<1xi32>")
@@ -1413,10 +1422,10 @@ def gen_vdeq4():
     e("  %vss = vector.extract %vsv[0] : vector<2xf16> -> f16")
     e("  %vsc = vector.extract %vsv[1] : vector<2xf16> -> f16")
     ws = []
-    for d in range(2):
-        e(f"  %vw{d} = vector.extract %vqv[{d}] : vector<2xi32> -> i32")
-        for k in range(4):
-            dec_pair(e, "  ", f"%vmg{d}{k}", f"%vw{d}", 6 - 4 * k, 0x03c003c0, "%v4g")
+    for d in range(nw):
+        e(f"  %vw{d} = vector.extract %vqv[{d}] : vector<{nw}xi32> -> i32")
+        for k, sh in enumerate((6, 2, -2, -6) if bits == 4 else (2, -6)):
+            dec_pair(e, "  ", f"%vmg{d}{k}", f"%vw{d}", sh, 0x03c003c0 if bits == 4 else 0x03fc03fc, "%v4g")
             ws.append(f"%vmg{d}{k}")
     e(f"  %vpk = vector.from_elements {', '.join(ws)} : vector<8xi32>")
     e(f"  %vf = vector.bitcast %vpk : vector<8xi32> to {V16H}")
@@ -1540,3 +1549,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+gen_kdeq4 = gen_kdeq
+gen_vdeq4 = gen_vdeq

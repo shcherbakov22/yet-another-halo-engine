@@ -707,6 +707,17 @@ def main():
     gen_attn_fa.configure(a_hpw, a_qt)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
+    # kv4 / kv8 (paged): decode once per attention call instead of in every workgroup's staging (llama.cpp's prefill
+    # flash attention converts quantized K / V to f16 the same way): yah_kdeq / yah_vdeq (per chunk) fill an f16 pool pair
+    # with the staging decode's own arithmetic and the attention is the fp16 paged kernel (kv4: on yah_qrot's rotated Q,
+    # kv8: on RoPE's f16 Q as before), bit-identical. kv4 attention -12% at 32K depth, kv8 -21%. dispatch.txt "kvdeq".
+    kvdeq = kv_paged and ((gen_attn_fa.K4 and gen_attn_fa.VQ4) or (gen_attn_fa.K8 and gen_attn_fa.VQ8))
+    deq_bits = 4 if gen_attn_fa.K4 else 8
+    kv8deq = kvdeq and deq_bits == 8
+    A = gen_attn_fa
+    kv_flags = (A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8)
+    if kv8deq:   # the main sources are the fp16 paged kernel
+        A.K8 = A.KDEC = A.VQ8 = False
     attn_src = os.path.join(tmp, "yah_attn_hip.loom")
     open(attn_src, "w").write(gen_attn_fa.gen())
     # afrag o-projections (K = 6144 kres) read the attention output fragment-major: wmma_t[_c<i>].hal
@@ -716,22 +727,19 @@ def main():
         gen_attn_fa.TILED_OUT = True
         open(attn_t_src, "w").write(gen_attn_fa.gen())
         gen_attn_fa.TILED_OUT = False
+    A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8 = kv_flags
     vtrans_src = os.path.join(tmp, "yah_transpose_v16.loom")
     open(vtrans_src, "w").write(gen_attn_fa.gen_vtrans())
     # kv4 at depth: the Q rotation in its own kernel (gen_attn_fa QROT) and the attention on direct Q fragments, from the
     # chunk at QROT_FROM tokens on: 4 workgroups per WGP instead of 3, -4.2% attention at 8K..120K depth (the rotation's
     # 1.5 M cycles break even at ~8K). dispatch.txt "qrot <first chunk>"; the driver rotates q into its own f16 buffer.
-    # kv4 (paged): decode once per attention call instead of in every workgroup's staging (llama.cpp's prefill flash
-    # attention converts quantized K / V to f16 the same way): yah_kdeq4 / yah_vdeq4 (per chunk) fill an f16 pool pair
-    # with the staging decode's own arithmetic and the attention is the fp16 paged kernel on the rotated f16 Q, from
-    # chunk 0 on (the attention -12% at 32K depth, the dequant ~2% of it; bit-identical). dispatch.txt "kvdeq".
-    kvdeq = gen_attn_fa.K4 and gen_attn_fa.VQ4 and kv_paged
-    qrot_first = 0 if kvdeq else -(-QROT_FROM // B) if gen_attn_fa.K4 and kv_paged and NCH > 1 else NCH
+    # kv4 under kvdeq: Q rotated from chunk 0 (its K is H256-rotated)
+    qrot_first = 0 if kvdeq and deq_bits == 4 else -(-QROT_FROM // B) if gen_attn_fa.K4 and kv_paged and NCH > 1 else NCH
     attn_qr_src = os.path.join(tmp, "yah_attn_hip_qr.loom")
     attn_qr_t_src = os.path.join(tmp, "yah_attn_hip_qr_t.loom")
     qrot_src = os.path.join(tmp, "yah_qrot.loom")
-    kdeq_src = os.path.join(tmp, "yah_kdeq4.loom")
-    vdeq_src = os.path.join(tmp, "yah_vdeq4.loom")
+    kdeq_src = os.path.join(tmp, "yah_kdeq%d.loom" % deq_bits)
+    vdeq_src = os.path.join(tmp, "yah_vdeq%d.loom" % deq_bits)
     if qrot_first < NCH:
         A = gen_attn_fa
         saved = (A.Q16, A.QROT, A.VSWZ_T, A.K4, A.K8, A.KDEC, A.VQ4, A.VQ8)
@@ -751,8 +759,8 @@ def main():
         open(qrot_src, "w").write(A.gen_qrot())
         geom.append(("qrot", qrot_first, 0, 0))
     if kvdeq:
-        open(kdeq_src, "w").write(gen_attn_fa.gen_kdeq4())
-        open(vdeq_src, "w").write(gen_attn_fa.gen_vdeq4())
+        open(kdeq_src, "w").write(gen_attn_fa.gen_kdeq(deq_bits))
+        open(vdeq_src, "w").write(gen_attn_fa.gen_vdeq(deq_bits))
         geom.append(("kvdeq", 0, 0, 0))
     geom.append(("wmma.hal", a_qt, a_hpw, (B + a_qt - 1) // a_qt))
     # Quantized KV (YAH_KV, gen_kvq.kv_bits; engine/run/kvq/README.md).
@@ -930,7 +938,8 @@ def main():
         *[(src, "%s.hal" % stem if c == 0 else "%s_c%d.hal" % (stem, c),
            ["%s.cache_capacity=%d" % (sym, T), "%s.rows=%d" % (sym, (c + 1) * B)])
           for c in range(NCH) if kvdeq
-          for src, stem, sym in ((kdeq_src, "kdeq4", "yah_kdeq4"), (vdeq_src, "vdeq4", "yah_vdeq4"))],
+          for src, stem, sym in ((kdeq_src, "kdeq%d" % deq_bits, "yah_kdeq%d" % deq_bits),
+                                 (vdeq_src, "vdeq%d" % deq_bits, "yah_vdeq%d" % deq_bits))],
         *[(attn_qr_src if c >= qrot_first else attn_src, "wmma.hal" if c == 0 else "wmma_c%d.hal" % c, [
             "attention_prefill.cache_capacity=%d" % T,
             "attention_prefill.token_count=%d" % B,
@@ -977,7 +986,7 @@ def main():
     def attn_env(loom):
         if loom in (attn_qr_src, attn_qr_t_src):   # fp16 paged under kvdeq, else the kv4 direct-Q kernel
             return {"LOOM_EXP_LICM": "1"} if kvdeq else {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
-        if loom in (attn_src, attn_t_src) and not gen_attn_fa.KDEC:
+        if loom in (attn_src, attn_t_src) and (not gen_attn_fa.KDEC or kv8deq):
             return {"LOOM_EXP_LICM": "1"}
         return None
     for loom, outname, configs in fixed:
