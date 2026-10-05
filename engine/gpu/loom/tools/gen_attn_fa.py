@@ -111,6 +111,26 @@ GATE_FENCE = True
 # tile's selects pass S through. The branch sits after the K staging and the S partner loads (the mask needs them), so
 # its join drains nothing.
 DIAG_MASK = True
+# DEC_LSHADD: in the int4 / int8 K and V decoders, a left-shifted nibble pair ((w << s) & M) | C becomes
+# ((w & (M >> s)) << s) + C (the fields do not overlap, so | is +), which Loom selects as v_and_b32 + v_lshl_add_u32:
+# 2 VALU instead of 3, same bits
+DEC_LSHADD = True
+
+
+def dec_pair(e, ind, out, w, sh, mask, gname):
+    """out = ((w << sh or w >> -sh) & mask) | g, as i32 (mask the f16 mantissa field of both lanes, then OR the 1.0)"""
+    if DEC_LSHADD and sh > 0:
+        e(f"{ind}{out}_m = scalar.constant {mask >> sh} : i32")
+        e(f"{ind}{out}_a = scalar.andi {w}, {out}_m : i32")
+        e(f"{ind}{out}_p = scalar.constant {1 << sh} : i32")
+        e(f"{ind}{out} = scalar.fmai {out}_a, {out}_p, {gname} : i32")
+        return
+    op = "shli" if sh >= 0 else "shrui"
+    e(f"{ind}{out}_c = scalar.constant {abs(sh)} : i32")
+    e(f"{ind}{out}_t = scalar.{op} {w}, {out}_c : i32")
+    e(f"{ind}{out}_mk = scalar.constant {mask} : i32")
+    e(f"{ind}{out}_x = scalar.andi {out}_t, {out}_mk : i32")
+    e(f"{ind}{out} = scalar.ori {out}_x, {gname} : i32")
 # Page lookups are scalar (SMEM) loads of the global table; an LDS copy of the table was slower.
 # No in-kernel clamp (it cost 1%): the host validates every entry (< npages) before upload,
 # and the cache writers clamp page indices into their pools.
@@ -711,6 +731,10 @@ def gen():
             for d in range(nw):
                 e(f"{ind}%{p}w{d} = vector.extract {cur[0]}[{d}] : vector<{nw}xi32> -> i32")
                 for k, sh in enumerate(shifts):
+                    if DEC_LSHADD:
+                        dec_pair(e, ind, f"%{p}g{d}{k}", f"%{p}w{d}", sh, 0x03c003c0 if K4 else 0x03fc03fc, "%kdgm")
+                        ws.append(f"%{p}g{d}{k}")
+                        continue
                     op = "shli" if sh >= 0 else "shrui"
                     e(f"{ind}%{p}t{d}{k}c = scalar.constant {abs(sh)} : i32")
                     e(f"{ind}%{p}t{d}{k} = scalar.{op} %{p}w{d}, %{p}t{d}{k}c : i32")
@@ -775,6 +799,10 @@ def gen():
             for k in range(4):
                 # nibbles (4k, 16 + 4k) -> bits (6.., 22..): f16 1 + u/16
                 sh = 6 - 4 * k
+                if DEC_LSHADD:
+                    dec_pair(e, ind, f"%{p}vmg{d}{k}", f"%{p}vw{d}x", sh, 0x03c003c0, "%v4g")
+                    ws.append(f"%{p}vmg{d}{k}")
+                    continue
                 op = "shli" if sh >= 0 else "shrui"
                 e(f"{ind}%{p}vsh{d}{k}c = scalar.constant {abs(sh)} : i32")
                 e(f"{ind}%{p}vsh{d}{k} = scalar.{op} %{p}vw{d}x, %{p}vsh{d}{k}c : i32")
