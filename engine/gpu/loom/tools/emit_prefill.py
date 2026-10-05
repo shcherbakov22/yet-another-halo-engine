@@ -58,13 +58,14 @@ def sym_of(loomfile):
     return re.search(r"config\.decl @([A-Za-z0-9_]+)\.m_tiles", text).group(1)
 
 
-def emit(loomfile, configs, outname, outdir):
-    """Compile one Loom source (relative to engine/gpu/loom, or absolute) at one config to <outdir>/<outname>."""
+def emit(loomfile, configs, outname, outdir, env=None):
+    """Compile one Loom source (relative to engine/gpu/loom, or absolute) at one config to <outdir>/<outname>.
+    env: extra environment for this compile (per-kernel compiler options, e.g. LOOM_EXP_LICM)."""
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(LOOM, loomfile)
     r = subprocess.run([sys.executable, EMIT, src, tmp] + configs,
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env={**os.environ, **env} if env else None)
     if r.returncode != 0:
         # stderr first: it holds the compiler diagnostics; stdout is progress output.
         log = os.path.join("/tmp", "emit_fail_" + os.path.basename(outname) + ".log")

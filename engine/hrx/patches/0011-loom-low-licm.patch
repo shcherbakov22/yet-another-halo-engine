@@ -1,0 +1,1178 @@
+low-licm: loop-invariant code motion for descriptor-backed low CFGs, after low-cse in packetization preparation, plus a
+second low-cse. Inert unless LOOM_EXP_LICM=1 (the pipeline schedules it only then), so default output is unchanged; the
+engine sets it per kernel (emit_prefill_pp: the fp16 and kv4-QROT prefill attention). Only pure ALU packets move (no
+memory, matrix, control, state writes, tied or effect rows; operands defined outside the loop; loops with a dedicated
+preheader; no new blocks). The fragment loads' per-lane LDS address math, re-derived every tile, leaves the attention
+loop: fp16 attention -1.0% (pp2048) / -2.15% (32K context), kv4 QROT -0.5% (LOOM_EXP_LICM_MAX_LIVE=1), bit-identical;
+the afrag GEMMs lose 5-20% (register pressure), so they keep it off. Knobs: LOOM_EXP_LICM_MAX (packets),
+LOOM_EXP_LICM_MAX_LIVE (new loop-live units), LOOM_EXP_LICM_SALU, LOOM_EXP_LICM_DEBUG.
+
+diff --git a/loom/src/loom/codegen/low/pipeline/pipeline.c b/loom/src/loom/codegen/low/pipeline/pipeline.c
+index af44e4e8b..ef4e6c416 100644
+--- a/loom/src/loom/codegen/low/pipeline/pipeline.c
++++ b/loom/src/loom/codegen/low/pipeline/pipeline.c
+@@ -6,6 +6,8 @@
+ 
+ #include "loom/codegen/low/pipeline/pipeline.h"
+ 
++#include <stdlib.h>
++
+ iree_status_t loom_low_pipeline_build_packetization_preparation(
+     loom_builder_t* builder) {
+   loom_op_t* run_op = NULL;
+@@ -14,6 +16,18 @@ iree_status_t loom_low_pipeline_build_packetization_preparation(
+                              loom_named_attr_slice_empty(), &run_op));
+   IREE_RETURN_IF_ERROR(loom_pass_ir_build_run(
+       builder, 0, IREE_SV("low-cse"), loom_named_attr_slice_empty(), &run_op));
++  // EXPERIMENTAL: low-licm (plus a second low-cse that merges hoisted
++  // duplicates in preheaders) is only scheduled under LOOM_EXP_LICM=1 so the
++  // default pipeline is unchanged. The pass body is gated on the same knob.
++  const char* licm_env = getenv("LOOM_EXP_LICM");
++  if (licm_env && licm_env[0] == '1') {
++    IREE_RETURN_IF_ERROR(loom_pass_ir_build_run(builder, 0, IREE_SV("low-licm"),
++                                                loom_named_attr_slice_empty(),
++                                                &run_op));
++    IREE_RETURN_IF_ERROR(loom_pass_ir_build_run(builder, 0, IREE_SV("low-cse"),
++                                                loom_named_attr_slice_empty(),
++                                                &run_op));
++  }
+   IREE_RETURN_IF_ERROR(
+       loom_pass_ir_build_run(builder, 0, IREE_SV("low-select-operand-forms"),
+                              loom_named_attr_slice_empty(), &run_op));
+diff --git a/loom/src/loom/codegen/low/transforms/BUILD.bazel b/loom/src/loom/codegen/low/transforms/BUILD.bazel
+index 9d195df7c..89a46c463 100644
+--- a/loom/src/loom/codegen/low/transforms/BUILD.bazel
++++ b/loom/src/loom/codegen/low/transforms/BUILD.bazel
+@@ -103,6 +103,29 @@ loom_cc_library(
+     ],
+ )
+ 
++loom_cc_library(
++    name = "licm",
++    srcs = ["licm.c"],
++    hdrs = ["licm.h"],
++    deps = [
++        "//loom/src/loom/codegen/low:descriptors",
++        "//loom/src/loom/codegen/low:function",
++        "//loom/src/loom/codegen/low:representation_binding",
++        "//loom/src/loom/codegen/low:target_binding",
++        "//loom/src/loom/codegen/low/pipeline:pass_environment",
++        "//loom/src/loom/ir",
++        "//loom/src/loom/ops:op_defs",
++        "//loom/src/loom/ops/low",
++        "//loom/src/loom/pass:types",
++        "//loom/src/loom/rewrite:rewriter",
++        "//loom/src/loom/target:function_version",
++        "//loom/src/loom/util:cfg_dominance",
++        "//loom/src/loom/util:cfg_graph",
++        "//runtime/src/iree/base",
++        "//runtime/src/iree/base/internal:arena",
++    ],
++)
++
+ loom_cc_library(
+     name = "operand_forms",
+     srcs = ["operand_forms.c"],
+diff --git a/loom/src/loom/codegen/low/transforms/CMakeLists.txt b/loom/src/loom/codegen/low/transforms/CMakeLists.txt
+index eed1da14a..7d56bdcac 100644
+--- a/loom/src/loom/codegen/low/transforms/CMakeLists.txt
++++ b/loom/src/loom/codegen/low/transforms/CMakeLists.txt
+@@ -105,6 +105,32 @@ loom_cc_library(
+   PUBLIC
+ )
+ 
++loom_cc_library(
++  NAME
++    licm
++  HDRS
++    "licm.h"
++  SRCS
++    "licm.c"
++  DEPS
++    iree::base
++    iree::base::internal::arena
++    loom::codegen::low::descriptors
++    loom::codegen::low::function
++    loom::codegen::low::pipeline::pass_environment
++    loom::codegen::low::representation_binding
++    loom::codegen::low::target_binding
++    loom::ir
++    loom::ops::low
++    loom::ops::op_defs
++    loom::pass::types
++    loom::rewrite::rewriter
++    loom::target::function_version
++    loom::util::cfg_dominance
++    loom::util::cfg_graph
++  PUBLIC
++)
++
+ loom_cc_library(
+   NAME
+     operand_forms
+diff --git a/loom/src/loom/codegen/low/transforms/licm.c b/loom/src/loom/codegen/low/transforms/licm.c
+new file mode 100644
+index 000000000..41127e349
+--- /dev/null
++++ b/loom/src/loom/codegen/low/transforms/licm.c
+@@ -0,0 +1,924 @@
++// Copyright 2026 The IREE Authors
++//
++// Licensed under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++
++#include "loom/codegen/low/transforms/licm.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "iree/base/internal/arena.h"
++#include "loom/codegen/low/descriptors.h"
++#include "loom/codegen/low/function.h"
++#include "loom/codegen/low/pipeline/pass_environment.h"
++#include "loom/codegen/low/representation_binding.h"
++#include "loom/codegen/low/target_binding.h"
++#include "loom/ir/module.h"
++#include "loom/ops/low/ops.h"
++#include "loom/ops/op_defs.h"
++#include "loom/rewrite/rewriter.h"
++#include "loom/target/function_version.h"
++#include "loom/util/cfg_dominance.h"
++#include "loom/util/cfg_graph.h"
++
++#define LOOM_LOW_LICM_STATISTICS(V, statistics_type)                     \
++  V(statistics_type, loops_visited, "loops-visited",                     \
++    "Number of natural loops inspected.")                                \
++  V(statistics_type, loops_without_preheader, "loops-without-preheader", \
++    "Number of loops skipped for lack of a dedicated preheader.")        \
++  V(statistics_type, ops_hoisted, "ops-hoisted",                         \
++    "Number of loop-invariant packets hoisted into preheaders.")
++
++LOOM_PASS_STATISTICS_DEFINE(loom_low_licm_statistics,
++                            loom_low_licm_statistics_t,
++                            LOOM_LOW_LICM_STATISTICS)
++
++static const loom_pass_info_t loom_low_licm_pass_info_storage = {
++    .name = IREE_SVL("low-licm"),
++    .description = IREE_SVL(
++        "EXPERIMENTAL (LOOM_EXP_LICM=1): hoist pure loop-invariant packets "
++        "into dedicated loop preheaders."),
++    .kind = LOOM_PASS_FUNCTION,
++    .statistic_layout = &loom_low_licm_statistics_layout,
++};
++
++const loom_pass_info_t* loom_low_licm_pass_info(void) {
++  return &loom_low_licm_pass_info_storage;
++}
++
++//===----------------------------------------------------------------------===//
++// Environment knobs
++//===----------------------------------------------------------------------===//
++
++typedef struct loom_low_licm_options_t {
++  bool enabled;
++  bool debug;
++  int debug_level;
++  bool hoist_salu;
++  uint32_t max_per_loop;
++  // Max VGPR units newly live across each loop (UINT32_MAX = unlimited).
++  uint32_t max_live;
++  // Minimum ops removed per new live unit for a VALU frontier cone.
++  uint32_t min_gain;
++  // Optional per-header-index filter (LOOM_EXP_LICM_HEADERS=1,4,...).
++  uint8_t* header_filter;
++} loom_low_licm_options_t;
++
++static uint32_t loom_low_licm_env_u32(const char* name,
++                                      uint32_t default_value) {
++  const char* value = getenv(name);
++  if (!value || !value[0]) {
++    return default_value;
++  }
++  long parsed = strtol(value, NULL, 10);
++  return parsed >= 0 ? (uint32_t)parsed : default_value;
++}
++
++static bool loom_low_licm_env_flag(const char* name, bool default_value) {
++  const char* value = getenv(name);
++  if (!value || !value[0]) {
++    return default_value;
++  }
++  return value[0] == '1';
++}
++
++static const loom_low_licm_options_t* loom_low_licm_options(void) {
++  // Read once; concurrent first reads compute identical values.
++  static loom_low_licm_options_t options;
++  static volatile int initialized = 0;
++  if (!initialized) {
++    options.enabled = loom_low_licm_env_flag("LOOM_EXP_LICM", false);
++    const char* debug_value = getenv("LOOM_EXP_LICM_DEBUG");
++    options.debug_level =
++        debug_value && debug_value[0] >= '0' && debug_value[0] <= '9'
++            ? debug_value[0] - '0'
++            : 0;
++    options.debug = options.debug_level >= 1;
++    options.hoist_salu = loom_low_licm_env_flag("LOOM_EXP_LICM_SALU", true);
++    options.max_per_loop =
++        loom_low_licm_env_u32("LOOM_EXP_LICM_MAX", UINT32_MAX);
++    options.max_live =
++        loom_low_licm_env_u32("LOOM_EXP_LICM_MAX_LIVE", UINT32_MAX);
++    options.min_gain = loom_low_licm_env_u32("LOOM_EXP_LICM_MIN_GAIN", 2);
++    const char* headers = getenv("LOOM_EXP_LICM_HEADERS");
++    if (headers && headers[0]) {
++      static uint8_t filter[UINT16_MAX + 1];
++      for (const char* p = headers; *p;) {
++        char* end = NULL;
++        long index = strtol(p, &end, 10);
++        if (end == p) {
++          ++p;
++          continue;
++        }
++        if (index >= 0 && index <= UINT16_MAX) {
++          filter[index] = 1;
++        }
++        p = end;
++      }
++      options.header_filter = filter;
++    }
++    initialized = 1;
++  }
++  return &options;
++}
++
++//===----------------------------------------------------------------------===//
++// Loop discovery
++//===----------------------------------------------------------------------===//
++
++typedef struct loom_low_licm_loop_t {
++  // Dense header block index.
++  uint16_t header;
++  // Number of blocks in the loop body (including the header).
++  uint16_t block_count;
++  // Per-block membership flags, graph->block_count entries.
++  uint8_t* members;
++} loom_low_licm_loop_t;
++
++// Collects the natural loop of |header| from all dominated back-edge sources.
++// Returns false in |*out_found| when |header| has no dominated back edge.
++static iree_status_t loom_low_licm_collect_loop(
++    const loom_cfg_graph_t* graph, const loom_cfg_dominance_t* dominance,
++    uint16_t header, iree_arena_allocator_t* arena, uint16_t* worklist,
++    loom_low_licm_loop_t* out_loop, bool* out_found) {
++  *out_found = false;
++  const loom_cfg_block_index_span_t predecessors =
++      loom_cfg_graph_predecessors(graph, header);
++  bool has_backedge = false;
++  for (iree_host_size_t i = 0; i < predecessors.count; ++i) {
++    const uint16_t source = predecessors.values[i];
++    if (loom_cfg_graph_block_is_reachable(graph, source) &&
++        loom_cfg_dominance_block_dominates(dominance, header, source)) {
++      has_backedge = true;
++      break;
++    }
++  }
++  if (!has_backedge) {
++    return iree_ok_status();
++  }
++
++  uint8_t* members = NULL;
++  IREE_RETURN_IF_ERROR(
++      iree_arena_allocate(arena, graph->block_count, (void**)&members));
++  memset(members, 0, graph->block_count);
++  members[header] = 1;
++  uint16_t block_count = 1;
++  iree_host_size_t worklist_count = 0;
++  for (iree_host_size_t i = 0; i < predecessors.count; ++i) {
++    const uint16_t source = predecessors.values[i];
++    if (!loom_cfg_graph_block_is_reachable(graph, source) ||
++        !loom_cfg_dominance_block_dominates(dominance, header, source) ||
++        members[source]) {
++      continue;
++    }
++    members[source] = 1;
++    ++block_count;
++    worklist[worklist_count++] = source;
++  }
++  while (worklist_count > 0) {
++    const uint16_t block = worklist[--worklist_count];
++    const loom_cfg_block_index_span_t block_predecessors =
++        loom_cfg_graph_predecessors(graph, block);
++    for (iree_host_size_t i = 0; i < block_predecessors.count; ++i) {
++      const uint16_t predecessor = block_predecessors.values[i];
++      if (members[predecessor] ||
++          !loom_cfg_graph_block_is_reachable(graph, predecessor)) {
++        continue;
++      }
++      members[predecessor] = 1;
++      ++block_count;
++      worklist[worklist_count++] = predecessor;
++    }
++  }
++  out_loop->header = header;
++  out_loop->block_count = block_count;
++  out_loop->members = members;
++  *out_found = true;
++  return iree_ok_status();
++}
++
++// Returns the dedicated preheader block index for |loop|, or UINT16_MAX.
++static uint16_t loom_low_licm_find_preheader(const loom_cfg_graph_t* graph,
++                                             const loom_low_licm_loop_t* loop) {
++  const loom_cfg_block_index_span_t predecessors =
++      loom_cfg_graph_predecessors(graph, loop->header);
++  uint16_t preheader = UINT16_MAX;
++  for (iree_host_size_t i = 0; i < predecessors.count; ++i) {
++    const uint16_t source = predecessors.values[i];
++    if (loop->members[source]) {
++      continue;
++    }
++    if (!loom_cfg_graph_block_is_reachable(graph, source)) {
++      continue;
++    }
++    if (preheader != UINT16_MAX) {
++      return UINT16_MAX;  // multiple entries
++    }
++    preheader = source;
++  }
++  if (preheader == UINT16_MAX) {
++    return UINT16_MAX;
++  }
++  const loom_block_t* block = graph->blocks[preheader].block;
++  const loom_op_t* terminator = block ? block->last_op : NULL;
++  if (!terminator || !loom_low_br_isa(terminator) ||
++      graph->blocks[preheader].successor_count != 1) {
++    return UINT16_MAX;
++  }
++  return preheader;
++}
++
++//===----------------------------------------------------------------------===//
++// Packet legality
++//===----------------------------------------------------------------------===//
++
++typedef struct loom_low_licm_context_t {
++  loom_pass_t* pass;
++  loom_module_t* module;
++  const loom_low_licm_options_t* options;
++  const loom_low_descriptor_set_t* descriptor_set;
++  const loom_cfg_graph_t* graph;
++  loom_rewriter_t* rewriter;
++  loom_low_licm_statistics_t* statistics;
++  // Per-register-class flags: written by some op in the current loop.
++  uint8_t* written_classes;
++  // Scratch arena for per-loop analysis.
++  iree_arena_allocator_t* arena;
++  // Open-addressed set of invariant ops found so far in the current loop
++  // (pointer -> index into |invariants|), capacity a power of two.
++  const loom_op_t** set_keys;
++  uint32_t* set_values;
++  uint32_t set_capacity;
++} loom_low_licm_context_t;
++
++static uint32_t loom_low_licm_hash_pointer(const void* pointer) {
++  uint64_t x = (uint64_t)(uintptr_t)pointer;
++  x ^= x >> 33;
++  x *= 0xff51afd7ed558ccdull;
++  x ^= x >> 33;
++  return (uint32_t)x;
++}
++
++// Returns the invariant index of |op| or UINT32_MAX.
++static uint32_t loom_low_licm_set_find(const loom_low_licm_context_t* context,
++                                       const loom_op_t* op) {
++  if (!context->set_capacity || !op) {
++    return UINT32_MAX;
++  }
++  const uint32_t mask = context->set_capacity - 1;
++  for (uint32_t i = loom_low_licm_hash_pointer(op) & mask;;
++       i = (i + 1) & mask) {
++    if (context->set_keys[i] == NULL) {
++      return UINT32_MAX;
++    }
++    if (context->set_keys[i] == op) {
++      return context->set_values[i];
++    }
++  }
++}
++
++static void loom_low_licm_set_insert(loom_low_licm_context_t* context,
++                                     const loom_op_t* op, uint32_t value) {
++  const uint32_t mask = context->set_capacity - 1;
++  for (uint32_t i = loom_low_licm_hash_pointer(op) & mask;;
++       i = (i + 1) & mask) {
++    if (context->set_keys[i] == NULL) {
++      context->set_keys[i] = op;
++      context->set_values[i] = value;
++      return;
++    }
++  }
++}
++
++static uint16_t loom_low_licm_operand_class(
++    const loom_low_descriptor_set_t* descriptor_set,
++    const loom_low_operand_t* operand) {
++  return descriptor_set->reg_class_alts[operand->reg_class_alt_start]
++      .reg_class_id;
++}
++
++// Scans the loop for state writes. Returns false when the loop contains an
++// op whose state effects cannot be bounded from descriptors.
++static bool loom_low_licm_scan_loop_state(loom_low_licm_context_t* context,
++                                          const loom_low_licm_loop_t* loop) {
++  const loom_low_descriptor_set_t* descriptor_set = context->descriptor_set;
++  memset(context->written_classes, 0, descriptor_set->reg_class_count);
++  for (iree_host_size_t b = 0; b < context->graph->block_count; ++b) {
++    if (!loop->members[b]) {
++      continue;
++    }
++    const loom_block_t* block = context->graph->blocks[b].block;
++    const loom_op_t* op = NULL;
++    loom_block_for_each_op(block, op) {
++      if (op->flags & LOOM_OP_FLAG_DEAD) {
++        continue;
++      }
++      loom_low_descriptor_packet_t packet = {0};
++      loom_low_descriptor_packet_initialize(descriptor_set, op, &packet);
++      if (packet.kind == LOOM_LOW_DESCRIPTOR_PACKET_NONE) {
++        if (loom_low_br_isa(op) || loom_low_cond_br_isa(op)) {
++          continue;
++        }
++        const loom_trait_flags_t traits =
++            loom_op_effective_traits(context->module, op);
++        if (op->region_count != 0 || loom_traits_has_side_effects(traits) ||
++            loom_traits_may_read(traits)) {
++          return false;
++        }
++        continue;
++      }
++      const loom_low_descriptor_t* descriptor = packet.descriptor;
++      for (uint16_t i = 0; i < descriptor->operand_count; ++i) {
++        const loom_low_operand_t* operand =
++            &descriptor_set->operands[descriptor->operand_start + i];
++        if (iree_any_bit_set(operand->flags,
++                             LOOM_LOW_OPERAND_FLAG_STATE_WRITE)) {
++          context->written_classes[loom_low_licm_operand_class(descriptor_set,
++                                                               operand)] = 1;
++        }
++      }
++    }
++  }
++  return true;
++}
++
++static bool loom_low_licm_value_in_loop(loom_low_licm_context_t* context,
++                                        const loom_low_licm_loop_t* loop,
++                                        loom_value_id_t value_id) {
++  const loom_value_t* value = loom_module_value(context->module, value_id);
++  const loom_block_t* block = NULL;
++  if (loom_value_is_block_arg(value)) {
++    block = loom_value_def_block(value);
++  } else {
++    const loom_op_t* producer = loom_value_def_op(value);
++    if (loom_low_licm_set_find(context, producer) != UINT32_MAX) {
++      return false;  // defined by an invariant op that will move first
++    }
++    block = producer ? producer->parent_block : NULL;
++  }
++  if (!block) {
++    return true;  // conservative
++  }
++  const iree_host_size_t index =
++      loom_cfg_graph_block_index(context->graph, block);
++  if (index == IREE_HOST_SIZE_MAX) {
++    // Defined outside the function body region (e.g. enclosing scope).
++    return block->parent_region == context->graph->region;
++  }
++  return loop->members[index] != 0;
++}
++
++typedef enum loom_low_licm_class_e {
++  LOOM_LOW_LICM_CLASS_NONE = 0,
++  LOOM_LOW_LICM_CLASS_VALU = 1,
++  LOOM_LOW_LICM_CLASS_SALU = 2,
++} loom_low_licm_class_t;
++
++// Returns the hoist class of |op| or NONE when it must stay in the loop.
++// |*out_reason| names the first failed rule (for LOOM_EXP_LICM_DEBUG=2).
++#define LOOM_LOW_LICM_REJECT(reason) \
++  do {                               \
++    *out_reason = (reason);          \
++    return LOOM_LOW_LICM_CLASS_NONE; \
++  } while (0)
++static loom_low_licm_class_t loom_low_licm_classify(
++    loom_low_licm_context_t* context, const loom_low_licm_loop_t* loop,
++    const loom_op_t* op, const char** out_reason) {
++  *out_reason = NULL;
++  if (op->flags & LOOM_OP_FLAG_DEAD) {
++    return LOOM_LOW_LICM_CLASS_NONE;
++  }
++  if (op->result_count == 0 || op->region_count != 0) {
++    return LOOM_LOW_LICM_CLASS_NONE;
++  }
++  // Operands must be defined outside the loop (hoisted packets already moved).
++  const loom_value_id_t* operands = loom_op_const_operands(op);
++  for (uint16_t i = 0; i < op->operand_count; ++i) {
++    if (loom_low_licm_value_in_loop(context, loop, operands[i])) {
++      return LOOM_LOW_LICM_CLASS_NONE;
++    }
++  }
++  const loom_low_descriptor_set_t* descriptor_set = context->descriptor_set;
++  loom_low_descriptor_packet_t packet = {0};
++  loom_low_descriptor_packet_initialize(descriptor_set, op, &packet);
++  if (packet.kind == LOOM_LOW_DESCRIPTOR_PACKET_NONE) {
++    LOOM_LOW_LICM_REJECT("non-descriptor");
++  }
++  const loom_low_descriptor_t* descriptor = packet.descriptor;
++  // Purity: DEAD_REMOVABLE (or SAFE_TO_SPECULATE) with no effect rows. Effect
++  // rows carry memory, counter, control, barrier and CONVERGENT (cross-lane:
++  // DPP, permlane, readlane, readfirstlane) semantics, so effect-free ALU
++  // packets compute their results from explicit operands and the implicit
++  // state rows checked below. SAFE_TO_SPECULATE is set on only a handful of
++  // AMDGPU descriptors, so it is not required; speculation (hoisting from a
++  // conditionally executed loop block, or out of a zero-trip loop) relies on
++  // the target fact that AMDGPU ALU packets cannot fault.
++  if (!iree_any_bit_set(descriptor->flags,
++                        LOOM_LOW_DESCRIPTOR_FLAG_SAFE_TO_SPECULATE |
++                            LOOM_LOW_DESCRIPTOR_FLAG_DEAD_REMOVABLE) ||
++      iree_any_bit_set(descriptor->flags,
++                       LOOM_LOW_DESCRIPTOR_FLAG_SIDE_EFFECTING |
++                           LOOM_LOW_DESCRIPTOR_FLAG_TERMINATOR |
++                           LOOM_LOW_DESCRIPTOR_FLAG_BARRIER |
++                           LOOM_LOW_DESCRIPTOR_FLAG_PSEUDO |
++                           LOOM_LOW_DESCRIPTOR_FLAG_UNIQUE_IDENTITY) ||
++      descriptor->effect_count != 0) {
++    LOOM_LOW_LICM_REJECT("descriptor-flags");
++  }
++  const loom_trait_flags_t traits =
++      loom_op_effective_traits(context->module, op);
++  if (loom_traits_has_side_effects(traits) || loom_traits_may_read(traits) ||
++      iree_any_bit_set(traits, LOOM_TRAIT_TERMINATOR)) {
++    LOOM_LOW_LICM_REJECT("traits");
++  }
++
++  const loom_low_instruction_class_flags_t class_flags =
++      loom_low_descriptor_set_descriptor_view(descriptor_set, descriptor)
++          ->instruction_class_flags;
++  const loom_low_instruction_class_flags_t excluded_classes =
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_MATRIX |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_MFMA |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_SMFMAC |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_WMMA |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_SWMMAC |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_DOT |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_GLOBAL_MEMORY |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_GLOBAL_LOAD |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_GLOBAL_STORE |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_BUFFER_LOAD |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_BUFFER_STORE |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_FLAT_MEMORY |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_LOCAL_MEMORY |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_SCALAR_MEMORY |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_PRIVATE_MEMORY |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_GENERIC_MEMORY |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_ATOMIC |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_BRANCH |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_EXECUTION_BARRIER |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_CONTROL |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_CACHE |
++      LOOM_LOW_INSTRUCTION_CLASS_FLAG_LDSDMA;
++  if (iree_any_bit_set(class_flags, excluded_classes)) {
++    LOOM_LOW_LICM_REJECT("instruction-class");
++  }
++  loom_low_licm_class_t hoist_class = LOOM_LOW_LICM_CLASS_NONE;
++  if (iree_any_bit_set(class_flags,
++                       LOOM_LOW_INSTRUCTION_CLASS_FLAG_VECTOR_ALU)) {
++    hoist_class = LOOM_LOW_LICM_CLASS_VALU;
++  } else if (context->options->hoist_salu &&
++             iree_any_bit_set(class_flags,
++                              LOOM_LOW_INSTRUCTION_CLASS_FLAG_SCALAR_ALU)) {
++    hoist_class = LOOM_LOW_LICM_CLASS_SALU;
++  } else {
++    LOOM_LOW_LICM_REJECT("not-alu");
++  }
++
++  // Architectural state: no writes at all (SCC clobbers, VCC carry-outs and
++  // compare masks, EXEC and MODE writes are all STATE_WRITE rows); reads only
++  // of implicit, schedule-only state (the per-VALU exec read, MODE) whose
++  // register class nothing in the loop writes. With the loop's only entry
++  // being P's unconditional branch, that state is then identical at P's
++  // terminator and at every loop instruction. Explicit state reads (VCC/SCC
++  // predicates of v_cndmask/s_cselect/addc) are refused.
++  for (uint16_t i = 0; i < descriptor->operand_count; ++i) {
++    const loom_low_operand_t* operand =
++        &descriptor_set->operands[descriptor->operand_start + i];
++    if (iree_any_bit_set(operand->flags,
++                         LOOM_LOW_OPERAND_FLAG_STATE_WRITE |
++                             LOOM_LOW_OPERAND_FLAG_TIED |
++                             LOOM_LOW_OPERAND_FLAG_STORAGE_CONTINUATION)) {
++      LOOM_LOW_LICM_REJECT("state-write-or-tied");
++    }
++    const bool implicit_role = operand->role == LOOM_LOW_OPERAND_ROLE_IMPLICIT;
++    if (iree_any_bit_set(operand->flags, LOOM_LOW_OPERAND_FLAG_STATE_READ)) {
++      if (!implicit_role ||
++          !iree_any_bit_set(operand->flags,
++                            LOOM_LOW_OPERAND_FLAG_SCHEDULE_ONLY_STATE)) {
++        LOOM_LOW_LICM_REJECT("explicit-or-unscheduled-state-read");
++      }
++      const uint16_t class_id =
++          loom_low_licm_operand_class(descriptor_set, operand);
++      if (context->written_classes[class_id]) {
++        LOOM_LOW_LICM_REJECT("state-written-in-loop");
++      }
++      continue;
++    }
++    if (implicit_role) {
++      // Implicit operand that is not a modeled state read: unknown.
++      LOOM_LOW_LICM_REJECT("implicit-operand");
++    }
++    if (operand->role == LOOM_LOW_OPERAND_ROLE_PREDICATE ||
++        operand->role == LOOM_LOW_OPERAND_ROLE_OPERAND_RESULT) {
++      LOOM_LOW_LICM_REJECT("predicate-operand");
++    }
++  }
++  return hoist_class;
++}
++
++//===----------------------------------------------------------------------===//
++// Hoisting
++//===----------------------------------------------------------------------===//
++
++typedef struct loom_low_licm_invariant_t {
++  // Invariant op, in reverse-postorder/program order.
++  loom_op_t* op;
++  // VALU or SALU.
++  loom_low_licm_class_t hoist_class;
++  // VGPR units newly live across the loop if this op is hoisted and some
++  // non-hoisted op (in or after the loop) still uses its results.
++  uint16_t live_cost;
++  // True when a non-invariant op uses one of the results.
++  bool is_frontier;
++  // Selected for hoisting.
++  bool selected;
++  // DFS stamp for cone walks.
++  uint32_t stamp;
++} loom_low_licm_invariant_t;
++
++static uint16_t loom_low_licm_result_units(loom_low_licm_context_t* context,
++                                           const loom_op_t* op) {
++  loom_low_descriptor_packet_t packet = {0};
++  loom_low_descriptor_packet_initialize(context->descriptor_set, op, &packet);
++  if (!packet.descriptor) {
++    return 1;
++  }
++  uint16_t units = 0;
++  for (uint16_t i = 0; i < packet.descriptor->result_count; ++i) {
++    units += iree_max(1, context->descriptor_set
++                             ->operands[packet.descriptor->operand_start + i]
++                             .unit_count);
++  }
++  return units ? units : 1;
++}
++
++// Walks the invariant producer cone of |root| and returns the number of
++// cone ops not yet selected; |*out_cost| receives the live cost of the
++// not-yet-selected frontier ops in the cone (the root included). With |select|
++// set, marks them selected.
++static uint32_t loom_low_licm_cone(loom_low_licm_context_t* context,
++                                   loom_low_licm_invariant_t* invariants,
++                                   uint32_t root, uint32_t stamp,
++                                   uint32_t* stack, bool select,
++                                   uint32_t* out_cost) {
++  uint32_t count = 0;
++  uint32_t cost = 0;
++  uint32_t depth = 0;
++  stack[depth++] = root;
++  invariants[root].stamp = stamp;
++  while (depth > 0) {
++    const uint32_t index = stack[--depth];
++    loom_low_licm_invariant_t* entry = &invariants[index];
++    if (!entry->selected) {
++      ++count;
++      if (entry->is_frontier) {
++        cost += entry->live_cost;
++      }
++      if (select) {
++        entry->selected = true;
++      }
++    }
++    const loom_value_id_t* operands = loom_op_const_operands(entry->op);
++    for (uint16_t i = 0; i < entry->op->operand_count; ++i) {
++      const loom_value_t* value =
++          loom_module_value(context->module, operands[i]);
++      if (loom_value_is_block_arg(value)) {
++        continue;
++      }
++      const uint32_t producer =
++          loom_low_licm_set_find(context, loom_value_def_op(value));
++      if (producer == UINT32_MAX || invariants[producer].stamp == stamp) {
++        continue;
++      }
++      invariants[producer].stamp = stamp;
++      stack[depth++] = producer;
++    }
++  }
++  *out_cost = cost;
++  return count;
++}
++
++static iree_status_t loom_low_licm_hoist_loop(
++    loom_low_licm_context_t* context, const loom_low_licm_loop_t* loop) {
++  const loom_cfg_graph_t* graph = context->graph;
++  const loom_low_licm_options_t* options = context->options;
++  ++context->statistics->loops_visited;
++  if (options->header_filter && !options->header_filter[loop->header]) {
++    return iree_ok_status();
++  }
++  const uint16_t preheader = loom_low_licm_find_preheader(graph, loop);
++  if (preheader == UINT16_MAX) {
++    ++context->statistics->loops_without_preheader;
++    if (options->debug) {
++      fprintf(stderr,
++              "[low-licm] loop header=_bb%u blocks=%u: no dedicated "
++              "preheader, skipped\n",
++              loop->header, loop->block_count);
++    }
++    return iree_ok_status();
++  }
++  if (!loom_low_licm_scan_loop_state(context, loop)) {
++    if (options->debug) {
++      fprintf(stderr,
++              "[low-licm] loop header=_bb%u blocks=%u: unbounded op in loop, "
++              "skipped\n",
++              loop->header, loop->block_count);
++    }
++    return iree_ok_status();
++  }
++  loom_op_t* anchor = graph->blocks[preheader].block->last_op;
++
++  // Size per-loop scratch from the loop's op count.
++  const loom_cfg_block_index_span_t order = graph->reverse_postorder;
++  uint32_t loop_op_count = 0;
++  for (iree_host_size_t r = 0; r < order.count; ++r) {
++    if (loop->members[order.values[r]]) {
++      loop_op_count += graph->blocks[order.values[r]].block->op_count;
++    }
++  }
++  uint32_t capacity = 16;
++  while (capacity < 2 * loop_op_count + 2) {
++    capacity <<= 1;
++  }
++  loom_low_licm_invariant_t* invariants = NULL;
++  uint32_t* stack = NULL;
++  IREE_RETURN_IF_ERROR(
++      iree_arena_allocate_array(context->arena, loop_op_count + 1,
++                                sizeof(*invariants), (void**)&invariants));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      context->arena, loop_op_count + 1, sizeof(*stack), (void**)&stack));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(context->arena, capacity,
++                                                 sizeof(*context->set_keys),
++                                                 (void**)&context->set_keys));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(context->arena, capacity,
++                                                 sizeof(*context->set_values),
++                                                 (void**)&context->set_values));
++  memset((void*)context->set_keys, 0, capacity * sizeof(*context->set_keys));
++  context->set_capacity = capacity;
++
++  // Phase 1: find the invariant set. Reverse postorder visits definitions
++  // before their in-loop uses.
++  uint32_t invariant_count = 0;
++  for (iree_host_size_t r = 0; r < order.count; ++r) {
++    const uint16_t b = order.values[r];
++    if (!loop->members[b]) {
++      continue;
++    }
++    loom_op_t* op = NULL;
++    loom_block_for_each_op(graph->blocks[b].block, op) {
++      const char* reason = NULL;
++      const loom_low_licm_class_t hoist_class =
++          loom_low_licm_classify(context, loop, op, &reason);
++      if (reason && options->debug_level >= 2) {
++        loom_low_descriptor_packet_t packet = {0};
++        loom_low_descriptor_packet_initialize(context->descriptor_set, op,
++                                              &packet);
++        iree_string_view_t name =
++            packet.descriptor ? loom_low_descriptor_set_string(
++                                    context->descriptor_set,
++                                    packet.descriptor->mnemonic_string_ref)
++                              : IREE_SV("<non-descriptor>");
++        fprintf(stderr,
++                "[low-licm]   _bb%u keep %.*s: %s (flags=0x%x effects=%u)\n",
++                loop->header, (int)name.size, name.data, reason,
++                packet.descriptor ? packet.descriptor->flags : 0,
++                packet.descriptor ? packet.descriptor->effect_count : 0);
++      }
++      if (hoist_class == LOOM_LOW_LICM_CLASS_NONE) {
++        continue;
++      }
++      invariants[invariant_count] = (loom_low_licm_invariant_t){
++          .op = op,
++          .hoist_class = hoist_class,
++          .live_cost = hoist_class == LOOM_LOW_LICM_CLASS_VALU
++                           ? loom_low_licm_result_units(context, op)
++                           : 0,
++      };
++      loom_low_licm_set_insert(context, op, invariant_count);
++      ++invariant_count;
++    }
++  }
++
++  // Phase 2: frontier = invariant ops with a use outside the invariant set.
++  uint32_t frontier_count = 0;
++  for (uint32_t i = 0; i < invariant_count; ++i) {
++    loom_low_licm_invariant_t* entry = &invariants[i];
++    const loom_value_id_t* results = loom_op_const_results(entry->op);
++    for (uint16_t r = 0; r < entry->op->result_count && !entry->is_frontier;
++         ++r) {
++      const loom_value_t* value =
++          loom_module_value(context->module, results[r]);
++      const loom_use_t* use = NULL;
++      loom_value_for_each_use(value, use) {
++        if (loom_low_licm_set_find(context, loom_use_user_op(*use)) ==
++            UINT32_MAX) {
++          entry->is_frontier = true;
++          break;
++        }
++      }
++    }
++    if (entry->is_frontier) {
++      ++frontier_count;
++    }
++  }
++
++  // Phase 3: select. Without a live budget, everything is selected. With
++  // LOOM_EXP_LICM_MAX_LIVE, frontier cones are picked greedily by ops removed
++  // per newly loop-live VGPR unit; zero-cost (SALU) frontiers always win.
++  uint32_t live_units = 0;
++  uint32_t stamp = 0;
++  if (options->max_live == UINT32_MAX) {
++    for (uint32_t i = 0; i < invariant_count; ++i) {
++      invariants[i].selected = true;
++    }
++  } else {
++    while (true) {
++      uint32_t best = UINT32_MAX;
++      uint32_t best_cost = 0;
++      uint64_t best_score = 0;
++      for (uint32_t i = 0; i < invariant_count; ++i) {
++        const loom_low_licm_invariant_t* entry = &invariants[i];
++        if (!entry->is_frontier || entry->selected) {
++          continue;
++        }
++        uint32_t cost = 0;
++        const uint32_t gain = loom_low_licm_cone(context, invariants, i,
++                                                 ++stamp, stack, false, &cost);
++        if (gain == 0 || live_units + cost > options->max_live) {
++          continue;
++        }
++        // Ops removed per newly loop-live VGPR unit; zero-cost (pure SALU)
++        // cones rank above everything else.
++        const uint64_t score =
++            cost == 0 ? ((uint64_t)gain << 32) : ((uint64_t)gain << 16) / cost;
++        if (score > best_score) {
++          best_score = score;
++          best = i;
++          best_cost = cost;
++        }
++      }
++      if (best == UINT32_MAX) {
++        break;
++      }
++      if (best_cost != 0 && best_score < ((uint64_t)options->min_gain << 16)) {
++        break;
++      }
++      uint32_t cost = 0;
++      loom_low_licm_cone(context, invariants, best, ++stamp, stack, true,
++                         &cost);
++      live_units += cost;
++    }
++  }
++
++  // Phase 4: move selected ops in program order (dependencies first).
++  uint32_t valu_count = 0;
++  uint32_t salu_count = 0;
++  bool capped = false;
++  for (uint32_t i = 0; i < invariant_count; ++i) {
++    const loom_low_licm_invariant_t* entry = &invariants[i];
++    if (!entry->selected) {
++      continue;
++    }
++    if (valu_count + salu_count >= options->max_per_loop) {
++      capped = true;
++      break;
++    }
++    IREE_RETURN_IF_ERROR(
++        loom_rewriter_move_before(context->rewriter, entry->op, anchor));
++    if (entry->hoist_class == LOOM_LOW_LICM_CLASS_VALU) {
++      ++valu_count;
++    } else {
++      ++salu_count;
++    }
++  }
++  context->set_capacity = 0;
++  context->statistics->ops_hoisted += valu_count + salu_count;
++  if (valu_count + salu_count) {
++    loom_pass_mark_changed(context->pass);
++  }
++  if (options->debug) {
++    fprintf(stderr,
++            "[low-licm] loop header=_bb%u blocks=%u preheader=_bb%u ops=%u: "
++            "invariant=%u frontier=%u hoisted valu=%u salu=%u "
++            "new-live-units=%u%s%s\n",
++            loop->header, loop->block_count, preheader, loop_op_count,
++            invariant_count, frontier_count, valu_count, salu_count,
++            options->max_live == UINT32_MAX ? 0 : live_units,
++            options->max_live == UINT32_MAX ? " (no live budget)" : "",
++            capped ? " [capped]" : "");
++  }
++  return iree_ok_status();
++}
++
++static iree_status_t loom_low_licm_region(loom_low_licm_context_t* context,
++                                          loom_region_t* region,
++                                          iree_arena_allocator_t* arena) {
++  loom_cfg_graph_t graph = {0};
++  IREE_RETURN_IF_ERROR(
++      loom_cfg_graph_build(context->module, region, arena, &graph));
++  if (graph.malformed || !graph.has_cycles || graph.block_count < 2) {
++    return iree_ok_status();
++  }
++  loom_cfg_dominance_t dominance = {0};
++  IREE_RETURN_IF_ERROR(loom_cfg_dominance_build(&graph, arena, &dominance));
++  if (!dominance.available) {
++    return iree_ok_status();
++  }
++  context->graph = &graph;
++
++  uint16_t* worklist = NULL;
++  loom_low_licm_loop_t* loops = NULL;
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      arena, graph.block_count, sizeof(*worklist), (void**)&worklist));
++  IREE_RETURN_IF_ERROR(iree_arena_allocate_array(
++      arena, graph.block_count, sizeof(*loops), (void**)&loops));
++  iree_host_size_t loop_count = 0;
++  for (iree_host_size_t h = 0; h < graph.block_count; ++h) {
++    if (!graph.blocks[h].reachable || !graph.blocks[h].is_dfs_backedge_target) {
++      continue;
++    }
++    bool found = false;
++    IREE_RETURN_IF_ERROR(
++        loom_low_licm_collect_loop(&graph, &dominance, (uint16_t)h, arena,
++                                   worklist, &loops[loop_count], &found));
++    if (found) {
++      ++loop_count;
++    }
++  }
++  // Innermost (smallest) loops first so hoisted packets can keep moving out.
++  for (iree_host_size_t i = 1; i < loop_count; ++i) {
++    loom_low_licm_loop_t key = loops[i];
++    iree_host_size_t j = i;
++    while (j > 0 && loops[j - 1].block_count > key.block_count) {
++      loops[j] = loops[j - 1];
++      --j;
++    }
++    loops[j] = key;
++  }
++  for (iree_host_size_t i = 0; i < loop_count; ++i) {
++    IREE_RETURN_IF_ERROR(loom_low_licm_hoist_loop(context, &loops[i]));
++  }
++  context->graph = NULL;
++  return iree_ok_status();
++}
++
++iree_status_t loom_low_licm_run(loom_pass_t* pass, loom_module_t* module,
++                                loom_func_like_t function) {
++  const loom_low_licm_options_t* options = loom_low_licm_options();
++  if (!options->enabled) {
++    return iree_ok_status();
++  }
++  if (!loom_low_function_def_isa(function.op) ||
++      !loom_func_like_body(function)) {
++    return iree_ok_status();
++  }
++  if (loom_low_function_schedule(function.op) == LOOM_LOW_SCHEDULE_LOCKED ||
++      loom_low_function_allocation(function.op) == LOOM_LOW_ALLOCATION_FIXED) {
++    return iree_ok_status();
++  }
++  const loom_low_pass_capability_t* capability =
++      loom_low_pass_capability_from_pass(pass);
++  const loom_low_descriptor_registry_t* registry =
++      loom_low_pass_capability_descriptor_registry(capability);
++  loom_symbol_fact_table_t symbol_facts = {0};
++  loom_symbol_fact_table_initialize(&symbol_facts, pass->arena);
++  loom_low_resolved_target_t target = {0};
++  IREE_RETURN_IF_ERROR(loom_low_resolve_function_target(
++      module, &symbol_facts, function.op,
++      loom_target_function_version_target_facts(pass->function_version),
++      registry, pass->diagnostic_emitter, &target));
++  if (!target.descriptor_set) {
++    return iree_ok_status();
++  }
++
++  iree_arena_allocator_t arena;
++  iree_arena_initialize(pass->arena->block_pool, &arena);
++  loom_rewriter_t rewriter;
++  loom_rewriter_initialize(&rewriter, module, pass->arena);
++  loom_low_licm_context_t context = {
++      .pass = pass,
++      .module = module,
++      .options = options,
++      .descriptor_set = target.descriptor_set,
++      .rewriter = &rewriter,
++      .statistics = loom_low_licm_statistics(pass),
++      .arena = &arena,
++  };
++  iree_status_t status = iree_arena_allocate(
++      &arena, iree_max(1, target.descriptor_set->reg_class_count),
++      (void**)&context.written_classes);
++  for (uint8_t i = 0;
++       i < loom_func_like_region_count(function) && iree_status_is_ok(status);
++       ++i) {
++    loom_region_t* region = loom_func_like_region(function, i);
++    if (!region || region->block_count == 0) {
++      continue;
++    }
++    status = loom_low_licm_region(&context, region, &arena);
++  }
++  loom_rewriter_deinitialize(&rewriter);
++  iree_arena_deinitialize(&arena);
++  return status;
++}
+diff --git a/loom/src/loom/codegen/low/transforms/licm.h b/loom/src/loom/codegen/low/transforms/licm.h
+new file mode 100644
+index 000000000..b566306a2
+--- /dev/null
++++ b/loom/src/loom/codegen/low/transforms/licm.h
+@@ -0,0 +1,80 @@
++// Copyright 2026 The IREE Authors
++//
++// Licensed under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++
++// EXPERIMENTAL: loop-invariant code motion for descriptor-backed low CFGs.
++//
++// The pass body is inert unless the environment variable LOOM_EXP_LICM=1 is
++// set, so the default pipeline output is unchanged.
++//
++// Loops are natural loops of the low.func CFG (a header H plus every block
++// that reaches a back-edge source dominated by H without passing through H).
++// A loop is only transformed when it has a dedicated preheader: exactly one
++// predecessor P of H outside the loop, terminated by an unconditional low.br.
++// No blocks are created.
++//
++// A packet moves to just before P's terminator (relative order preserved)
++// when every operand is defined outside the loop (or by another hoisted
++// packet) and its descriptor proves it pure:
++//   - DEAD_REMOVABLE or SAFE_TO_SPECULATE, and not SIDE_EFFECTING, TERMINATOR,
++//     BARRIER, PSEUDO or UNIQUE_IDENTITY; zero effect rows (effect rows carry
++//     memory, counter, control, barrier and CONVERGENT/cross-lane semantics,
++//     so DPP, permlane, readlane and readfirstlane are excluded); no
++//     OBSERVABLE_EFFECT or memory traits; no regions; at least one result;
++//   - instruction class VECTOR_ALU, or SCALAR_ALU (LOOM_EXP_LICM_SALU), and
++//     none of the memory, matrix, dot, branch, control, barrier, atomic,
++//     cache or LDS-DMA classes;
++//   - no operand row with STATE_WRITE (SCC clobbers, VCC carry-outs, compare
++//     masks, EXEC and MODE writes), TIED or STORAGE_CONTINUATION, and no
++//     PREDICATE/OPERAND_RESULT/unmodeled IMPLICIT rows;
++//   - every STATE_READ row is an implicit SCHEDULE_ONLY_STATE read (the
++//     per-VALU exec read, MODE) of a register class that no op in the loop
++//     writes.
++// EXEC rule: Loom low branches are wave-uniform jumps and exec changes are
++// explicit descriptor packets with STATE_WRITE rows. With no exec write in the
++// loop and a single P->H entry edge, every loop instruction executes under
++// exactly the exec mask live at P's terminator, so hoisted lane-local results
++// are unchanged. SAFE_TO_SPECULATE is only set on a few AMDGPU descriptors, so
++// speculation (hoisting from conditional loop blocks or zero-trip loops)
++// relies on effect-free ALU packets not faulting.
++// Loops containing non-descriptor ops with effects or regions are skipped.
++// Inner (smaller) loops are processed before outer loops.
++//
++// Environment knobs (read once):
++//   LOOM_EXP_LICM=1           schedule the pass (plus a following low-cse
++//                             that merges hoisted duplicates) and enable it.
++//   LOOM_EXP_LICM_MAX=<n>     cap hoisted packets per loop (default unlimited).
++//   LOOM_EXP_LICM_MAX_LIVE=<n> cap VGPR units newly live across each loop. An
++//                             invariant result still used by a packet that
++//                             stays (a "frontier") becomes loop-live; cones of
++//                             frontier producers are chosen greedily by ops
++//                             removed per new live unit (pure-SALU cones are
++//                             free). Default unlimited.
++//   LOOM_EXP_LICM_MIN_GAIN=<n> minimum ops removed per new live unit (2).
++//   LOOM_EXP_LICM_SALU=0      hoist VALU only (SALU hoisting defaults on).
++//   LOOM_EXP_LICM_HEADERS=a,b only transform loops with these header indices.
++//   LOOM_EXP_LICM_DEBUG=1|2   per-loop counts (2: also why each packet stays).
++
++#ifndef LOOM_CODEGEN_LOW_TRANSFORMS_LICM_H_
++#define LOOM_CODEGEN_LOW_TRANSFORMS_LICM_H_
++
++#include "loom/pass/types.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Static metadata for the experimental low-licm function pass.
++const loom_pass_info_t* loom_low_licm_pass_info(void);
++
++// Runs low-licm on one low function (no-op unless LOOM_EXP_LICM=1).
++iree_status_t loom_low_licm_run(loom_pass_t* pass, loom_module_t* module,
++                                loom_func_like_t function);
++
++#ifdef __cplusplus
++}  // extern "C"
++#endif
++
++#endif  // LOOM_CODEGEN_LOW_TRANSFORMS_LICM_H_
+diff --git a/loom/src/loom/pass/BUILD.bazel b/loom/src/loom/pass/BUILD.bazel
+index 16a1aa291..21e2c69ea 100644
+--- a/loom/src/loom/pass/BUILD.bazel
++++ b/loom/src/loom/pass/BUILD.bazel
+@@ -298,6 +298,7 @@ loom_cc_library(
+         "//loom/src/loom/codegen/low/transforms:cfg_tuple_decomposition",
+         "//loom/src/loom/codegen/low/transforms:cse",
+         "//loom/src/loom/codegen/low/transforms:dce",
++        "//loom/src/loom/codegen/low/transforms:licm",
+         "//loom/src/loom/codegen/low/transforms:operand_forms",
+         "//loom/src/loom/codegen/low/transforms/pipeline:source_to_low",
+         "//loom/src/loom/codegen/low/transforms/pipeline:target_legalize",
+diff --git a/loom/src/loom/pass/CMakeLists.txt b/loom/src/loom/pass/CMakeLists.txt
+index 9182930c8..671c3647c 100644
+--- a/loom/src/loom/pass/CMakeLists.txt
++++ b/loom/src/loom/pass/CMakeLists.txt
+@@ -332,6 +332,7 @@ loom_cc_library(
+     loom::codegen::low::transforms::cfg_tuple_decomposition
+     loom::codegen::low::transforms::cse
+     loom::codegen::low::transforms::dce
++    loom::codegen::low::transforms::licm
+     loom::codegen::low::transforms::operand_forms
+     loom::codegen::low::transforms::pipeline::source_to_low
+     loom::codegen::low::transforms::pipeline::target_legalize
+diff --git a/loom/src/loom/pass/builtin_registry.c b/loom/src/loom/pass/builtin_registry.c
+index 60392d6c7..3150d3cd6 100644
+--- a/loom/src/loom/pass/builtin_registry.c
++++ b/loom/src/loom/pass/builtin_registry.c
+@@ -14,6 +14,7 @@
+ #include "loom/codegen/low/transforms/cfg_tuple_decomposition.h"
+ #include "loom/codegen/low/transforms/cse.h"
+ #include "loom/codegen/low/transforms/dce.h"
++#include "loom/codegen/low/transforms/licm.h"
+ #include "loom/codegen/low/transforms/operand_forms.h"
+ #include "loom/codegen/low/transforms/pipeline/source_to_low.h"
+ #include "loom/codegen/low/transforms/pipeline/target_legalize.h"
+@@ -474,6 +475,13 @@ static const loom_pass_descriptor_t kBuiltinPassDescriptors[] = {
+         .requirement_defs = kLowDescriptorRegistryRequirements,
+         .requirement_count = IREE_ARRAYSIZE(kLowDescriptorRegistryRequirements),
+     },
++    {
++        .key = IREE_SVL("low-licm"),
++        .info = loom_low_licm_pass_info,
++        .function_run = loom_low_licm_run,
++        .requirement_defs = kLowDescriptorRegistryRequirements,
++        .requirement_count = IREE_ARRAYSIZE(kLowDescriptorRegistryRequirements),
++    },
+     {
+         .key = IREE_SVL("low-decompose-cfg-tuples"),
+         .info = loom_low_decompose_cfg_tuples_pass_info,

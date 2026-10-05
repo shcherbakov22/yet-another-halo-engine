@@ -951,8 +951,17 @@ def main():
          ["yah_gemv_q6k.m_rows=248320", "yah_gemv_q6k.k_blocks=20"]),
         ("yah_argmax_f32.loom", "argmax.hal", ["yah_argmax.vocab=248320"]),
     ]
+    # Loom low-level LICM (HRX patch 0011) for the attention kernels where it wins: it hoists the fragment loads'
+    # per-lane LDS address math out of the key loop (fp16 -1..-2%; kv4 QROT -0.5% with one extra live register); the
+    # kv4 staged-Q build loses 11% and the afrag GEMMs 5-20%, so they compile without it
+    def attn_env(loom):
+        if loom in (attn_qr_src, attn_qr_t_src):
+            return {"LOOM_EXP_LICM": "1", "LOOM_EXP_LICM_MAX_LIVE": "1"}
+        if loom in (attn_src, attn_t_src) and not gen_attn_fa.KDEC:
+            return {"LOOM_EXP_LICM": "1"}
+        return None
     for loom, outname, configs in fixed:
-        E.emit(loom, configs, outname, outdir)
+        E.emit(loom, configs, outname, outdir, attn_env(loom))
         n += 1
 
     tables = os.path.join(E.LOOM, "tables")
