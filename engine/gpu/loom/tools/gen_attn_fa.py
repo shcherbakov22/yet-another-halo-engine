@@ -103,6 +103,14 @@ TILED_OUT = False
 # GATE_EACH: the epilogue loads each fragment's gate right before its use instead of all 8 up front (64 fewer live
 # registers at the epilogue peak; the paged fragment-major build otherwise allocates 236 VGPRs)
 GATE_EACH = False
+# GATE_FENCE: every gate address first, a schedule fence, then the loads: without it the allocator recycles each address
+# register right after its load and Loom waits for that load (vmcnt) before the overwrite, serializing the 16 loads
+GATE_FENCE = True
+# DIAG_MASK: the causal / context mask (8 compares, ands and selects per lane) under a wave-uniform branch taken only when
+# some lane of the wave has a key past its limit or a dead row (the diagonal and last tiles). Same values: an unmasked
+# tile's selects pass S through. The branch sits after the K staging and the S partner loads (the mask needs them), so
+# its join drains nothing.
+DIAG_MASK = True
 # Page lookups are scalar (SMEM) loads of the global table; an LDS copy of the table was slower.
 # No in-kernel clamp (it cost 1%): the host validates every entry (< npages) before upload,
 # and the cache writers clamp page indices into their pools.
@@ -131,7 +139,8 @@ def configure(hpw, qt):
     DRAIN_OFF = S_OFF if S_OFF >= Q_END else Q_END
     K2_OFF = S_OFF + NT * 32
     POOL = max(S_OFF + NT * 32, DRAIN_OFF + NT * 16)
-    assert POOL <= 65536
+    # QDIRECT has no Q stage or drain slot: gen() sizes the pool S_OFF + NT * 32 then
+    assert (S_OFF + NT * 32 if (Q16 if QDIRECT is None else QDIRECT) else POOL) <= 65536
 
 
 def had64(e, pre, vecs, xors, scale):
@@ -846,15 +855,32 @@ def gen():
             e("    %limi = index.cast %lim1 : index to i32")
             e("    %khi = index.cast %kh : index to i32")
             e("    %lim = scalar.subi %limi, %khi : i32")
+            ind = "    "
+            if DIAG_MASK:
+                # some lane has a key at or past its limit (lim < 8) or a dead row
+                e("    %mc8 = scalar.constant 8 : i32")
+                e("    %mpart = scalar.cmpi slt, %lim, %mc8 : i32")
+                e("    %mdead = index.cmp uge, %r_lq, %B : index")
+                e("    %mneed = scalar.ori %mpart, %mdead : i1")
+                e("    %manyneed = kernel.subgroup.vote.any %mneed : i1")
+                e(f"    %smask = scf.if %manyneed -> ({V8}) {{")
+                ind = "      "
             els = []
             for i in range(8):
-                e(f"    %mi{i} = scalar.constant {i} : i32")
-                e(f"    %mv{i}a = scalar.cmpi slt, %mi{i}, %lim : i32")
-                e(f"    %mv{i} = scalar.andi %mv{i}a, %r_live_i1 : i1")
-                e(f"    %se{i} = vector.extract %s0[{i}] : {V8} -> f32")
-                e(f"    %sm{i} = scf.select %mv{i}, %se{i}, %ninf : f32")
+                e(f"{ind}%mi{i} = scalar.constant {i} : i32")
+                e(f"{ind}%mv{i}a = scalar.cmpi slt, %mi{i}, %lim : i32")
+                e(f"{ind}%mv{i} = scalar.andi %mv{i}a, %r_live_i1 : i1")
+                e(f"{ind}%se{i} = vector.extract %s0[{i}] : {V8} -> f32")
+                e(f"{ind}%sm{i} = scf.select %mv{i}, %se{i}, %ninf : f32")
                 els.append(f"%sm{i}")
-            e(f"    %smask = vector.from_elements {', '.join(els)} : {V8}")
+            if DIAG_MASK:
+                e(f"      %smk = vector.from_elements {', '.join(els)} : {V8}")
+                e(f"      scf.yield %smk : {V8}")
+                e("    } else {")
+                e(f"      scf.yield %s0 : {V8}")
+                e("    }")
+            else:
+                e(f"    %smask = vector.from_elements {', '.join(els)} : {V8}")
             s = "%smask"
         e(f"    %tmax0 = vector.reduce<maxnumf> {s}, %ninf : {V8}, f32")
         e("    %tmi = scalar.bitcast %tmax0 : f32 to i32")
@@ -1050,15 +1076,28 @@ def gen():
     e("  %eh8 = index.mul %half, %c8 : index")
     e("  %eoff2 = index.add %eoff1, %hd128 : index")
     e("  %eoff = index.add %eoff2, %eh8 : index")
-    def gate_loads(f):
+    def gate_addr(f):
         e(f"  %eo{f}c = index.constant {16 * f} : index")
         e(f"  %eo{f} = index.add %eoff, %eo{f}c : index")
         e(f"  %eo{f}b = index.add %eo{f}, %c4 : index")
+
+    def gate_load(f):
         e(f"  %eg{f}a = vector.load %g_flat[%eo{f}] : view<[%qtot]xf32> -> {V4}")
         e(f"  %eg{f}b = vector.load %g_flat[%eo{f}b] : view<[%qtot]xf32> -> {V4}")
+
+    def gate_loads(f):
+        gate_addr(f)
+        gate_load(f)
     # all gate loads together (latency); GATE_EACH: each fragment's right before its use (fewer live registers)
-    for f in range(0 if GATE_EACH else 8):
-        gate_loads(f)
+    if GATE_FENCE and not GATE_EACH:
+        for f in range(8):
+            gate_addr(f)
+        e("  scf.schedule.fence")
+        for f in range(8):
+            gate_load(f)
+    else:
+        for f in range(0 if GATE_EACH else 8):
+            gate_loads(f)
     if TILED_OUT:
         e("  %et16 = index.constant 16 : index")
         e("  %et384 = index.constant 384 : index")
