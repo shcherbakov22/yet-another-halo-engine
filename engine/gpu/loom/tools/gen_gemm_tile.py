@@ -545,10 +545,11 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         # segment s = tid + i * LANES (clamped): token row s / aseg, f16 column 8 * (s % aseg)
         e(f"  %gs_last = index.constant {BN * aseg - 1} : index")
         e(f"  %gs_aseg = index.constant {aseg} : index")
+        sep = "_" if nsl > 10 else ""   # %gs1 + "0" would collide with %gs10 past ten slices
         for i in range(nsl):
-            e(f"  %gs{i}c = index.constant {i * LANES} : index")
-            e(f"  %gs{i}0 = index.add %tid, %gs{i}c : index")
-            e(f"  %gs{i} = index.min %gs{i}0, %gs_last : index")
+            e(f"  %gs{i}{sep}c = index.constant {i * LANES} : index")
+            e(f"  %gs{i}{sep}0 = index.add %tid, %gs{i}{sep}c : index")
+            e(f"  %gs{i} = index.min %gs{i}{sep}0, %gs_last : index")
             e(f"  %gr{i} = index.div %gs{i}, %gs_aseg : index")
             e(f"  %gq{i} = index.rem %gs{i}, %gs_aseg : index")
             e(f"  %gc{i} = index.mul %gq{i}, %c8 : index")
