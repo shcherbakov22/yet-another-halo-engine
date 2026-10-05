@@ -257,7 +257,58 @@ class LoomPrefill {
   }
   [[nodiscard]] std::uint32_t pool_rows() const { return pages_ * 256; }
 
+  // A slot: the sequence state after `chunks` chunks (KV pools, page table, conv rings, DeltaNet states), raw. It loads
+  // only into a prefill of the same set (context, chunk size, KV format); LoadState returns the chunks it covers, so the
+  // caller continues at that chunk index (marginal prefill at depth without re-running the prefix).
+  void SaveState(const std::string& path, std::uint32_t chunks) {
+    gpu_.Synchronize();
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) throw LoomError("prefill: cannot write the slot " + path);
+    const auto bufs = StateBuffers();
+    const std::uint64_t head[5] = {kSlotMagic, T_, B_, chunks, bufs.size()};
+    bool ok = std::fwrite(head, sizeof head, 1, f) == 1;
+    std::vector<std::uint8_t> host(std::size_t{64} << 20);
+    for (const LoomBuffer* b : bufs) {
+      const std::uint64_t n = b->size;
+      ok = ok && std::fwrite(&n, 8, 1, f) == 1;
+      for (std::size_t o = 0; ok && o < b->size; o += host.size()) {
+        const std::size_t k = std::min(host.size(), b->size - o);
+        gpu_.D2H(*b, host.data(), k, o);
+        ok = std::fwrite(host.data(), 1, k, f) == k;
+      }
+    }
+    if (std::fclose(f) != 0 || !ok) throw LoomError("prefill: short write to the slot " + path);
+  }
+  std::uint32_t LoadState(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) throw LoomError("prefill: cannot open the slot " + path);
+    const auto bufs = StateBuffers();
+    std::uint64_t head[5] = {};
+    bool ok = std::fread(head, sizeof head, 1, f) == 1 && head[0] == kSlotMagic && head[1] == T_ && head[2] == B_ &&
+              head[4] == bufs.size();
+    std::vector<std::uint8_t> host(std::size_t{64} << 20);
+    for (const LoomBuffer* b : bufs) {
+      std::uint64_t n = 0;
+      ok = ok && std::fread(&n, 8, 1, f) == 1 && n == b->size;
+      for (std::size_t o = 0; ok && o < b->size; o += host.size()) {
+        const std::size_t k = std::min(host.size(), b->size - o);
+        ok = std::fread(host.data(), 1, k, f) == k;
+        if (ok) gpu_.H2D(*b, host.data(), k, o);
+      }
+    }
+    std::fclose(f);
+    if (!ok) throw LoomError("prefill: the slot " + path + " does not match this set (context, chunk, KV format)");
+    gpu_.Synchronize();
+    return static_cast<std::uint32_t>(head[3]);
+  }
+
  private:
+  static constexpr std::uint64_t kSlotMagic = 0x31544f4c53484159ull;  // "YAHSLOT1"
+  // Paged sets keep the whole sequence state in these (the f16 K/V buffer is per-chunk scratch there).
+  [[nodiscard]] std::vector<const LoomBuffer*> StateBuffers() const {
+    if (!kv_paged_ || !kv16_scratch_) throw LoomError("prefill: slots need the paged KV layout (the default set)");
+    return {ptab_, kq8buf_, ksbuf_, kmbuf_, vqbuf_, vqsbuf_, kpool_, vtpool_, conv_state_, state_};
+  }
   struct Fmt {
     const char* name;
     std::uint32_t qk;

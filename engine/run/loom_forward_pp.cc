@@ -11,6 +11,8 @@
 //   YAH_LOGITS_FROM=P   f32 logits of positions P..tokens-1 into <out-prefix>.all_logits (engine/run/gate)
 //   YAH_ROWSTATS=<file> compact per-position logit statistics (engine/run/kvq/gate2.py); YAH_ROWSTATS_FROM (1024),
 //                       YAH_ROWSTATS_STRIDE (8) or a position list in YAH_ROWSTATS_POS
+//   YAH_SLOT_SAVE=<file> [YAH_SLOT_AT=C]  save the sequence state before chunk C (default: after the last)
+//   YAH_SLOT_LOAD=<file> restore a slot and run from the chunk it covers (marginal prefill at depth)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -134,10 +136,22 @@ int main(int argc, char** argv) {
           rs_max, std::count(rs_want.begin() + std::size_t{c} * B, rs_want.begin() + std::size_t{c + 1} * B, 1));
     LoomBuffer rsbuf = gpu.Allocate(std::size_t{rs_max} * kVocab * 4);
 
+    // Slots (LoomPrefill::SaveState): YAH_SLOT_SAVE=<file> writes the state before chunk YAH_SLOT_AT (default: after the
+    // last chunk); YAH_SLOT_LOAD=<file> restores it and runs from the chunk it covers, so layers_ms is the marginal time.
+    std::uint32_t ci0 = 0;
+    if (const char* sl = std::getenv("YAH_SLOT_LOAD")) {
+      ci0 = pf.LoadState(sl);
+      if (ci0 >= n_chunks) throw LoomError("the slot covers every chunk of this run");
+      std::fprintf(stderr, "loom_forward_pp: slot %s covers %u chunks; running from token %u\n", sl, ci0, ci0 * B);
+    }
+    const char* slot_save = std::getenv("YAH_SLOT_SAVE");
+    const std::uint32_t slot_at = std::getenv("YAH_SLOT_AT") ? std::atoi(std::getenv("YAH_SLOT_AT")) : n_chunks;
+
     gpu.Synchronize();
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> idx(kVocab);
-    for (std::uint32_t ci = 0; ci < n_chunks; ++ci) {
+    for (std::uint32_t ci = ci0; ci < n_chunks; ++ci) {
+      if (slot_save && ci == slot_at) pf.SaveState(slot_save, ci);
       pf.Embed(ids.data() + std::size_t{ci} * B, ci + 1 == n_chunks ? last_n : B);
       // the last layer's tail only for the rows read below: every row for logits_from / rowstats, else the last row
       const bool rows = rowstats || logits_from < std::min((ci + 1) * B, T_run);
@@ -165,6 +179,7 @@ int main(int argc, char** argv) {
       }
     }
     gpu.Synchronize();
+    if (slot_save && slot_at >= n_chunks) pf.SaveState(slot_save, n_chunks);
     if (rowstats) std::fclose(rowstats);
     const double layer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("layers_ms=%.1f\n", layer_ms);
