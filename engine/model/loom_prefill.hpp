@@ -615,6 +615,13 @@ class LoomPrefill {
     pool_bytes_ = std::size_t{pages_} * 256 * kKvRow * 2;
     kpool_ = &Alloc(paged_f16k_ ? std::size_t{full_} * pool_bytes_ : 4);
     vtpool_ = &Alloc(paged_f16v_ ? std::size_t{full_} * pool_bytes_ : 4);
+    // kv4 sets (dispatch.txt "kvdeq"): yah_kdeq4 / yah_vdeq4 decode the layer's int4 pools into one f16 pool pair (reused
+    // layer to layer) and the attention runs the fp16 kernel on it, as llama.cpp's prefill flash attention does
+    if (geom_.count("kvdeq")) {
+      if (!attn_kq8_ || !attn_vqt_ || !kv_paged_) throw LoomError("dispatch.txt kvdeq needs the paged kv4 pools");
+      kdeq_ = &Alloc(pool_bytes_);
+      vdeq_ = &Alloc(pool_bytes_);
+    }
   }
 
   void LoadExecutables() {
@@ -1031,6 +1038,13 @@ class LoomPrefill {
                {{kv16_->handle, voff, kv_cache_ * 2}, {vt16_->handle, 0, vt_bytes_}});
     }
     if (tail_ == kNoRows) return;  // K / V are written; nothing reads this layer's output
+    if (kdeq_) {  // the context so far, this chunk included, as f16 pools for the fp16 attention
+      const std::uint32_t rows = (ci + 1) * B_;
+      Dispatch(ChunkExe("kdeq4", ci), "yah_kdeq4", (rows * 64 + 255) / 256, 1, 1, 256, 1, 1,
+               {{kq8buf_->handle, q8off, kq_bytes_}, {ksbuf_->handle, ksoff, ks_bytes_}, ptab_ref_, Ref(*kdeq_)});
+      Dispatch(ChunkExe("vdeq4", ci), "yah_vdeq4", 4 * ((rows + 15) / 16), 1, 1, 256, 1, 1,
+               {{vqbuf_->handle, vqoff, vq_bytes_}, {vqsbuf_->handle, vqsoff, vqs_bytes_}, ptab_ref_, Ref(*vdeq_)});
+    }
     const bool qrot = qr16_ && ci >= qrot_first_;
     if (qrot)
       Dispatch(Exe("qrot.hal"), "yah_qrot", (B_ * 96 + 255) / 256, 1, 1, 256, 1, 1, {Ref(*q16_), Ref(*qr16_)});
@@ -1047,8 +1061,9 @@ class LoomPrefill {
                         : hrx_buffer_ref_t{kv16_->handle, voff, kv_cache_ * 2},
           Ref(*scratch_),
           Ref(*lse_)};
-      if (attn_kq8_) b.push_back({ksbuf_->handle, ksoff, ks_bytes_});
-      if (attn_vqt_) b.push_back({vqsbuf_->handle, vqsoff, vqs_bytes_});
+      if (kdeq_) b = {b[0], b[1], Ref(*kdeq_), Ref(*vdeq_), b[4], b[5]};  // the fp16 kernel's bindings
+      if (attn_kq8_ && !kdeq_) b.push_back({ksbuf_->handle, ksoff, ks_bytes_});
+      if (attn_vqt_ && !kdeq_) b.push_back({vqsbuf_->handle, vqsoff, vqs_bytes_});
       if (kv_paged_) b.push_back(ptab_ref_);
       Dispatch(ChunkExe(o_af ? "wmma_t" : "wmma", ci), "yah_attn_wmma", (B_ + attn_tpw_ - 1) / attn_tpw_, kHeads / attn_hpw_, 1, 256, 1,
                1, b);
@@ -1146,6 +1161,7 @@ class LoomPrefill {
              *wstage_ = nullptr, *ostage_ = nullptr, *partial_ = nullptr, *hidden2_ = nullptr, *normed_ = nullptr,
              *ptab_ = nullptr, *vt16_ = nullptr, *kq8buf_ = nullptr, *ksbuf_ = nullptr, *kmbuf_ = nullptr,
              *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr, *qr16_ = nullptr,
+             *kdeq_ = nullptr, *vdeq_ = nullptr,
              *normt_ = nullptr;
   std::int64_t keep_rows_ = kAllRows, tail_ = kAllRows, trim_row_ = kAllRows;
 };
