@@ -1269,8 +1269,28 @@ class LoomPrefill {
         const NpuView c = NpuCalls(site, a, w, c_off, calls);
         Cut(Segment::kEnqueue, std::move(calls), site);
         const Geom gs = GeomOf(sh);
-        Dispatch(Exe(sh), (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(), (MTiles(*t) - nn / 16) / gs.rowgrp,
-                 tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+        const std::string kname = std::string("yah_ffn_gemm_") + f.name + "_kres";
+        const std::uint32_t blocks = (MTiles(*t) - nn / 16) / gs.rowgrp;
+        // The persistent kres (one workgroup per row block) over all but the last token tile, the tiled kres on that
+        // tile beside it (disjoint token ranges: the graph runs them together on the CUs the row blocks leave idle).
+        const std::string p3 = fused0.substr(0, fused0.size() - 4) + ".af.p3.npu.hal";   // NPU split only
+        if (af && geom_.count(p3) && tt == g.tt) {
+          const std::size_t T = tt - 1;
+          const std::size_t tile = B_ / tt;
+          // per-token bytes of input, residual and output (bindings first, first + 1, first + 4)
+          const std::size_t stride[] = {std::size_t(t->dims[0]) * 2, M * 4, 0, 0, M * 4};
+          auto part = [&](std::size_t tok0, std::size_t ntok) {
+            auto r = b;
+            for (std::size_t i = 0; i < 5; ++i)
+              if (stride[i]) r[first + i].offset += tok0 * stride[i], r[first + i].length = ntok * stride[i];
+            return r;
+          };
+          const auto b0 = part(0, T * tile), b1 = part(T * tile, tile);
+          Dispatch(Exe(p3), kname.c_str(), blocks, 1, 1, 32, 1, 1, b0, GemmWrites(b0, f, {hidden2_}));
+          Dispatch(Exe(sh), kname.c_str(), blocks, 1, 1, 32, 1, 1, b1, GemmWrites(b1, f, {hidden2_}));
+        } else {
+          Dispatch(Exe(sh), kname.c_str(), blocks, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+        }
         Cut(Segment::kJoin);
         NpuUnpack(std::string("npu_unpack_") + site + ".hal", c, {Ref(*hidden_), Ref(*hidden2_)}, 4);
         std::swap(hidden_, hidden2_);

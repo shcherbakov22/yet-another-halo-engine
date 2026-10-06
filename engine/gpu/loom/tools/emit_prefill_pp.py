@@ -641,18 +641,19 @@ def npu_split(rows, combos, B, outdir):
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
 
-    def split(fmt, kind, mt, kb, t, name, nn, persist=None):
-        """The GPU's share: rows [0, mt * 16 - nn) of the GEMM HAL name (tile t) at the full stride."""
+    def split(fmt, kind, mt, kb, t, name, nn, persist=None, tokens=B):
+        """The GPU's share: rows [0, mt * 16 - nn) of the GEMM HAL name (tile t) at the full stride, over tokens."""
         mtg = mt - nn // 16
-        assert mtg % t.rowgrp == 0 and B % t.bn == 0, (name, nn)
+        assert mtg % t.rowgrp == 0 and tokens % t.bn == 0, (name, nn)
         TG.check(t)
         if persist is not None:
             gen = lambda f, k: gen_kres_persist.persist(TG.gen(f, "kres", persist, False),
                                                        TG.gen(f, "kstore", dataclasses.replace(persist, respre=0), False),
-                                                       B // t.bn)
+                                                       tokens // t.bn)
         else:
             gen = lambda f, k: TG.gen(f, k, t, False)
-        out.append(_emit_gen(gen, t.bn, fmt, mtg, kb, B, name[:-4] + ".npu.hal", outdir, kind, t.rowgrp, ostride=mt * 16))
+        out.append(_emit_gen(gen, t.bn, fmt, mtg, kb, tokens, name[:-4] + ".npu.hal", outdir, kind, t.rowgrp,
+                             ostride=mt * 16))
 
     def variants(fmt, kind, mt, kb, base, nn):
         """Every form of GEMM base the set emits (tile_kstore, afrag_variants): its split."""
@@ -671,7 +672,10 @@ def npu_split(rows, combos, B, outdir):
                 split(fmt, kind, mt, kb, dataclasses.replace(ta, tout=True), base[:-4] + ".af.to.hal", nn)
             if persist and kind == "kres" and B // ta.bn > 1 and 2 * kb >= gen_kres_persist.SLICES:
                 pt = dataclasses.replace(ta, **persist) if isinstance(persist, dict) else ta
-                split(fmt, kind, mt, kb, ta, base[:-4] + ".af.p.hal", nn, persist=pt)
+                # fewer row blocks than CUs: the persistent kres over all but the last token tile, run beside the tiled
+                # kres on that tile (LoomPrefill::RunResidual)
+                if B // ta.bn > 2:
+                    split(fmt, kind, mt, kb, ta, base[:-4] + ".af.p3.hal", nn, persist=pt, tokens=B - ta.bn)
 
     def dqbfp(fmt, mt, kb, nn, chunk=None):
         """The NPU's rows (the last nn of mt * 16) decoded to its weight stream; chunk: (k offset, passes) of a K chunk."""
