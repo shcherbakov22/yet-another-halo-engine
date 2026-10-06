@@ -113,7 +113,7 @@ Chunked sets also carry a calibration menu: for each tile GEMM, up to 8 `<gemm>.
 
 Plan: split each large prefill GEMM by output columns at a runtime ratio; the NPU (XDNA2, 32 compute tiles through HRX `.xdna`) computes the trailing columns, the GPU the rest. Not wired into the driver yet.
 
-The NPU multiplies one-pass BFP16 (`bfp16ebs8`) operands with f32 accumulation. A fragment is 8 rows x 8 consecutive k: per row `[E u8][8 x int8 m]`, value `m * 2^(E - 133)`, 72 bytes; E is the f32 exponent field of the block's max |x|. The NPU GEMM is a cascade: per column, 3 rows compute K-slice partials and pass them down the accumulator cascade, the 4th row adds its slice and holds C across passes.
+The NPU multiplies one-pass BFP16 (`bfp16ebs8`) operands with f32 accumulation. `tools/gen_npu_gemm.py` emits the NPU GEMM (array program + leaves, compiled by `loom-compile` with HRX patch 0013); `tools/npu_gemm_check.py` runs it through `iree-xdna-run` against a float64 oracle. A fragment is 8 rows x 8 consecutive k: per row `[E u8][8 x int8 m]`, value `m * 2^(E - 133)`, 72 bytes; E is the f32 exponent field of the block's max |x|. The NPU GEMM is a cascade: per column, 3 rows compute K-slice partials and pass them down the accumulator cascade, the 4th row adds its slice and holds C across passes.
 
 The GPU writes both operand streams in the NPU's layout (`tools/gen_bfp16_encode.py`): activations from the f16 GEMM input (`yah_bfp16_encode_act`), weights from the NPU's rows decoded by the tile GEMM's dequant kind (`yah_dequant_<fmt>`, f16 `[rows][K]`) into a transient scratch (`yah_bfp16_encode_wgt`). No weight copy persists. `tools/bfp16_check.py` and `tools/dq_bfp16_check.py` check both against numpy oracles byte for byte, for every model format.
 

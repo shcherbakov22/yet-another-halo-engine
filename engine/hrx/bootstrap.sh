@@ -87,10 +87,12 @@ if [ ! -f "$build/CMakeCache.txt" ]; then
     -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_HAL_DRIVER_TASK=ON \
     -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_SAMPLES=OFF -DIREE_ENABLE_LIBBACKTRACE=OFF \
     -DLIBHRX_BUILD=ON -DLIBHRX_BUILD_HIP_BINDING=ON -DLIBHRX_BUILD_CTS=OFF \
-    -DLOOM_BUILD=ON -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=loom_defaults
+    -DLOOM_BUILD=ON -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=loom_defaults \
+    -DAMDF_BUILD=ON -DAMDF_FAMILY_XDNA=ON -DLOOM_TARGET_XDNA=ON -DLOOM_TARGET_ARCH_XDNA=ON -DLOOM_EMIT_XDNA=ON
 fi
-# What the engine uses: the runtime, its HIP binding, the HAL emitter, the compiler (compile reports), the profiler.
+# What the engine uses: the runtime, its HIP binding, the HAL emitter, the compiler (compile reports), the profiler,
+# and the NPU runner (tools/npu_gemm_check.py).
 ninja -C "$build" libhrx/src/libhrx/libhrx.so libhrx/src/binding/hip/libamdhip64.so \
   loom/src/loom/tools/iree-run-loom/iree-run-loom loom/src/loom/tools/loom-compile/loom-compile \
-  runtime/src/iree/tools/iree-profile/iree-profile
+  runtime/src/iree/tools/iree-profile/iree-profile experimental/xdna/iree-xdna-run
 check

@@ -15,6 +15,7 @@ LIBHSA = os.path.join(ROCM, "x_runtime/opt/rocm/core-10.0/lib")
 
 IREE_RUN_LOOM = os.path.join(BUILD, "loom/src/loom/tools/iree-run-loom/iree-run-loom")
 LOOM_COMPILE = os.path.join(BUILD, "loom/src/loom/tools/loom-compile/loom-compile")
+XDNA_RUN = os.path.join(BUILD, "experimental/xdna/iree-xdna-run")
 
 
 def env():
