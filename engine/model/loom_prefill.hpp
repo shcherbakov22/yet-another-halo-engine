@@ -1259,7 +1259,8 @@ class LoomPrefill {
       // NPU split (sites "out": ssm_out / attn_output, "down": ffn_down) of untrimmed chunks
       const char* site = wname.find("ffn_down") != std::string::npos ? "down" : "out";
       const std::uint32_t nn = df.empty() && tt == g.tt ? NpuRows(site) : 0;
-      const std::string sh = nn ? NpuHal(use_p ? pers : fused) : "";
+      // The persistent kres runs one workgroup per row block (one per CU unsplit), so the split uses the tiled form.
+      const std::string sh = nn ? NpuHal(fused) : "";
       if (!sh.empty()) {
         const auto a = NpuEncode(site, input, af);
         std::size_t w_off = 0, c_off = 0;
@@ -1269,7 +1270,7 @@ class LoomPrefill {
         Cut(Segment::kEnqueue, std::move(calls), site);
         const Geom gs = GeomOf(sh);
         Dispatch(Exe(sh), (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(), (MTiles(*t) - nn / 16) / gs.rowgrp,
-                 use_p ? 1 : tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
+                 tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
         Cut(Segment::kJoin);
         NpuUnpack(std::string("npu_unpack_") + site + ".hal", c, {Ref(*hidden_), Ref(*hidden2_)}, 4);
         std::swap(hidden_, hidden2_);
