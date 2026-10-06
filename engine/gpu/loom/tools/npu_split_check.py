@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """One kstore GEMM split between the GPU and the NPU, end to end through engine/build/npu_split_run.
 
-usage: npu_split_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [iters]
+usage: npu_split_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [rounds]
 
-Emits the GPU kernels (activation / weight encoders, the dequant of the NPU's rows, the split kstore, the C unpack)
+Emits the GPU kernels (activation encoder, the NPU's rows decoded to BFP16, the split kstore, the C unpack)
 and the NPU image, runs them on one stream with the NPU relay, and checks the output: the GPU's rows bit-identical to
 the full kstore GEMM, the NPU's rows against the float64 product of the bfp16 operands (f32 accumulation order only).
 npu_rows is a multiple of 512 (one NPU call per 512 output features). Needs PYTHONPATH with llama.cpp's gguf-py.
@@ -45,7 +45,7 @@ def main():
     import gguf
     from gguf import quants
     model, work, name, nn, act = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
-    iters = int(sys.argv[6]) if len(sys.argv) > 6 else 3
+    iters = int(sys.argv[6]) if len(sys.argv) > 6 else 9
     os.makedirs(work, exist_ok=True)
     rd = gguf.GGUFReader(model)
     tn = next(x for x in rd.tensors if x.name == name)
@@ -64,13 +64,17 @@ def main():
     full = SC.emit(work, "full", fmt, t, N // 16, kb, tt, 0)
     split = SC.emit(work, "split", fmt, t, (N - nn) // 16, kb, tt, N)
     enc_act = emit_plain(work, "enc_act", GE.gen("act", tokens, list(KS), passes))
-    enc_wgt = emit_plain(work, "enc_wgt", GE.gen("wgt", nn, list(KS), passes))
     unpack = emit_plain(work, "unpack", GU.gen(tokens, nn // 64, N, N - nn))
+    # the NPU's rows decoded straight into its BFP16 weight stream (gen_gemm_tile.DQ_BFP)
     dt = TG.dataclasses.replace(TG.default_tile(fmt, "kstore", kb), bm=64, wm=2, wn=4, decahead=False, ksub=64,
                                 dbuf=False)
-    sym = "yah_dequant_" + fmt
+    sym = "yah_dequant_" + fmt + "_bfp16"
     src = os.path.join(work, "dq.loom")
-    open(src, "w").write(TG.gen(fmt, "dequant", dt))
+    TG.DQ_BFP = (KS, passes)
+    try:
+        open(src, "w").write(TG.gen(fmt, "dequant", dt))
+    finally:
+        TG.DQ_BFP = None
     r = subprocess.run([sys.executable, B.EMIT, src, os.path.join(work, "dq"), f"{sym}.m_tiles={nn // 16}",
                         f"{sym}.k_blocks={kb}", f"{sym}.token_tiles=1"], capture_output=True, text=True)
     if r.returncode:
@@ -91,18 +95,17 @@ def main():
     tables = [DQ.table_file(fmt, e) for e in TG.G.FMTS[fmt]["extra"]]
     plan = {"tensor": name, "tokens": tokens, "n": N, "k": K, "npu_rows": nn, "panels": panels,
             "a_bytes": a_bytes, "w_panel_bytes": w_panel, "c_panel_bytes": c_panel,
-            "split_hal": split, "split_gx": (N - nn) // 16 // t.rowgrp, "split_gy": tt, "split_wg": t.lanes,
+            "split_hal": split, "split_gx": (N - nn) // 16 // t.rowgrp, "full_hal": full, "full_gx": N // 16 // t.rowgrp, "split_gy": tt, "split_wg": t.lanes,
             "enc_act_hal": enc_act, "enc_act_wgs": tokens // 8 * (K // 8) // GE.WG,
-            "dq_hal": dq, "dq_wgs": TG.DQ_WGS, "dq_wg": dt.lanes,
-            "enc_wgt_hal": enc_wgt, "enc_wgt_wgs": nn // 8 * (K // 8) // GE.WG,
+            "dq_hal": dq, "dq_wgs": TG.dq_wgs(nn // 16, kb, dt, fmt), "dq_wg": dt.lanes,
             "unpack_hal": unpack, "unpack_wgs": tokens * (nn // 64) * 8 // GU.WG,
-            "npu_xdna": ximg, "npu_entry": cfg.entry, "npu_columns": 8, "tables": ",".join(tables), "iters": iters}
+            "npu_xdna": ximg, "npu_entry": cfg.entry, "npu_columns": 8, "tables": ",".join(tables), "iters": iters, "warmup_ms": 4000}
     pf = os.path.join(work, "plan.txt")
     open(pf, "w").write("".join(f"{k}={v}\n" for k, v in plan.items()))
     out = os.path.join(work, "y_npu.f32")
     r = subprocess.run([B.GPURUN, "npu-split", "--", os.path.join(hrx_paths.ROOT, "engine", "build", "npu_split_run"),
                         model, pf, act, out], capture_output=True, text=True, timeout=900, env=env)
-    print("\n".join(ln for ln in r.stdout.splitlines() if "iteration" in ln or " us " in ln))
+    print("\n".join(ln for ln in r.stdout.splitlines() if " us" in ln))
     if "npu_split_run: ok" not in r.stdout:
         sys.exit(f"npu_split_run failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
     # reference: the full kstore GEMM for the GPU's rows
@@ -112,10 +115,9 @@ def main():
     cmd = [B.GPURUN, "npu-split", "--", B.HALRUN, model, full, f"{N // 16 // t.rowgrp},{tt}", str(t.lanes), mins,
            f"t:{name}"] + [f"f:{f}" for f in tables] + [f"f:{act}", f"o:{wst}:/dev/null", f"o:{ost}:/dev/null",
                                                         f"o:{N * tokens * 4}:{yf}"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=dict(os.environ, HAL_RUN_ITERS=str(iters)))
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=dict(os.environ, HAL_RUN_ITERS="1"))
     if "hal_run: ok" not in r.stdout:
         sys.exit(f"hal_run failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
-    print("full GEMM on the GPU: " + next(ln for ln in r.stdout.splitlines() if "per dispatch" in ln)[9:])
     y = np.fromfile(out, np.float32).reshape(tokens, N)
     yfull = np.fromfile(yf, np.float32).reshape(tokens, N)
     gpu_same = np.array_equal(y[:, :N - nn].view(np.uint32), yfull[:, :N - nn].view(np.uint32))

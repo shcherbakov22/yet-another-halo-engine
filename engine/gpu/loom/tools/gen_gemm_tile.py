@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import gen_bfp16_encode as GE  # noqa: E402
 import gen_gemm_decode as G  # noqa: E402
 
 # Default workgroup: 128 x 256 over 4 x 4 waves (WAVE_FMTS: 4 x 2).
@@ -246,6 +247,17 @@ DQ_WGS = 20
 OSTRIDE = 0
 
 
+# NPU weights (emit_prefill_pp NPU_SPLIT): with DQ_BFP = (ks, passes), the dequant kind writes the NPU's BFP16 weight
+# stream (gen_bfp16_encode "wgt", 64-row columns) instead of f16 rows; K must be 8 * passes * sum(ks).
+# Its grid is dq_wgs(): one workgroup per item.
+DQ_BFP = None
+
+
+def dq_wgs(m_tiles, k_blocks, t, fmt):
+    """Workgroups of the DQ_BFP dequant: (row groups) x (K groups of DQ_BLOCKS 256-wide blocks)."""
+    return m_tiles // t.rowgrp * (k_blocks // G.FMTS[fmt].get("kdiv", 1) // DQ_BLOCKS)
+
+
 def orw():
     return "%o_rows" if OSTRIDE else "%m_rows"
 
@@ -294,7 +306,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     if dq:
         assert not (DECAHEAD or DBUF or masked)
         bufs = ["weight"] + F["extra"] + ["output"]
-        sym = f"yah_dequant_{fmt}"
+        sym = f"yah_dequant_{fmt}" + ("_bfp16" if DQ_BFP else "")
     slots = G.GPP                   # decoding lane groups of BM per phase
     arow = ksub + APAD              # f16 per LDS activation row
     aseg = ksub // 8                # 16-byte segments per token row
@@ -332,9 +344,13 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         # DQ_BLOCKS 256-wide blocks per workgroup (k_blocks is a multiple of it: 20 and 68 here)
         e(f"  %cdqb = index.constant {DQ_BLOCKS} : index")
         e("  %kgl = index.div %kbl, %cdqb : index")
-        # persistent: DQ_WGS workgroups (one per WGP) walk the (row group, K group) items, so the dequant fits beside a running
-        # GEMM (whose workgroups would otherwise all launch first) and finishes within it
-        e(f"  %dqw = index.constant {DQ_WGS} : index")
+        if DQ_BFP:
+            # one workgroup per (row group, K group) item: the NPU weights are encoded with the GPU otherwise idle
+            e("  %dqw = index.mul %m_groups, %kgl : index")
+        else:
+            # persistent: DQ_WGS workgroups (one per WGP) walk the (row group, K group) items, so the dequant fits beside a
+            # running GEMM (whose workgroups would otherwise all launch first) and finishes within it
+            e(f"  %dqw = index.constant {DQ_WGS} : index")
         e("  kernel.launch.config workgroups(%dqw, %unit, %unit) workgroup_size(%wgs, %unit, %unit) : index")
     else:
         e("  kernel.launch.config workgroups(%m_groups, %token_tiles, %unit) workgroup_size(%wgs, %unit, %unit) : index")
@@ -575,8 +591,18 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %z8s = scalar.constant 0 : i8")
         e("  %z8v = vector.splat %z8s : vector<8xi8>")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
-        e("  %dq_tot = index.mul %m_rows, %ktot : index")
-        e("  %dq_out = buffer.view %output_na[%base] : buffer -> view<[%dq_tot]xf16>")
+        if DQ_BFP:
+            bks, bpasses = DQ_BFP
+            bpanel = sum(bpasses * 4 * GE.slab_bytes(k) for k in bks)
+            nfrag = (BM // 8) * (ksub // 8)
+            assert BM % 64 == 0 and ksub % 8 == 0 and nfrag <= LANES
+            e(f"  %dq_bpanel = index.constant {bpanel} : index")
+            e("  %dq_bcols = index.div %m_rows, %c64 : index")
+            e("  %dq_tot = index.mul %dq_bcols, %dq_bpanel : index")
+            e("  %dq_out = buffer.view %output_na[%base] : buffer -> view<[%dq_tot]xi8>")
+        else:
+            e("  %dq_tot = index.mul %m_rows, %ktot : index")
+            e("  %dq_out = buffer.view %output_na[%base] : buffer -> view<[%dq_tot]xf16>")
         e("  %dq_g = index.add %wg_y, %c0 : index")
         e(f"  %dq_np = index.constant {DQ_BLOCKS * G.PH} : index")
         e("  %dq_p0 = index.mul %dq_g, %dq_np : index")
@@ -622,6 +648,38 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %dq_kn = index.min %dq_kn0, %dq_plast : index")
         wn = G.pack_vals(e, dq_loads("dqn_", "%dq_kn"), "dqn")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+        if DQ_BFP:
+            # encode the BM x KSUB tile's 8 x 8 fragments into the NPU weight stream, one lane per fragment
+            e(f"  %bf_nfrag = index.constant {nfrag} : index")
+            e("  %bf_live = index.cmp ult, %tid, %bf_nfrag : index")
+            e("  scf.if %bf_live {")
+            for nm, v in (("c2", 2), ("c144", 144), ("c72", 72), ("csub", 4), ("cpk", sum(bks)), ("cpass", bpasses),
+                          ("c8", 8), ("ckq", ksub // 8)):
+                e(f"    %bf_{nm} = index.constant {v} : index")
+            e("    %bf_rr = index.div %tid, %bf_ckq : index")
+            e("    %bf_kk = index.rem %tid, %bf_ckq : index")
+            e("    %bf_r0 = index.mul %bf_rr, %bf_c8 : index")
+            e("    %bf_gr = index.add %wg_row, %bf_r0 : index")
+            e("    %bf_g8 = index.div %bf_gr, %bf_c8 : index")
+            e("    %bf_kb0 = index.mul %dq_kp, %bf_ckq : index")
+            e("    %bf_kbi = index.add %bf_kb0, %bf_kk : index")
+            frag = GE.emit_offset(e, "wgt", 0, bks, bpasses, 64, True, "%bf_g8", "%bf_kbi", p="bf_")
+            e("    %bf_kc = index.mul %bf_kk, %bf_c8 : index")
+
+            def bf_load(r):
+                e(f"    %bf_ro{r} = index.constant {r} : index")
+                e(f"    %bf_lr{r} = index.add %bf_r0, %bf_ro{r} : index")
+                e(f"    %bf_xh{r} = vector.load %wl_dq[%bf_lr{r}, %bf_kc] : view<{BM}x{G.ROWP}xf16> -> vector<8xf16>")
+                return f"%bf_xh{r}"
+
+            GE.emit_encode(e, bf_load, frag, "%dq_out", "%dq_tot", p="bf_")
+            e("  }")
+            e("  scf.yield " + ", ".join(nm for nm, _ in wn) + f" : {ctys}")
+            e("  }")
+            e("  }")
+            e("  kernel.return")
+            e("}")
+            return "\n".join(L) + "\n"
         # copy the BM x KSUB tile to out[row][K] (f16), 8 halves per store
         e("  %dq_k0 = index.mul %dq_kp, %cksub : index")
         cpr = ksub // 8

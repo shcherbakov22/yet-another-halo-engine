@@ -6,6 +6,7 @@ usage: dq_bfp16_check.py <model.gguf> <workdir> <tensor> <npu_rows> <ks,ks,...> 
 Takes the last <npu_rows> output features of <tensor> (the NPU computes the trailing columns).
 Dequantizes them with yah_dequant_<fmt> (the GPU GEMMs' decode) and checks the f16 against gguf-py.
 Encodes that f16 into the cascade GEMM's weight stream with yah_bfp16_encode_wgt and checks the bytes against the numpy oracle.
+Runs the fused form (yah_dequant_<fmt>_bfp16, gen_gemm_tile.DQ_BFP: the dequant writes the stream itself) against the same oracle.
 Writes <workdir>/dq.f16 and <workdir>/wgt.bfp. Needs PYTHONPATH with llama.cpp's gguf-py.
 """
 import dataclasses
@@ -97,14 +98,38 @@ def main():
     ehal = r.stdout.strip().splitlines()[0]
     of = os.path.join(work, "wgt.bfp")
     items = (nn // 8) * (K // 8)
-    run("encode", [GPURUN, "dq-bfp16", "--", HALRUN, model, ehal, str((items + GE.WG - 1) // GE.WG), str(GE.WG),
-                   f"{nn * K * 2},{total}", f"f:{df}", f"o:{total}:{of}"], env)
+    out = run("encode", [GPURUN, "dq-bfp16", "--", HALRUN, model, ehal, str((items + GE.WG - 1) // GE.WG), str(GE.WG),
+                         f"{nn * K * 2},{total}", f"f:{df}", f"o:{total}:{of}"], env)
     gb = np.fromfile(of, np.uint8)
     idx = (off[..., None] + np.arange(72)).reshape(-1)
     bad = np.count_nonzero(gb[idx] != eref[idx])
-    print(f"  weight stream: {bad} of {idx.size} fragment bytes differ")
+    ms = [ln.strip() for ln in out.splitlines() if "ms per dispatch" in ln]
+    print(f"  weight stream: {bad} of {idx.size} fragment bytes differ" + (f" | {ms[0]}" if ms else ""))
+    # fused: dequant straight into the stream
+    TG.DQ_BFP = (tuple(ks), passes)
+    try:
+        text = TG.gen(fmt, "dequant", dt)
+    finally:
+        TG.DQ_BFP = None
+    fsym = sym + "_bfp16"
+    fsrc = os.path.join(work, "dqbfp.loom")
+    open(fsrc, "w").write(text)
+    r = subprocess.run([sys.executable, EMIT, fsrc, os.path.join(work, "dqbfp"), f"{fsym}.m_tiles={mt}",
+                        f"{fsym}.k_blocks={kb}", f"{fsym}.token_tiles=1"], capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(f"fused emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
+    fhal = r.stdout.strip().splitlines()[0]
+    ff = os.path.join(work, "wgt_fused.bfp")
+    mins = [share.nbytes] + [os.path.getsize(x) for x in tables] + [total]
+    out = run("fused", [GPURUN, "dq-bfp16", "--", HALRUN, model, fhal, str(TG.dq_wgs(mt, kb, dt, fmt)), str(dt.lanes),
+                        ",".join(str(v) for v in mins), f"f:{wf}"] + [f"f:{x}" for x in tables] + [f"o:{total}:{ff}"], env)
+    fb = np.fromfile(ff, np.uint8)
+    fbad = np.count_nonzero(fb[idx] != eref[idx])
+    ms = [ln.strip() for ln in out.splitlines() if "ms per dispatch" in ln]
+    print(f"  fused dequant -> stream: {fbad} of {idx.size} fragment bytes differ" + (f" | {ms[0]}" if ms else ""))
     os.remove(wf)
-    sys.exit(1 if bad else 0)
+    os.remove(ff)
+    sys.exit(1 if bad or fbad else 0)
 
 
 if __name__ == "__main__":

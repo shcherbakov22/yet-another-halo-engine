@@ -4,6 +4,8 @@
 C (gen_npu_gemm): [col][M block][mp][np][chain mh, nh][8 rows][8 cols] f32, 64 x 64 per (col, M block).
 out: f32 [tokens][stride]; C column j goes to out column off + j.
 One work item per 8 consecutive C columns of one token: a 32-byte read and a 32-byte write.
+A wave takes 4 tokens x one column's 8 chunks: 8 lanes store a token's 64 columns (256 contiguous bytes) and each chunk's 4 tokens read 128 contiguous bytes of C.
+The next waves take the next columns, so 4 output rows fill left to right (DRAM-page friendly).
 """
 import sys
 
@@ -33,39 +35,51 @@ def gen(tokens, cols, stride, off):
     e("  %ov = buffer.view %out_na[%base] : buffer -> view<[%no]xf32>")
     e("  %wg = kernel.workgroup.id<x> : index")
     e("  %tid = kernel.workitem.id<x> : index")
-    for nm, v in (("cwg", WG), ("c8", 8), ("c2", 2), ("c4", 4), ("c16", 16), ("c64", 64), ("cmb", tokens // 64),
-                  ("cstride", stride), ("coff", off)):
+    for nm, v in (("cwg", WG), ("c8", 8), ("c2", 2), ("c4", 4), ("c16", 16), ("c64", 64), ("c4096", 4096),
+                  ("cmb", tokens // 64), ("ccols", cols), ("cstride", stride), ("coff", off)):
         e(f"  %{nm} = index.constant {v} : index")
-    # item = C element index / 8 in C order: ((((col * nb + blk) * 4 + mp) * 4 + np) * 4 + chain) * 8 + row
+    # item = (((blk * 16 + r4) * cols + col) * 4 + rr) * 8 + j: token blk * 64 + r4 * 4 + rr, j = 8-column chunk (np, nh)
     e("  %i0 = index.mul %wg, %cwg : index")
     e("  %item = index.add %i0, %tid : index")
-    e("  %row = index.rem %item, %c8 : index")
+    e("  %j = index.rem %item, %c8 : index")
     e("  %q1 = index.div %item, %c8 : index")
-    e("  %chain = index.rem %q1, %c4 : index")
+    e("  %rr = index.rem %q1, %c4 : index")
     e("  %q2 = index.div %q1, %c4 : index")
-    e("  %npi = index.rem %q2, %c4 : index")
-    e("  %q3 = index.div %q2, %c4 : index")
-    e("  %mpi = index.rem %q3, %c4 : index")
-    e("  %q4 = index.div %q3, %c4 : index")
-    e("  %blk = index.rem %q4, %cmb : index")
-    e("  %col = index.div %q4, %cmb : index")
-    e("  %mh = index.div %chain, %c2 : index")
-    e("  %nh = index.rem %chain, %c2 : index")
+    e("  %col = index.rem %q2, %ccols : index")
+    e("  %q3 = index.div %q2, %ccols : index")
+    e("  %r4 = index.rem %q3, %c16 : index")
+    e("  %blk = index.div %q3, %c16 : index")
+    e("  %r0 = index.mul %r4, %c4 : index")
+    e("  %r = index.add %r0, %rr : index")
+    e("  %tc = index.mul %col, %cmb : index")
+    e("  %tile = index.add %tc, %blk : index")
+    e("  %mpi = index.div %r, %c16 : index")
+    e("  %r16 = index.rem %r, %c16 : index")
+    e("  %mh = index.div %r16, %c8 : index")
+    e("  %row = index.rem %r, %c8 : index")
+    e("  %npi = index.div %j, %c2 : index")
+    e("  %nh = index.rem %j, %c2 : index")
+    # C element: tile * 4096 + ((mp * 4 + np) * 4 + mh * 2 + nh) * 64 + row * 8
+    e("  %a0 = index.mul %mpi, %c4 : index")
+    e("  %a1 = index.add %a0, %npi : index")
+    e("  %a2 = index.mul %a1, %c4 : index")
+    e("  %a3 = index.mul %mh, %c2 : index")
+    e("  %a4 = index.add %a2, %a3 : index")
+    e("  %a5 = index.add %a4, %nh : index")
+    e("  %a6 = index.mul %a5, %c64 : index")
+    e("  %a7 = index.mul %row, %c8 : index")
+    e("  %a8 = index.add %a6, %a7 : index")
+    e("  %a9 = index.mul %tile, %c4096 : index")
+    e("  %ca = index.add %a9, %a8 : index")
+    # out: token blk * 64 + r, column col * 64 + 8 * j + off
     e("  %t0 = index.mul %blk, %c64 : index")
-    e("  %t1 = index.mul %mpi, %c16 : index")
-    e("  %t2 = index.mul %mh, %c8 : index")
-    e("  %t3 = index.add %t0, %t1 : index")
-    e("  %t4 = index.add %t3, %t2 : index")
-    e("  %tok = index.add %t4, %row : index")
+    e("  %tok = index.add %t0, %r : index")
     e("  %j0 = index.mul %col, %c64 : index")
-    e("  %j1 = index.mul %npi, %c16 : index")
-    e("  %j2 = index.mul %nh, %c8 : index")
-    e("  %j3 = index.add %j0, %j1 : index")
-    e("  %j4 = index.add %j3, %j2 : index")
-    e("  %jo = index.add %j4, %coff : index")
+    e("  %j1 = index.mul %j, %c8 : index")
+    e("  %j2 = index.add %j0, %j1 : index")
+    e("  %jo = index.add %j2, %coff : index")
     e("  %tb = index.mul %tok, %cstride : index")
     e("  %oa = index.add %tb, %jo : index")
-    e("  %ca = index.mul %item, %c8 : index")
     e("  %v = vector.load %cv[%ca] : view<[%nc]xf32> -> vector<8xf32>")
     e("  vector.store %v, %ov[%oa] : vector<8xf32>, view<[%no]xf32>")
     e("  kernel.return")

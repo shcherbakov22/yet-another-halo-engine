@@ -209,7 +209,7 @@ class LoomNpu {
   }
 
   // Queue NPU work behind the GPU stream's current position; the relay runs the kernels in order after it.
-  // Pass the returned value to StreamWait before the stream reads the results.
+  // Pass the returned value to Join before the stream reads the results.
   std::uint64_t Enqueue(std::vector<Kernel*> kernels) {
     LoomCheck(hrx_stream_flush(gpu_.stream()), "hrx_stream_flush");
     hrx_timeline_point_t after{};
@@ -219,8 +219,12 @@ class LoomNpu {
     cv_.notify_one();
     return issued_;
   }
-  // The GPU stream waits for the NPU work that Enqueue returned value for.
-  void StreamWait(std::uint64_t value) {
+  // Orders the stream after the NPU work Enqueue returned value for; queue the GPU work that runs beside the NPU first.
+  // The host waits for the NPU here, so the stream wait sees a signaled semaphore.
+  // A stream wait on a semaphore the host signals later is resolved in software after the stream drains (~0.1-0.2 ms idle GPU).
+  void Join(std::uint64_t value) {
+    LoomCheck(hrx_stream_flush(gpu_.stream()), "hrx_stream_flush");
+    LoomCheck(hrx_semaphore_wait(done_, value, UINT64_MAX), "hrx_semaphore_wait(npu)");
     LoomCheck(hrx_stream_wait_on(gpu_.stream(), {done_, value}), "hrx_stream_wait_on");
   }
   // Host time of the last finished job from its first submission to the NPU's completion.

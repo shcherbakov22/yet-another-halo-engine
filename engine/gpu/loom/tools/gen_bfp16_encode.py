@@ -32,15 +32,7 @@ def gen(layout, rows, ks, passes, tile=64, pad=True):
     pk = sum(ks)
     kb = passes * pk
     K = 8 * kb
-    sb = [slab_bytes(k, pad) for k in ks]
     sub = tile // 16                                   # slabs per M block (act) / per NPU column (wgt)
-    if layout == "act":
-        nblk = rows // tile
-        base = [sum(nblk * passes * sub * sb[j] for j in range(i)) for i in range(len(ks))]
-    else:
-        base = [sum(passes * sub * sb[j] for j in range(i)) for i in range(len(ks))]
-        panel = sum(passes * sub * b for b in sb)
-    start = [sum(ks[:i]) for i in range(len(ks))]
     items = (rows // 8) * kb
     total = layout_bytes(layout, rows, ks, passes, tile, pad)
     name = f"yah_bfp16_encode_{layout}"
@@ -75,98 +67,129 @@ def gen(layout, rows, ks, passes, tile=64, pad=True):
         e(f"    %{nm} = index.constant {v} : index")
     e("    %g8 = index.div %item, %ckb : index")
     e("    %kbi = index.rem %item, %ckb : index")
-    e("    %g16 = index.div %g8, %c2 : index")
-    e("    %h = index.rem %g8, %c2 : index")
-    e("    %blk = index.div %g16, %csub : index")          # M block (act) / NPU column (wgt)
-    e("    %slab = index.rem %g16, %csub : index")
-    e("    %pass = index.div %kbi, %cpk : index")
-    e("    %o = index.rem %kbi, %cpk : index")
-    # K-slice of o: a compare chain over the cumulative starts
-    sel_base, sel_start, sel_sb = f"%cb0", f"%cs0", f"%csb0"
-    for i in range(len(ks)):
-        e(f"    %cb{i} = index.constant {base[i]} : index")
-        e(f"    %cs{i} = index.constant {start[i]} : index")
-        e(f"    %csb{i} = index.constant {sb[i]} : index")
-    for i in range(1, len(ks)):
-        e(f"    %ge{i} = index.cmp uge, %o, %cs{i} : index")
-        e(f"    %sb_{i} = scf.select %ge{i}, %cb{i}, {sel_base} : index")
-        e(f"    %ss_{i} = scf.select %ge{i}, %cs{i}, {sel_start} : index")
-        e(f"    %sz_{i} = scf.select %ge{i}, %csb{i}, {sel_sb} : index")
-        sel_base, sel_start, sel_sb = f"%sb_{i}", f"%ss_{i}", f"%sz_{i}"
-    e(f"    %kin = index.sub %o, {sel_start} : index")
-    if layout == "act":
-        e("    %r0 = index.mul %blk, %cpass : index")
-        e("    %r1 = index.add %r0, %pass : index")
-        e("    %r2 = index.mul %r1, %csub : index")
-        e("    %rec = index.add %r2, %slab : index")
-        e(f"    %slo = index.mul %rec, {sel_sb} : index")
-        e(f"    %off0 = index.add {sel_base}, %slo : index")
-    else:
-        e(f"    %cpanel = index.constant {panel} : index")
-        e("    %po = index.mul %blk, %cpanel : index")
-        e("    %r1 = index.mul %pass, %csub : index")
-        e("    %rec = index.add %r1, %slab : index")
-        e(f"    %slo = index.mul %rec, {sel_sb} : index")
-        e(f"    %off1 = index.add {sel_base}, %slo : index")
-        e("    %off0 = index.add %po, %off1 : index")
-    e("    %ko = index.mul %kin, %c144 : index")
-    e("    %ho = index.mul %h, %c72 : index")
-    e("    %off2 = index.add %off0, %ko : index")
-    e("    %frag = index.add %off2, %ho : index")
+    frag = emit_offset(e, layout, rows, ks, passes, tile, pad, "%g8", "%kbi")
     # inputs: 8 rows x 8 halves
     e("    %row0 = index.mul %g8, %c8 : index")
     e("    %rb = index.mul %row0, %cK : index")
     e("    %kc = index.mul %kbi, %c8 : index")
     e("    %xb = index.add %rb, %kc : index")
-    e("    %zero = scalar.constant 0.0 : f32")
-    e("    %i23 = scalar.constant 23 : i32")
-    e("    %i255 = scalar.constant 255 : i32")
-    e("    %i260 = scalar.constant 260 : i32")
-    e("    %i0 = scalar.constant 0 : i32")
-    e("    %fmin = scalar.constant -128.0 : f32")
-    e("    %fmax = scalar.constant 127.0 : f32")
-    byts = []
-    for r in range(8):
+
+    def load(r):
         e(f"    %ro{r} = index.constant {r * K} : index")
         e(f"    %xa{r} = index.add %xb, %ro{r} : index")
         e(f"    %xh{r} = vector.load %xv[%xa{r}] : view<[%nx]xf16> -> vector<8xf16>")
-        e(f"    %xf{r} = vector.extf %xh{r} : vector<8xf16> to vector<8xf32>")
-        vals = []
-        for i in range(8):
-            e(f"    %v{r}_{i} = vector.extract %xf{r}[{i}] : vector<8xf32> -> f32")
-            e(f"    %a{r}_{i} = scalar.absf %v{r}_{i} : f32")
-            vals.append(f"%v{r}_{i}")
-        cur = f"%a{r}_0"
-        for i in range(1, 8):
-            e(f"    %mx{r}_{i} = scalar.maxnumf {cur}, %a{r}_{i} : f32")
-            cur = f"%mx{r}_{i}"
-        e(f"    %mb{r} = scalar.bitcast {cur} : f32 to i32")
-        e(f"    %ms{r} = scalar.shrui %mb{r}, %i23 : i32")
-        e(f"    %E{r} = scalar.andi %ms{r}, %i255 : i32")            # exponent field (0 for an all-zero block)
-        e(f"    %ie{r} = scalar.subi %i260, %E{r} : i32")
-        e(f"    %ib{r} = scalar.shli %ie{r}, %i23 : i32")
-        e(f"    %iq0{r} = scalar.bitcast %ib{r} : i32 to f32")          # 2^(133 - E)
-        e(f"    %z{r} = scalar.cmpi eq, %E{r}, %i0 : i32")
-        e(f"    %iq{r} = scf.select %z{r}, %zero, %iq0{r} : f32")
-        e(f"    %eb{r} = scalar.trunci %E{r} : i32 to i8")
-        byts.append(f"%eb{r}")
-        for i in range(8):
-            e(f"    %s{r}_{i} = scalar.mulf {vals[i]}, %iq{r} : f32")
-            e(f"    %n{r}_{i} = scalar.roundevenf %s{r}_{i} : f32")
-            e(f"    %c0{r}_{i} = scalar.maxnumf %n{r}_{i}, %fmin : f32")
-            e(f"    %c{r}_{i} = scalar.minnumf %c0{r}_{i}, %fmax : f32")
-            e(f"    %t{r}_{i} = scalar.fptosi %c{r}_{i} : f32 to i32")
-            e(f"    %m{r}_{i} = scalar.trunci %t{r}_{i} : i32 to i8")
-            byts.append(f"%m{r}_{i}")
-    for j in range(9):   # 72 bytes = 9 aligned 8-byte stores
-        e(f"    %w{j} = vector.from_elements {', '.join(byts[8 * j:8 * j + 8])} : vector<8xi8>")
-        e(f"    %wo{j} = index.constant {8 * j} : index")
-        e(f"    %wa{j} = index.add %frag, %wo{j} : index")
-        e(f"    vector.store %w{j}, %ov[%wa{j}] : vector<8xi8>, view<[%nout]xi8>")
+        return f"%xh{r}"
+
+    emit_encode(e, load, frag, "%ov", "%nout")
     e("  }")
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def emit_offset(e, layout, rows, ks, passes, tile, pad, g8, kbi, p="", ind="    "):
+    """Emit the byte offset of the fragment of row group g8 (8 rows) and k-block kbi in the stream layout; returns its name.
+    The caller defines the index constants %{p}c2, %{p}c144, %{p}c72, %{p}csub (tile / 16), %{p}cpk (sum(ks)) and %{p}cpass."""
+    sb = [slab_bytes(k, pad) for k in ks]
+    sub = tile // 16
+    if layout == "act":
+        nblk = rows // tile
+        base = [sum(nblk * passes * sub * sb[j] for j in range(i)) for i in range(len(ks))]
+    else:
+        base = [sum(passes * sub * sb[j] for j in range(i)) for i in range(len(ks))]
+        panel = sum(passes * sub * b for b in sb)
+    start = [sum(ks[:i]) for i in range(len(ks))]
+
+    def x(line):
+        e(ind + line)
+    x(f"%{p}g16 = index.div {g8}, %{p}c2 : index")
+    x(f"%{p}h = index.rem {g8}, %{p}c2 : index")
+    x(f"%{p}blk = index.div %{p}g16, %{p}csub : index")          # M block (act) / NPU column (wgt)
+    x(f"%{p}slab = index.rem %{p}g16, %{p}csub : index")
+    x(f"%{p}pass = index.div {kbi}, %{p}cpk : index")
+    x(f"%{p}o = index.rem {kbi}, %{p}cpk : index")
+    # K-slice of o: a compare chain over the cumulative starts
+    sel_base, sel_start, sel_sb = f"%{p}cb0", f"%{p}cs0", f"%{p}csb0"
+    for i in range(len(ks)):
+        x(f"%{p}cb{i} = index.constant {base[i]} : index")
+        x(f"%{p}cs{i} = index.constant {start[i]} : index")
+        x(f"%{p}csb{i} = index.constant {sb[i]} : index")
+    for i in range(1, len(ks)):
+        x(f"%{p}ge{i} = index.cmp uge, %{p}o, %{p}cs{i} : index")
+        x(f"%{p}sb_{i} = scf.select %{p}ge{i}, %{p}cb{i}, {sel_base} : index")
+        x(f"%{p}ss_{i} = scf.select %{p}ge{i}, %{p}cs{i}, {sel_start} : index")
+        x(f"%{p}sz_{i} = scf.select %{p}ge{i}, %{p}csb{i}, {sel_sb} : index")
+        sel_base, sel_start, sel_sb = f"%{p}sb_{i}", f"%{p}ss_{i}", f"%{p}sz_{i}"
+    x(f"%{p}kin = index.sub %{p}o, {sel_start} : index")
+    if layout == "act":
+        x(f"%{p}r0 = index.mul %{p}blk, %{p}cpass : index")
+        x(f"%{p}r1 = index.add %{p}r0, %{p}pass : index")
+        x(f"%{p}r2 = index.mul %{p}r1, %{p}csub : index")
+        x(f"%{p}rec = index.add %{p}r2, %{p}slab : index")
+        x(f"%{p}slo = index.mul %{p}rec, {sel_sb} : index")
+        x(f"%{p}off0 = index.add {sel_base}, %{p}slo : index")
+    else:
+        x(f"%{p}cpanel = index.constant {panel} : index")
+        x(f"%{p}po = index.mul %{p}blk, %{p}cpanel : index")
+        x(f"%{p}r1 = index.mul %{p}pass, %{p}csub : index")
+        x(f"%{p}rec = index.add %{p}r1, %{p}slab : index")
+        x(f"%{p}slo = index.mul %{p}rec, {sel_sb} : index")
+        x(f"%{p}off1 = index.add {sel_base}, %{p}slo : index")
+        x(f"%{p}off0 = index.add %{p}po, %{p}off1 : index")
+    x(f"%{p}ko = index.mul %{p}kin, %{p}c144 : index")
+    x(f"%{p}ho = index.mul %{p}h, %{p}c72 : index")
+    x(f"%{p}off2 = index.add %{p}off0, %{p}ko : index")
+    x(f"%{p}frag = index.add %{p}off2, %{p}ho : index")
+    return f"%{p}frag"
+
+
+def emit_encode(e, load, frag, ov, nout, p="", ind="    "):
+    """Encode one fragment: load(r) emits row r's 8 halves (vector<8xf16>) and returns its name; 72 bytes go to ov at frag."""
+    def x(line):
+        e(ind + line)
+    x(f"%{p}zero = scalar.constant 0.0 : f32")
+    x(f"%{p}i23 = scalar.constant 23 : i32")
+    x(f"%{p}i255 = scalar.constant 255 : i32")
+    x(f"%{p}i260 = scalar.constant 260 : i32")
+    x(f"%{p}i0 = scalar.constant 0 : i32")
+    x(f"%{p}fmin = scalar.constant -128.0 : f32")
+    x(f"%{p}fmax = scalar.constant 127.0 : f32")
+    byts = []
+    for r in range(8):
+        xh = load(r)
+        x(f"%{p}xf{r} = vector.extf {xh} : vector<8xf16> to vector<8xf32>")
+        vals = []
+        for i in range(8):
+            x(f"%{p}v{r}_{i} = vector.extract %{p}xf{r}[{i}] : vector<8xf32> -> f32")
+            x(f"%{p}a{r}_{i} = scalar.absf %{p}v{r}_{i} : f32")
+            vals.append(f"%{p}v{r}_{i}")
+        cur = f"%{p}a{r}_0"
+        for i in range(1, 8):
+            x(f"%{p}mx{r}_{i} = scalar.maxnumf {cur}, %{p}a{r}_{i} : f32")
+            cur = f"%{p}mx{r}_{i}"
+        x(f"%{p}mb{r} = scalar.bitcast {cur} : f32 to i32")
+        x(f"%{p}ms{r} = scalar.shrui %{p}mb{r}, %{p}i23 : i32")
+        x(f"%{p}E{r} = scalar.andi %{p}ms{r}, %{p}i255 : i32")            # exponent field (0 for an all-zero block)
+        x(f"%{p}ie{r} = scalar.subi %{p}i260, %{p}E{r} : i32")
+        x(f"%{p}ib{r} = scalar.shli %{p}ie{r}, %{p}i23 : i32")
+        x(f"%{p}iq0{r} = scalar.bitcast %{p}ib{r} : i32 to f32")          # 2^(133 - E)
+        x(f"%{p}z{r} = scalar.cmpi eq, %{p}E{r}, %{p}i0 : i32")
+        x(f"%{p}iq{r} = scf.select %{p}z{r}, %{p}zero, %{p}iq0{r} : f32")
+        x(f"%{p}eb{r} = scalar.trunci %{p}E{r} : i32 to i8")
+        byts.append(f"%{p}eb{r}")
+        for i in range(8):
+            x(f"%{p}s{r}_{i} = scalar.mulf {vals[i]}, %{p}iq{r} : f32")
+            x(f"%{p}n{r}_{i} = scalar.roundevenf %{p}s{r}_{i} : f32")
+            x(f"%{p}c0{r}_{i} = scalar.maxnumf %{p}n{r}_{i}, %{p}fmin : f32")
+            x(f"%{p}c{r}_{i} = scalar.minnumf %{p}c0{r}_{i}, %{p}fmax : f32")
+            x(f"%{p}t{r}_{i} = scalar.fptosi %{p}c{r}_{i} : f32 to i32")
+            x(f"%{p}m{r}_{i} = scalar.trunci %{p}t{r}_{i} : i32 to i8")
+            byts.append(f"%{p}m{r}_{i}")
+    for j in range(9):   # 72 bytes = 9 aligned 8-byte stores
+        x(f"%{p}w{j} = vector.from_elements {', '.join(byts[8 * j:8 * j + 8])} : vector<8xi8>")
+        x(f"%{p}wo{j} = index.constant {8 * j} : index")
+        x(f"%{p}wa{j} = index.add {frag}, %{p}wo{j} : index")
+        x(f"vector.store %{p}w{j}, {ov}[%{p}wa{j}] : vector<8xi8>, view<[{nout}]xi8>")
 
 
 def main():

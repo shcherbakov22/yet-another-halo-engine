@@ -36,9 +36,10 @@ def main():
     hal = r.stdout.strip().splitlines()[0]
     cmd = [B.GPURUN, "npu-unpack", "--", B.HALRUN, model, hal, str(tokens * cols * 8 // G.WG), str(G.WG),
            f"{c.nbytes},{tokens * stride * 4}", f"f:{cf}", f"io:{sf}:{of}"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=dict(os.environ, HAL_RUN_ITERS="1"))
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=dict(os.environ, HAL_RUN_ITERS="4"))
     if "hal_run: ok" not in r.stdout:
         sys.exit(f"hal_run failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
+    print(next(ln for ln in r.stdout.splitlines() if "per dispatch" in ln))
     got = np.fromfile(of, np.float32).reshape(tokens, stride)
     want = N.unpack_c(c, cols, tokens // 64)
     ok = np.array_equal(got[:, off:off + 64 * cols], want)
