@@ -5,7 +5,8 @@ usage: npu_unpack_check.py <model.gguf> <workdir> <tokens> <cols> <stride> <off>
 
 Random C into an output filled with NaN: columns [off, off + 64 * cols) must hold C exactly, all others stay NaN.
 UNP_PARTS=n (partial Cs summed), UNP_RESID=1 (out = resid + C), UNP_SWIGLU=1 (f16(silu(gate) * up), checked to f16
-rounding: the kernel's exp / reciprocal are not numpy's), UNP_TILED=1 (fragment-major f16 output).
+rounding: the kernel's exp / reciprocal are not numpy's), UNP_TILED=1 (fragment-major f16 output), UNP_QG=1 (attention q
+rows: <stride> is the q / gate row count, <off> the first NPU row of heads x [256 q | 256 gate]).
 """
 import os
 import subprocess
@@ -26,7 +27,7 @@ def main():
     model, work = sys.argv[1], sys.argv[2]
     tokens, cols, stride, off = (int(v) for v in sys.argv[3:7])
     parts = int(os.environ.get("UNP_PARTS", "1"))
-    resid, swiglu, tiled = (os.environ.get(k) == "1" for k in ("UNP_RESID", "UNP_SWIGLU", "UNP_TILED"))
+    resid, swiglu, tiled, qg = (os.environ.get(k) == "1" for k in ("UNP_RESID", "UNP_SWIGLU", "UNP_TILED", "UNP_QG"))
     out16 = (len(sys.argv) > 7 and sys.argv[7] != "0") or swiglu or tiled
     dt = np.float16 if out16 else np.float32
     nblk = parts * (2 if swiglu else 1)
@@ -36,7 +37,7 @@ def main():
     c.tofile(cf)
     np.full(tokens * stride, np.nan, dt).tofile(sf)
     src = os.path.join(work, "unpack.loom")
-    open(src, "w").write(G.gen(tokens, cols, stride, off, out16 and not (swiglu or tiled), resid, parts, swiglu, tiled))
+    open(src, "w").write(G.gen(tokens, cols, stride, off, out16 and not (swiglu or tiled), resid, parts, swiglu, tiled, qg))
     r = subprocess.run([sys.executable, B.EMIT, src, os.path.join(work, "unpack"), "nop=0"], capture_output=True, text=True)
     if r.returncode:
         sys.exit(f"emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
@@ -48,11 +49,31 @@ def main():
     obytes = tokens * stride * np.dtype(dt).itemsize
     cmd = [B.GPURUN, "npu-unpack", "--", B.HALRUN, model, hal, str(tokens * cols * 8 // G.WG), str(G.WG),
            ",".join(str(v) for v in [c.nbytes] + ([obytes] if resid else []) + [obytes]), f"f:{cf}"]
-    cmd += ([f"f:{rf}"] if resid else []) + [f"io:{sf}:{of}"]
+    gfo = os.path.join(work, "gate_out.f32")
+    cmd += ([f"f:{rf}"] if resid else []) + [f"io:{sf}:{of}"] + ([f"io:{sf}:{gfo}"] if qg else [])
+    if qg:
+        cmd[cmd.index(f"{c.nbytes},{obytes}")] = f"{c.nbytes},{obytes},{obytes}"
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=dict(os.environ, HAL_RUN_ITERS="4"))
     if "hal_run: ok" not in r.stdout:
         sys.exit(f"hal_run failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
     print(next(ln for ln in r.stdout.splitlines() if "per dispatch" in ln))
+    if qg:   # rows off .. off + 64 cols of heads x [256 q | 256 gate] -> q / gate [tokens][stride]
+        if "hal_run: ok" not in r.stdout:
+            sys.exit(f"hal_run failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
+        q, g = np.fromfile(of, np.float32).reshape(tokens, stride), np.fromfile(gfo, np.float32).reshape(tokens, stride)
+        want = N.unpack_c(c, cols, tokens // 64)
+        exp_q = np.full((tokens, stride), np.nan, np.float32)
+        exp_g = exp_q.copy()
+        for j in range(64 * cols):
+            row = off + j
+            h, w = divmod(row, 512)
+            (exp_q if w < 256 else exp_g)[:, h * 256 + w % 256] = want[:, j]
+        ok = all(np.array_equal(a.view(np.uint32), b.view(np.uint32)) for a, b in ((q, exp_q), (g, exp_g)))
+        print(f"unpack qg tokens={tokens} cols={cols} rows {off}..{off + 64 * cols} of 2 x {stride}: "
+              f"{'exact, other columns untouched' if ok else 'DIFFERS'}")
+        for f in (cf, of, sf, gfo):
+            os.remove(f)
+        sys.exit(0 if ok else 1)
     got = np.fromfile(of, dt)
     if tiled:   # back to row-major
         got = got.reshape(tokens // 16, stride // 16, 16, 16).transpose(0, 2, 1, 3)

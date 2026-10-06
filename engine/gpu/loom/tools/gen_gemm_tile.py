@@ -244,7 +244,8 @@ DQ_WGS = 20
 
 # Column split with the NPU (emit_prefill_pp NPU_SPLIT): the GPU computes output rows [0, m_tiles * 16) of a wider
 # matrix; OSTRIDE (> 0) is the full row count: the token stride of the output (and kres residual, swiglu gate input),
-# the tile count of a fragment-major output, and for ffn the gate rows before the up rows. kstore / kres / swiglu / ffn.
+# the tile count of a fragment-major output, for ffn the gate rows before the up rows, for kqg twice the q / gate row
+# stride (whole heads split). kstore / kres / swiglu / ffn / kqg.
 OSTRIDE = 0
 
 
@@ -392,7 +393,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %tokens = index.mul %token_tiles, %cwtok : index")
     e("  %m_rows = index.mul %m_tiles, %c16 : index")
     if OSTRIDE:
-        assert kind in ("kstore", "kres", "swiglu", "ffn") and not MX, "the NPU column split: kstore / kres / swiglu / ffn"
+        assert kind in ("kstore", "kres", "swiglu", "ffn", "kqg") and not MX, "the NPU column split: kstore / kres / swiglu / ffn / kqg"
         e(f"  %o_rows = index.constant {OSTRIDE} : index")
     dq_chunk = kind == "dequant" and DQ_BFP is not None and len(DQ_BFP) == 4
     if dq_chunk:   # weight rows keep their full length; the decode starts kb_start blocks in
@@ -1227,7 +1228,7 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
     elif qg:
         # row r = head*512 + half*256 + d goes to (q|gate)[t][head*256 + d]; a wave's TM=32 rows sit inside one half
         e("  %qg_tot = index.div %out_total, %c2 : index")
-        e("  %qg_rows = index.div %m_rows, %c2 : index")
+        e(f"  %qg_rows = index.div {orw()}, %c2 : index")
         e("  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf32>")
         e("  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]xf32>")
         e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
@@ -1340,7 +1341,7 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
     e(f"  %et_flat = buffer.view %wl[%et_off] : buffer -> view<{(sr + EPAD) * 16}xf32>")
     if qg:
         e("  %qg_tot = index.div %out_total, %c2 : index")
-        e("  %qg_rows = index.div %m_rows, %c2 : index")
+        e(f"  %qg_rows = index.div {orw()}, %c2 : index")
         e("  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf32>")
         e("  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]xf32>")
         e("  %qg_last4 = index.sub %qg_tot, %c4 : index")
@@ -1586,7 +1587,7 @@ def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
     elif qg:
         # row r = head*512 + half*256 + d goes to (q|gate)[t][head*256 + d]; a wave's TM=32 rows sit inside one half
         e("  %qg_tot = index.div %out_total, %c2 : index")
-        e("  %qg_rows = index.div %m_rows, %c2 : index")
+        e(f"  %qg_rows = index.div {orw()}, %c2 : index")
         e("  %q_flat = buffer.view %output_na[%base] : buffer -> view<[%qg_tot]xf32>")
         e("  %g_flat = buffer.view %gate_out_na[%base] : buffer -> view<[%qg_tot]xf32>")
         e("  %qg_last4 = index.sub %qg_tot, %c4 : index")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the GPU half of an NPU column split: a kstore / kres over rows [0, N - npu_rows) at the full output stride.
 
-usage: split_gemm_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [plain|af|afp|afto] [kstore|kres|swiglu|ffn]
+usage: split_gemm_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [plain|af|afp|afto] [kstore|kres|swiglu|ffn|kqg]
 
 Runs the set's GEMM for <tensor> over all N rows, then the split variant (gen_gemm_tile.OSTRIDE = N) into an output
 filled with NaN. The split variant's rows must equal the full GEMM bit for bit and the NPU's trailing rows of every
@@ -11,6 +11,7 @@ af: the afrag form with emit_prefill_pp's knobs for the full shape (input fragme
 prefill set. kres: out = resid + W x, with a random f32 residual. swiglu (tensor: ffn_up): out = f16(silu(gate) * W x)
 with a random f32 gate; ffn (tensor: ffn_gate): the fused gate + up GEMM (emit_prefill_pp.AF_FFN), its weights the gate
 tensor then the up tensor. afto: the afrag form with fragment-major output (the afrag down projection's input).
+kqg (tensor: attn_q, rows = heads x [256 q | 256 gate]): q and gate outputs, whole heads split (npu_rows / 512 heads).
 Needs PYTHONPATH with llama.cpp's gguf-py.
 """
 import os
@@ -55,7 +56,7 @@ def emit(work, tag, fmt, kind, t, mt, kb, tt, ostride, out16=False, persist=None
             text = TG.gen(fmt, kind, t)
     finally:
         TG.OSTRIDE, TG.OUT16 = 0, False
-    sym = "yah_ffn_gemm_" + fmt + {"kres": "_kres", "swiglu": "_swiglu", "ffn": "_ffn"}.get(kind, "")
+    sym = "yah_ffn_gemm_" + fmt + {"kres": "_kres", "swiglu": "_swiglu", "ffn": "_ffn", "kqg": "_kqg"}.get(kind, "")
     src = os.path.join(work, tag + ".loom")
     open(src, "w").write(text)
     r = subprocess.run([sys.executable, EMIT, src, os.path.join(work, tag), f"{sym}.m_tiles={mt}", f"{sym}.k_blocks={kb}",
@@ -111,24 +112,40 @@ def main():
     wst, ost = 17408 * 16 * 2, 17408 * B * 4   # the driver's wstage_ / ostage_
     env = dict(os.environ, HAL_RUN_ITERS="1")
 
-    def run(hal, gx, out_spec):
+    qg = kind == "kqg"
+    obytes = N // 2 * B * 4 if qg else N * B * esz   # kqg: q and gate, f32 [B][N / 2] each
+
+    def run(hal, gx, out_spec, gate_spec=None):
         rs = [B * N * 4] if kind in ("kres", "swiglu") else []
-        mins = ",".join(str(v) for v in [0] + [os.path.getsize(f) for f in tables] + [B * K * 2] + rs + [wst, ost, N * B * esz])
+        mins = ",".join(str(v) for v in [0] + [os.path.getsize(f) for f in tables] + [B * K * 2] + rs + [wst, ost, obytes]
+                        + ([obytes] if qg else []))
         cmd = [GPURUN, "split-gemm", "--", HALRUN, model, hal, f"{gx},{gy}", str(t.lanes), mins,
                f"f:{wfile}" if wfile else f"t:{name}"]
         cmd += [f"f:{f}" for f in tables] + [f"f:{act}"] + ([f"f:{resid}"] if kind == "kres" else [])
         cmd += [f"f:{gfile}"] if kind == "swiglu" else []
-        cmd += [f"o:{wst}:/dev/null", f"o:{ost}:/dev/null", out_spec]
+        cmd += [f"o:{wst}:/dev/null", f"o:{ost}:/dev/null", out_spec] + ([gate_spec] if qg else [])
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
         if "hal_run: ok" not in r.stdout:
             sys.exit(f"hal_run failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
 
     yf, ys = os.path.join(work, "y_full.f32"), os.path.join(work, "y_split.f32")
     dt, it = (np.float16, np.uint16) if out16 else (np.float32, np.uint32)
-    run(full, mt // t.rowgrp, f"o:{N * B * esz}:{yf}")
+    gf, gs = os.path.join(work, "g_full.f32"), os.path.join(work, "g_split.f32")
     sentinel = os.path.join(work, "y_nan.f32")
-    np.full(N * B, np.nan, dt).tofile(sentinel)
-    run(split, mtg // t.rowgrp, f"io:{sentinel}:{ys}")
+    np.full(obytes // np.dtype(dt).itemsize, np.nan, dt).tofile(sentinel)
+    run(full, mt // t.rowgrp, f"o:{obytes}:{yf}", f"o:{obytes}:{gf}")
+    run(split, mtg // t.rowgrp, f"io:{sentinel}:{ys}", f"io:{sentinel}:{gs}")
+    if qg:   # q and gate side by side: [B][N / 2] each -> [B][N] with q in the first half
+        pair = lambda a, b: np.concatenate([np.fromfile(a, dt).reshape(B, N // 2), np.fromfile(b, dt).reshape(B, N // 2)], 1)
+        yfull, ysplit = pair(yf, gf), pair(ys, gs)
+        h = (N - nn) // 2   # the GPU's columns in each of q and gate
+        gpu_same = all(np.array_equal(yfull[:, o:o + h].view(it), ysplit[:, o:o + h].view(it)) for o in (0, N // 2))
+        npu_kept = all(bool(np.isnan(ysplit[:, o + h:o + N // 2]).all()) for o in (0, N // 2))
+        print(f"{name} ({fmt} kqg{' ' + mode if af else ''}) N={N} K={K} B={B}: GPU heads [0, {(N - nn) // 512}) "
+              f"{'bit-identical' if gpu_same else 'DIFFER'}; NPU heads {'untouched' if npu_kept else 'WRITTEN'}")
+        for f in (yf, ys, gf, gs, sentinel) + ((act,) if af else ()):
+            os.remove(f)
+        sys.exit(0 if gpu_same and npu_kept else 1)
     def rows_major(y):   # fragment-major [token / 16][row / 16][16][16] -> [token][row]
         return y.reshape(B // 16, N // 16, 16, 16).transpose(0, 2, 1, 3).reshape(B, N) if tout else y.reshape(B, N)
     yfull = rows_major(np.fromfile(yf, dt))
