@@ -30,8 +30,8 @@ class NpuSplit {
   [[nodiscard]] virtual const LoomBuffer& C() const = 0;
   // One call of the NPU GEMM image at path on these views (cold: loads and binds; the same arguments return the same id).
   virtual std::uint32_t Bind(const std::string& image, NpuView a, NpuView w, NpuView c) = 0;
-  // The calls in order behind the stream's current position; returns the value to Join on.
-  virtual std::uint64_t Enqueue(const std::vector<std::uint32_t>& calls) = 0;
+  // The calls in order behind the stream's current position; returns the value to Join on. tag names the job in Stats.
+  virtual std::uint64_t Enqueue(const std::vector<std::uint32_t>& calls, const std::string& tag) = 0;
   // Orders the stream after that work (the host waits for it first).
   virtual void Join(std::uint64_t value) = 0;
 };

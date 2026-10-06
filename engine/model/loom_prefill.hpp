@@ -74,7 +74,8 @@ class LoomPrefill {
   LoomBuffer& hidden() { return *hidden_; }
 
   // Buffer sizes of the NPU column split this set carries (dispatch.txt "npusplit_<site>", "npubytes_<K>"); zero: none.
-  // A job is the NPU work behind one cut: the DeltaNet qkv + gate, or one other site; the buffers fit the largest.
+  // A job is the NPU work behind one cut: the DeltaNet qkv + gate, or one other site; the buffers fit the largest
+  // (W twice).
   [[nodiscard]] NpuPlan npu_plan() const {
     NpuPlan p;
     const auto need = [&](const std::string& site) {
@@ -94,6 +95,7 @@ class LoomPrefill {
                              need("q"), need("out"), need("down"), need("ffn")})
       p.a_bytes = std::max(p.a_bytes, q.a_bytes), p.w_bytes = std::max(p.w_bytes, q.w_bytes),
       p.c_bytes = std::max(p.c_bytes, q.c_bytes);
+    p.w_bytes *= 2;   // two slots: a job's weights are decoded while the previous job runs (NpuDecode)
     return p;
   }
   // Split the set's NPU sites of full chunks with the NPU from now on: it computes their trailing npusplit rows.
@@ -109,6 +111,7 @@ class LoomPrefill {
     const std::uint32_t n = n_;
     n_ = B_, npu_on_ = true, npu_planning_ = true;
     segments_.clear();
+    npu_prev_ = nullptr, npu_job_ = 0;
     NewSegment();
     RecordLayers(0, {});
     segments_.clear();
@@ -171,6 +174,7 @@ class LoomPrefill {
     // NPU split: full chunks only; the chunk then launches as several graph segments joined by NPU calls
     npu_on_ = npu_ && n_ == B_;
     segments_.clear();
+    npu_prev_ = nullptr, npu_job_ = 0;
     NewSegment();
     nodes_.clear();
     const bool calibrate = !npu_on_ && calib_ && calib_->BeginChunk(n_);
@@ -197,7 +201,7 @@ class LoomPrefill {
     for (std::size_t i = 0; i < segments_.size(); ++i) {
       Segment& seg = segments_[i];
       seg.graph->Launch();
-      if (seg.after == Segment::kEnqueue) ticket = npu_->Enqueue(seg.calls);
+      if (seg.after == Segment::kEnqueue) ticket = npu_->Enqueue(seg.calls, seg.tag);
       if (i + 1 < segments_.size()) segments_[i + 1].graph->Instantiate();
       if (seg.after == Segment::kJoin) npu_->Join(ticket);
     }
@@ -809,7 +813,7 @@ class LoomPrefill {
       const auto wu = NpuDecode("ffn", pre + "ffn_up.weight", nn, w_off);
       std::vector<std::uint32_t> calls;
       const NpuView cg = NpuCalls("ffn", a, wg, c_off, calls), cu = NpuCalls("ffn", a, wu, c_off, calls);
-      Cut(Segment::kEnqueue, std::move(calls));
+      Cut(Segment::kEnqueue, std::move(calls), "ffn");
       RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, gate_af, gs, nn);
       RunSwigluSplit(pre + "ffn_up.weight", up_af, us, nn);
       Cut(Segment::kJoin);
@@ -854,7 +858,7 @@ class LoomPrefill {
       const auto wu = NpuDecode("ffn", pre + "ffn_up.weight", nn, w_off);
       std::vector<std::uint32_t> calls;
       const NpuView cg = NpuCalls("ffn", a, wg, c_off, calls), cu = NpuCalls("ffn", a, wu, c_off, calls);
-      Cut(Segment::kEnqueue, std::move(calls));
+      Cut(Segment::kEnqueue, std::move(calls), "ffn");
       Dispatch(Exe(sh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(),
                (MTiles(*tg) - nn / 16) / GeomOf(sh).rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
       Cut(Segment::kJoin);
@@ -1034,10 +1038,15 @@ class LoomPrefill {
     }
     return views;
   }
-  // The NPU's rows of wname (its last rows) decoded straight into W panels from w_off ("dqbfp_<fmt>_<mt>_<kb>[_c<i>]",
-  // dispatch.txt: <workgroups> <workgroup size>); the W views per chunk and call.
+  // The NPU's rows of wname (its last rows) decoded straight into W panels from w_off within this job's W slot
+  // ("dqbfp_<fmt>_<mt>_<kb>[_c<i>]", dispatch.txt: <workgroups> <workgroup size>); the W views per chunk and call.
+  // The decode reads only weights, so it is recorded into the previous job's GPU segment, where it runs beside that
+  // segment's GEMM while the NPU works; the two slots alternate per job.
   std::vector<std::vector<NpuView>> NpuDecode(const std::string& site, const std::string& wname, std::uint32_t rows,
                                               std::size_t& w_off) {
+    const std::size_t slot = (npu_job_ % 2) * (npu_->W().size / 2);
+    LoomGraph* const here = graph_;
+    if (npu_prev_) graph_ = npu_prev_;
     const auto* t = Find(wname);
     Fmt f{};
     const std::string base = GemmHal("gemm_kstore", *t, &f);
@@ -1052,13 +1061,14 @@ class LoomPrefill {
       auto b = GemmWeights(*t, f);
       b[0].offset += (static_cast<std::size_t>(t->dims[1]) - rows) * row_bytes;
       b[0].length = std::size_t{rows} * row_bytes;
-      b.push_back({npu_->W().handle, w_off, calls * panel});
+      b.push_back({npu_->W().handle, slot + w_off, calls * panel});
       Dispatch(Exe(dq), ("yah_dequant_" + std::string(f.name) + "_bfp16").c_str(), g.tokens, 1, 1, g.rowgrp, 1, 1, b,
                std::uint64_t{1} << (b.size() - 1));
       views.emplace_back();
-      for (std::size_t p = 0; p < calls; ++p) views.back().push_back({w_off + p * panel, panel});
+      for (std::size_t p = 0; p < calls; ++p) views.back().push_back({slot + w_off + p * panel, panel});
       w_off += calls * panel;
     }
+    graph_ = here;
     return views;
   }
   // The NPU calls of one matrix: per chunk, per 512 rows; C panels from c_off, chunk-major (the unpack sums the chunks).
@@ -1147,6 +1157,7 @@ class LoomPrefill {
     std::unique_ptr<LoomGraph> graph;
     After after = kNone;
     std::vector<std::uint32_t> calls;
+    std::string tag;  // the NPU job's site, for NpuSplit stats
   };
   void NewSegment() {
     segments_.push_back(Segment{std::make_unique<LoomGraph>(gpu_)});
@@ -1156,8 +1167,10 @@ class LoomPrefill {
       g.ReadOnly(t->handle);
     graph_ = &g;
   }
-  void Cut(Segment::After after, std::vector<std::uint32_t> calls = {}) {
-    segments_.back().after = after, segments_.back().calls = std::move(calls);
+  void Cut(Segment::After after, std::vector<std::uint32_t> calls = {}, std::string tag = {}) {
+    segments_.back().after = after, segments_.back().calls = std::move(calls), segments_.back().tag = std::move(tag);
+    if (after == Segment::kEnqueue) ++npu_job_;
+    if (after == Segment::kJoin) npu_prev_ = segments_.back().graph.get();   // the GPU segment beside the NPU job
     NewSegment();
   }
 
@@ -1253,7 +1266,7 @@ class LoomPrefill {
         const auto w = NpuDecode(site, wname, nn, w_off);
         std::vector<std::uint32_t> calls;
         const NpuView c = NpuCalls(site, a, w, c_off, calls);
-        Cut(Segment::kEnqueue, std::move(calls));
+        Cut(Segment::kEnqueue, std::move(calls), site);
         const Geom gs = GeomOf(sh);
         Dispatch(Exe(sh), (std::string("yah_ffn_gemm_") + f.name + "_kres").c_str(), (MTiles(*t) - nn / 16) / gs.rowgrp,
                  use_p ? 1 : tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
@@ -1302,7 +1315,7 @@ class LoomPrefill {
       const auto w = NpuDecode("q", pre + "attn_q.weight", nq, w_off);
       std::vector<std::uint32_t> calls;
       const NpuView c = NpuCalls("q", a, w, c_off, calls);
-      Cut(Segment::kEnqueue, std::move(calls));
+      Cut(Segment::kEnqueue, std::move(calls), "q");
       RunKqgSplit(pre + "attn_q.weight", q_af, qs, nq);
       RunKstore(pre + "attn_k.weight", *kbuf_, k_af);
       RunKstore(pre + "attn_v.weight", *vbuf_, v_af);
@@ -1429,7 +1442,7 @@ class LoomPrefill {
       const auto wg = NpuDecode("gate", pre + "attn_gate.weight", ng, w_off);
       std::vector<std::uint32_t> calls;
       const NpuView cq = NpuCalls("qkv", a, wq, c_off, calls), cg = NpuCalls("gate", a, wg, c_off, calls);
-      Cut(Segment::kEnqueue, std::move(calls));
+      Cut(Segment::kEnqueue, std::move(calls), "qkv");
       RunKstore(pre + "ssm_alpha.weight", *alpha_);
       RunKstore(pre + "ssm_beta.weight", *beta_);
       RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, nq);
@@ -1504,6 +1517,8 @@ class LoomPrefill {
   NpuSplit* npu_ = nullptr;        // EnableNpu
   bool npu_on_ = false;            // this chunk splits with the NPU
   bool npu_planning_ = false;      // EnableNpu's binding pass: Dispatch records nothing
+  LoomGraph* npu_prev_ = nullptr;  // the last NPU job's GPU segment (NpuDecode records the next job's decode there)
+  std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
   std::map<std::string, std::uint32_t> npu_rows_;  // NPU rows per site (dispatch.txt "npusplit_<site>")
   // The last RunLayers graph's dispatches in node order.
   std::vector<Node> nodes_;

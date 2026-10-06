@@ -88,9 +88,10 @@ rm -f "$LOGDIR/.dmesg-w-${STAMP}.log"
 echo "gpu_run: exit=$RC log=$LOG"
 # Scan only the follower section: the before/after snapshots repeat the whole boot's history, old warnings included.
 DURING="$(sed -n '/^### --- dmesg follower ---/,/^### --- dmesg after ---/p' "$LOG")"
-FAULT="$(grep -icE 'timeout|GPU reset|MES failed|wedged|page fault|ring .* reset' <<<"$DURING" || true)"
+# "(no timeout)" ends every machine-check report line; it is not a GPU timeout.
+FAULT="$(grep -iE 'timeout|GPU reset|MES failed|wedged|page fault|ring .* reset' <<<"$DURING" | grep -vic 'no timeout' || true)"
 if [ "$FAULT" != "0" ]; then
   echo "gpu_run: *** $FAULT GPU fault line(s) logged during the run ***"
-  grep -iE 'timeout|GPU reset|MES failed|wedged|page fault|ring .* reset' <<<"$DURING" | tail -10
+  grep -iE 'timeout|GPU reset|MES failed|wedged|page fault|ring .* reset' <<<"$DURING" | grep -vi 'no timeout' | tail -10
 fi
 exit $RC

@@ -218,14 +218,14 @@ class LoomNpu {
 
   // Queue NPU work behind the GPU stream's current position; the relay runs the kernels in order after it.
   // Pass the returned value to Join before the stream reads the results.
-  std::uint64_t Enqueue(std::vector<Kernel*> kernels) {
+  std::uint64_t Enqueue(std::vector<Kernel*> kernels, std::string tag = {}) {
     // system-scope release: the GPU's writes to A / W reach memory before the NPU reads them
     LoomCheck(hrx_stream_copy_buffer(gpu_.stream(), fence_dev_.handle, 0, fence_host_.handle, 0, 64), "fence release");
     LoomCheck(hrx_stream_flush(gpu_.stream()), "hrx_stream_flush");
     hrx_timeline_point_t after{};
     LoomCheck(hrx_stream_get_timeline_position(gpu_.stream(), &after), "hrx_stream_get_timeline_position");
     std::lock_guard<std::mutex> lock(mu_);
-    jobs_.push_back({after, std::move(kernels), ++issued_});
+    jobs_.push_back({after, std::move(kernels), ++issued_, std::move(tag)});
     cv_.notify_one();
     return issued_;
   }
@@ -240,6 +240,19 @@ class LoomNpu {
     // resolved in software without a fence)
     LoomCheck(hrx_stream_copy_buffer(gpu_.stream(), fence_host_.handle, 0, fence_dev_.handle, 0, 64), "fence acquire");
   }
+  // Per job tag: jobs, calls, NPU busy time (first submission to completion, host clock).
+  struct TagStats {
+    std::size_t jobs = 0, calls = 0;
+    double busy_ms = 0, join_ms = 0;
+  };
+  std::map<std::string, TagStats> Stats() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return stats_;
+  }
+  void AddJoinMs(const std::string& tag, double ms) {
+    std::lock_guard<std::mutex> lock(mu_);
+    stats_[tag].join_ms += ms;
+  }
   // Host time of the last finished job from its first submission to the NPU's completion.
   [[nodiscard]] double LastJobMs() const { return last_job_ms_.load(); }
   // Throws if the relay saw an NPU failure (the fence signals on errors too).
@@ -253,6 +266,7 @@ class LoomNpu {
     hrx_timeline_point_t after;
     std::vector<Kernel*> kernels;
     std::uint64_t signal;
+    std::string tag;
   };
 
   void Relay() {
@@ -283,6 +297,11 @@ class LoomNpu {
         }
         YAH_AMDF(api_->kernel_queue_wait(queue_, submission, AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait");
         last_job_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          auto& st = stats_[job.tag];
+          st.jobs += 1, st.calls += job.kernels.size(), st.busy_ms += last_job_ms_.load();
+        }
       } catch (const LoomError& e) {
         std::lock_guard<std::mutex> lock(mu_);
         if (failure_.empty()) failure_ = e.what();
@@ -495,6 +514,7 @@ class LoomNpu {
   LoomBuffer fence_host_, fence_dev_;  // Enqueue / Join cache fences
   const void* resident_ = nullptr;  // relay thread only
   std::atomic<double> last_job_ms_{0};
+  std::map<std::string, TagStats> stats_;  // under mu_
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Job> jobs_;
@@ -522,21 +542,31 @@ class LoomNpuSplit : public NpuSplit {
                                   {{&a_, a.offset, a.length}, {&w_, w.offset, w.length}, {&c_, c.offset, c.length}}));
     return ids_[key] = static_cast<std::uint32_t>(kernels_.size() - 1);
   }
-  std::uint64_t Enqueue(const std::vector<std::uint32_t>& calls) override {
+  std::uint64_t Enqueue(const std::vector<std::uint32_t>& calls, const std::string& tag) override {
     npu_.CheckHealth();
     std::vector<LoomNpu::Kernel*> k;
     for (const std::uint32_t id : calls) k.push_back(kernels_.at(id));
-    return npu_.Enqueue(std::move(k));
+    last_tag_ = tag;
+    return npu_.Enqueue(std::move(k), tag);
   }
   void Join(std::uint64_t value) override {
+    const auto t0 = std::chrono::steady_clock::now();
     npu_.Join(value);
+    npu_.AddJoinMs(last_tag_, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     npu_.CheckHealth();
+  }
+  // One line per job tag: jobs, calls, NPU busy time, and host time spent waiting for the NPU in Join.
+  void Report(std::FILE* f) {
+    for (const auto& [tag, st] : npu_.Stats())
+      std::fprintf(f, "npu: %-5s %4zu jobs %5zu calls, NPU busy %7.1f ms, join wait %6.1f ms\n", tag.c_str(), st.jobs,
+                   st.calls, st.busy_ms, st.join_ms);
   }
 
  private:
   LoomNpu npu_;
   LoomNpu::Shared &a_, &w_, &c_;
   std::vector<LoomNpu::Kernel*> kernels_;
+  std::string last_tag_;
   std::map<std::tuple<std::string, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>,
            std::uint32_t>
       ids_;
