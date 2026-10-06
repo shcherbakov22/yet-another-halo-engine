@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048] [masked] [ostride=<rows>]
+[kfull=<k_blocks of the whole row>]
 
 Compile the source under the exact config and read each root's declared byte envelope from the compile report.
 Refuse (exit 3) unless every envelope fits the buffer loom_forward_pp binds for that root.
@@ -23,7 +24,9 @@ fmts = fmt.split(":")
 qk, bpb = QB[fmts[0]]
 M, K = mt * 16, kb * qk
 MO = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("ostride=")), M)
-wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else M * kb * bpb * (2 if kind == "ffn" else 1)
+# kfull: a K-chunk dequant (gen_gemm_tile.DQ_BFP) reading kb of each <kfull>-block weight row
+KBW = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("kfull=")), kb)
+wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else M * KBW * bpb * (2 if kind == "ffn" else 1)
 bound = {"weight": wbytes, "input": B * K * 2, "resid": B * MO * 4, "gate": B * M * 4,
          "output": M * K * 2 if kind == "dequant" else B * MO * (2 if kind in ("swiglu", "kqg", "ffn") else 4),
          "gate_out": B * M * 2,

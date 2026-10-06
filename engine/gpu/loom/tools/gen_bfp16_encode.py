@@ -26,8 +26,10 @@ def layout_bytes(layout, rows, ks, passes, tile=64, pad=True):
     return (rows // tile) * sum(passes * (tile // 16) * b for b in sb)
 
 
-def gen(layout, rows, ks, passes, tile=64, pad=True):
-    """layout: "act" | "wgt"; rows: tokens (act) or NPU output features (wgt); ks: k-blocks per K-slice."""
+def gen(layout, rows, ks, passes, tile=64, pad=True, tiled=False, k_off=0, k_src=None):
+    """layout: "act" | "wgt"; rows: tokens (act) or NPU output features (wgt); ks: k-blocks per K-slice.
+    The input is f16 [rows][k_src] (default K), or fragment-major with tiled ([row / 16][k / 16][row % 16][k % 16], the
+    afrag GEMMs' input); the encoded K columns are k_off .. k_off + K of it (a K chunk of a wider matrix)."""
     assert layout in ("act", "wgt") and rows % tile == 0 and tile % 16 == 0
     pk = sum(ks)
     kb = passes * pk
@@ -49,7 +51,9 @@ def gen(layout, rows, ks, passes, tile=64, pad=True):
     e("  kernel.launch.config workgroups(%wgs, %unit, %unit) workgroup_size(%wgsz, %unit, %unit) : index")
     e("} launch(%x: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
-    e(f"  %nx = index.constant {rows * K} : index")
+    ksrc = k_src or K
+    assert k_off % 16 == 0 and k_off + K <= ksrc and (not tiled or (rows % 16 == 0 and ksrc % 16 == 0))
+    e(f"  %nx = index.constant {rows * ksrc} : index")
     e(f"  %nout = index.constant {total} : index")
     e("  %x_na, %out_na = buffer.assume.noalias %x, %out : buffer, buffer")
     e("  %xv = buffer.view %x_na[%base] : buffer -> view<[%nx]xf16>")
@@ -62,7 +66,7 @@ def gen(layout, rows, ks, passes, tile=64, pad=True):
     e(f"  %citems = index.constant {items} : index")
     e("  %live = index.cmp ult, %item, %citems : index")
     e("  scf.if %live {")
-    for nm, v in (("ckb", kb), ("cK", K), ("c8", 8), ("c2", 2), ("c144", 144), ("c72", 72), ("csub", sub),
+    for nm, v in (("ckb", kb), ("cK", ksrc), ("c8", 8), ("c2", 2), ("c144", 144), ("c72", 72), ("csub", sub),
                   ("cpk", pk), ("cpass", passes)):
         e(f"    %{nm} = index.constant {v} : index")
     e("    %g8 = index.div %item, %ckb : index")
@@ -70,14 +74,40 @@ def gen(layout, rows, ks, passes, tile=64, pad=True):
     frag = emit_offset(e, layout, rows, ks, passes, tile, pad, "%g8", "%kbi")
     # inputs: 8 rows x 8 halves
     e("    %row0 = index.mul %g8, %c8 : index")
-    e("    %rb = index.mul %row0, %cK : index")
+    if not tiled:
+        e("    %rb = index.mul %row0, %cK : index")
     e("    %kc = index.mul %kbi, %c8 : index")
-    e("    %xb = index.add %rb, %kc : index")
+    if k_off:
+        e(f"    %kco = index.constant {k_off} : index")
+        e("    %kc0 = index.add %kc, %kco : index")
+    kcol = "%kc0" if k_off else "%kc"
+    if tiled:   # 8 rows of one 16-row tile, 8 halves of one 16-wide k tile: each row's 8 halves are contiguous
+        e("    %c16 = index.constant 16 : index")
+        e("    %c256 = index.constant 256 : index")
+        e(f"    %ckt = index.constant {ksrc // 16} : index")
+        e("    %t16 = index.div %row0, %c16 : index")
+        e("    %tr = index.rem %row0, %c16 : index")
+        e(f"    %k16 = index.div {kcol}, %c16 : index")
+        e(f"    %kr = index.rem {kcol}, %c16 : index")
+        e("    %tt0 = index.mul %t16, %ckt : index")
+        e("    %tt1 = index.add %tt0, %k16 : index")
+        e("    %tb = index.mul %tt1, %c256 : index")
+        e("    %trr = index.mul %tr, %c16 : index")
+        e("    %tb1 = index.add %tb, %trr : index")
+        e("    %xb = index.add %tb1, %kr : index")
+        e(f"    %xlast = index.constant {rows * ksrc - 8} : index")   # always in range; for the bound proof
+    else:
+        e(f"    %xb = index.add %rb, {kcol} : index")
+    rstride = 16 if tiled else ksrc
 
     def load(r):
-        e(f"    %ro{r} = index.constant {r * K} : index")
+        e(f"    %ro{r} = index.constant {r * rstride} : index")
         e(f"    %xa{r} = index.add %xb, %ro{r} : index")
-        e(f"    %xh{r} = vector.load %xv[%xa{r}] : view<[%nx]xf16> -> vector<8xf16>")
+        xa = f"%xa{r}"
+        if tiled:
+            e(f"    %xm{r} = index.min %xa{r}, %xlast : index")
+            xa = f"%xm{r}"
+        e(f"    %xh{r} = vector.load %xv[{xa}] : view<[%nx]xf16> -> vector<8xf16>")
         return f"%xh{r}"
 
     emit_encode(e, load, frag, "%ov", "%nout")

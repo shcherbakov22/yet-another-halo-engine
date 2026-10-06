@@ -4,6 +4,8 @@
 usage: bfp16_check.py <model.gguf> <workdir> act|wgt <rows> <ks,ks,...> <passes> [input.f16 | random] [tile] [pad]
 
 The input is an f16 [rows][K] file (e.g. a YAH_DUMP_ACT dump) or random rows with a wide per-row dynamic range.
+BFP_SRC=tiled: the kernel reads it fragment-major (the afrag GEMMs' input); BFP_KWIN=<k_off>,<k_src>: the input is
+[rows][k_src] and the K columns k_off .. k_off + K are encoded (a K chunk).
 Every work item's store range is simulated first; the kernel is dispatched only if all of them fit the output.
 Writes <workdir>/<layout>.bfp (the encoded stream) for the NPU harness.
 """
@@ -87,28 +89,30 @@ def main():
     tile = int(sys.argv[8]) if len(sys.argv) > 8 else 64
     pad = (sys.argv[9] != "0") if len(sys.argv) > 9 else True
     K = 8 * passes * sum(ks)
+    tiled = os.environ.get("BFP_SRC") == "tiled"
+    k_off, k_src = (int(v) for v in os.environ.get("BFP_KWIN", f"0,{K}").split(","))
     os.makedirs(work, exist_ok=True)
     if src_in == "random":
         rng = np.random.default_rng(7)
-        x = (rng.standard_normal((rows, K)) * np.exp(rng.uniform(-6, 4, (rows, 1)))).astype(np.float16)
-        x[:, :8] = 0                                       # all-zero blocks
+        x = (rng.standard_normal((rows, k_src)) * np.exp(rng.uniform(-6, 4, (rows, 1)))).astype(np.float16)
+        x[:, k_off:k_off + 8] = 0                          # all-zero blocks
     else:
         x = np.fromfile(src_in, np.float16)
-        assert x.size >= rows * K, f"{src_in}: {x.size} halves < {rows} x {K}"
-        x = x[:rows * K].reshape(rows, K)
-    ref, off = reference(x, layout, rows, ks, passes, tile, pad)
+        assert x.size >= rows * k_src, f"{src_in}: {x.size} halves < {rows} x {k_src}"
+        x = x[:rows * k_src].reshape(rows, k_src)
+    ref, off = reference(np.ascontiguousarray(x[:, k_off:k_off + K]), layout, rows, ks, passes, tile, pad)
     total = ref.size
     if off.min() < 0 or off.max() + 72 > total:
         sys.exit(f"store range [{off.min()}, {off.max() + 72}) outside the {total}-byte output: not dispatching")
     tag = f"bfp16_{layout}"
     srcf = os.path.join(work, tag + ".loom")
-    open(srcf, "w").write(G.gen(layout, rows, ks, passes, tile, pad))
+    open(srcf, "w").write(G.gen(layout, rows, ks, passes, tile, pad, tiled, k_off, None if k_src == K else k_src))
     r = subprocess.run([sys.executable, EMIT, srcf, os.path.join(work, tag), "nop=0"], capture_output=True, text=True)
     if r.returncode:
         sys.exit(f"emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
     hal = r.stdout.strip().splitlines()[0]
     xf = os.path.join(work, tag + ".x")
-    x.tofile(xf)
+    (x.reshape(rows // 16, 16, k_src // 16, 16).transpose(0, 2, 1, 3) if tiled else x).tofile(xf)
     of = os.path.join(work, layout + ".bfp")
     items = (rows // 8) * (K // 8)
     cmd = [GPURUN, "bfp16-check", "--", HALRUN, model, hal, str((items + G.WG - 1) // G.WG), str(G.WG),
@@ -123,7 +127,8 @@ def main():
     # padding bytes are never written; compare the fragment bytes only
     idx = (off[..., None] + np.arange(72)).reshape(-1)
     bad = np.count_nonzero(got[idx] != ref[idx])
-    print(f"{layout} rows={rows} K={K} ks={ks} passes={passes}: {bad} of {idx.size} fragment bytes differ"
+    print(f"{layout} rows={rows} K={K} ks={ks} passes={passes}{' tiled' if tiled else ''}"
+          f"{f' window {k_off}+{K} of {k_src}' if k_src != K else ''}: {bad} of {idx.size} fragment bytes differ"
           + (f" | {ms[0].strip()}" if ms else ""))
     if bad:
         first = idx[np.nonzero(got[idx] != ref[idx])[0][0]]

@@ -249,6 +249,7 @@ OSTRIDE = 0
 
 # NPU weights (emit_prefill_pp NPU_SPLIT): with DQ_BFP = (ks, passes), the dequant kind writes the NPU's BFP16 weight
 # stream (gen_bfp16_encode "wgt", 64-row columns) instead of f16 rows; K must be 8 * passes * sum(ks).
+# DQ_BFP = (ks, passes, kb_start, kb_total): a K chunk, k_blocks (config) 256-wide blocks from kb_start of kb_total-block rows.
 # Its grid is dq_wgs(): one workgroup per item.
 DQ_BFP = None
 
@@ -392,8 +393,15 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     if OSTRIDE:
         assert kind in ("kstore", "kres") and not t.tout, "the NPU column split covers kstore / kres"
         e(f"  %o_rows = index.constant {OSTRIDE} : index")
-    e("  %bpr = index.mul %k_blocks, %cbb : index")
-    e("  %hpr = index.mul %k_blocks, %cbbh : index")
+    dq_chunk = kind == "dequant" and DQ_BFP is not None and len(DQ_BFP) == 4
+    if dq_chunk:   # weight rows keep their full length; the decode starts kb_start blocks in
+        assert F.get("kdiv", 1) == 1
+        e(f"  %ckbt = index.constant {DQ_BFP[3]} : index")
+        e("  %bpr = index.mul %ckbt, %cbb : index")
+        e("  %hpr = index.mul %ckbt, %cbbh : index")
+    else:
+        e("  %bpr = index.mul %k_blocks, %cbb : index")
+        e("  %hpr = index.mul %k_blocks, %cbbh : index")
     if MX:
         # gate rows (bb bytes per block) then up rows (bbu)
         e(f"  %cbbs = index.constant {bb + bbu} : index")
@@ -541,8 +549,15 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     else:
         e("  %grow_i = scalar.addi %wg_row_i, %drow_i : i32")
     e("  %k_blocks_i = index.cast %k_blocks : index to i32")
-    e("  %bpr_i = scalar.muli %k_blocks_i, %cbbi : i32")
-    e("  %row_off_i = scalar.muli %grow_i, %bpr_i : i32")
+    if dq_chunk:
+        e(f"  %ckbt_i = scalar.constant {DQ_BFP[3]} : i32")
+        e("  %bpr_i = scalar.muli %ckbt_i, %cbbi : i32")
+        e("  %row_off_i0 = scalar.muli %grow_i, %bpr_i : i32")
+        e(f"  %ckbs_i = scalar.constant {DQ_BFP[2] * bb} : i32")
+        e("  %row_off_i = scalar.addi %row_off_i0, %ckbs_i : i32")
+    else:
+        e("  %bpr_i = scalar.muli %k_blocks_i, %cbbi : i32")
+        e("  %row_off_i = scalar.muli %grow_i, %bpr_i : i32")
     if MX:
         e(f"  %cbbu_i = scalar.constant {bbu} : i32")
         e("  %bpru_i = scalar.muli %k_blocks_i, %cbbu_i : i32")
@@ -592,7 +607,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %z8v = vector.splat %z8s : vector<8xi8>")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         if DQ_BFP:
-            bks, bpasses = DQ_BFP
+            bks, bpasses = DQ_BFP[:2]
             bpanel = sum(bpasses * 4 * GE.slab_bytes(k) for k in bks)
             nfrag = (BM // 8) * (ksub // 8)
             assert BM % 64 == 0 and ksub % 8 == 0 and nfrag <= LANES
