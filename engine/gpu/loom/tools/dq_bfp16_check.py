@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""The NPU's weight share through the GPU: the tile GEMM's dequant kind (f16 [rows][K]) then the BFP16 encoder.
+
+usage: dq_bfp16_check.py <model.gguf> <workdir> <tensor> <npu_rows> <ks,ks,...> <passes>
+
+Takes the last <npu_rows> output features of <tensor> (the NPU computes the trailing columns), dequantizes them with
+yah_dequant_<fmt> (the same decode as the GPU GEMMs) and checks the f16 against gguf-py's dequantization, then encodes
+them into the cascade GEMM's weight stream with yah_bfp16_encode_wgt and checks those bytes against the numpy oracle of
+the GPU f16. Writes <workdir>/dq.f16 and <workdir>/wgt.bfp.
+"""
+import dataclasses
+import os
+import subprocess
+import sys
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, "/home/q/llama.cpp/gguf-py")
+import bfp16_check as B  # noqa: E402
+import gen_bfp16_encode as GE  # noqa: E402
+import gen_gemm_tile as TG  # noqa: E402
+
+EMIT = B.EMIT
+HALRUN, GPURUN = B.HALRUN, B.GPURUN
+TABLE_DIR = os.environ.get("YAH_TABLE_DIR", "/home/q/yah-hal-p72")
+
+
+def table_file(fmt, extra):
+    """The tile GEMM's LDS table bindings: the format's grid, and the IQ2 sign table."""
+    return os.path.join(TABLE_DIR, "ksigns_iq2xxs.bin" if extra == "ksigns" else f"grid_{fmt}.bin")
+FMT = {"Q3_K": "q3k", "Q4_K": "q4k", "Q5_K": "q5k", "Q6_K": "q6k", "IQ4_XS": "iq4xs", "IQ3_XXS": "iq3xxs",
+       "IQ3_S": "iq3s", "IQ2_XXS": "iq2xxs", "IQ2_XS": "iq2xs", "Q8_0": "q8_0"}
+
+
+def run(tag, cmd, env):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+    if "hal_run: ok" not in r.stdout:
+        sys.exit(f"{tag}: hal_run failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
+    return r.stdout
+
+
+def main():
+    if len(sys.argv) < 7:
+        sys.exit(__doc__)
+    import gguf
+    from gguf import quants
+    model, work, name = sys.argv[1], sys.argv[2], sys.argv[3]
+    nn, ks, passes = int(sys.argv[4]), [int(v) for v in sys.argv[5].split(",")], int(sys.argv[6])
+    os.makedirs(work, exist_ok=True)
+    rd = gguf.GGUFReader(model)
+    t = next(x for x in rd.tensors if x.name == name)
+    fmt = FMT[t.tensor_type.name]
+    K, N = int(t.shape[0]), int(t.shape[1])
+    assert K == 8 * passes * sum(ks), f"{name}: K={K} != 8 * {passes} * {sum(ks)}"
+    raw = np.asarray(t.data)                               # [N][row bytes]
+    share = np.ascontiguousarray(raw[N - nn:])
+    wf = os.path.join(work, "dq.w")
+    share.tofile(wf)
+    ref = quants.dequantize(share, t.tensor_type).astype(np.float16)   # [nn][K]
+    # the dequant kind, configured as the driver's decode-free path builds it
+    dt = TG.default_tile(fmt, "kstore", K // 256)
+    dt = dataclasses.replace(dt, bm=64, wm=2, wn=4, decahead=False, ksub=64, dbuf=False)
+    kb = K // 256 * TG.G.FMTS[fmt].get("kdiv", 1)          # k_blocks counts the format's blocks (q8_0: 32 wide)
+    mt = nn // 16
+    assert mt % dt.rowgrp == 0 and (kb // TG.G.FMTS[fmt].get("kdiv", 1)) % TG.DQ_BLOCKS == 0
+    sym = "yah_dequant_" + fmt
+    src = os.path.join(work, "dq.loom")
+    open(src, "w").write(TG.gen(fmt, "dequant", dt))
+    r = subprocess.run([sys.executable, EMIT, src, os.path.join(work, "dq"), f"{sym}.m_tiles={mt}",
+                        f"{sym}.k_blocks={kb}", f"{sym}.token_tiles=1"], capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(f"dequant emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
+    hal = r.stdout.strip().splitlines()[0]
+    tables = [table_file(fmt, x) for x in TG.G.FMTS[fmt]["extra"]]
+    df = os.path.join(work, "dq.f16")
+    mins = [share.nbytes] + [os.path.getsize(x) for x in tables] + [nn * K * 2]
+    env = dict(os.environ, HAL_RUN_ITERS=os.environ.get("HAL_RUN_ITERS", "1"))
+    out = run("dequant", [GPURUN, "dq-bfp16", "--", HALRUN, model, hal, str(TG.DQ_WGS), str(dt.lanes),
+                          ",".join(str(v) for v in mins), f"f:{wf}"] + [f"f:{x}" for x in tables]
+              + [f"o:{nn * K * 2}:{df}"], env)
+    got = np.fromfile(df, np.float16).reshape(nn, K)
+    d = np.abs(got.astype(np.float32) - ref.astype(np.float32))
+    exact = np.count_nonzero(got.view(np.uint16) != ref.view(np.uint16))
+    ms = [ln.strip() for ln in out.splitlines() if "ms per dispatch" in ln]
+    print(f"{name} ({fmt}) rows {N - nn}..{N} K={K}: dequant f16 vs gguf-py: {exact} of {got.size} differ, "
+          f"max |d| {d.max():.3e} (max |w| {np.abs(ref.astype(np.float32)).max():.3e})" + (f" | {ms[0]}" if ms else ""))
+    # encode the GPU's f16 (what the NPU will multiply) and check it byte for byte
+    eref, off = B.reference(got, "wgt", nn, ks, passes, 64, True)
+    total = eref.size
+    assert off.min() >= 0 and off.max() + 72 <= total
+    esrc = os.path.join(work, "enc.loom")
+    open(esrc, "w").write(GE.gen("wgt", nn, ks, passes))
+    r = subprocess.run([sys.executable, EMIT, esrc, os.path.join(work, "enc"), "nop=0"], capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(f"encoder emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
+    ehal = r.stdout.strip().splitlines()[0]
+    of = os.path.join(work, "wgt.bfp")
+    items = (nn // 8) * (K // 8)
+    run("encode", [GPURUN, "dq-bfp16", "--", HALRUN, model, ehal, str((items + GE.WG - 1) // GE.WG), str(GE.WG),
+                   f"{nn * K * 2},{total}", f"f:{df}", f"o:{total}:{of}"], env)
+    gb = np.fromfile(of, np.uint8)
+    idx = (off[..., None] + np.arange(72)).reshape(-1)
+    bad = np.count_nonzero(gb[idx] != eref[idx])
+    print(f"  weight stream: {bad} of {idx.size} fragment bytes differ")
+    os.remove(wf)
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()
