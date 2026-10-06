@@ -138,9 +138,8 @@ class LoomNpu {
 
   // A zeroed GPU buffer the NPU can bind views of.
   // host: anonymous host pages registered with libamdf and imported into HRX instead of a device buffer the NPU imports.
-  // The NPU's DMA bypasses the SoC's memory-side cache (MALL), which the GPU fills from device memory: a line of a
-  // device buffer the GPU read before the NPU rewrote it can be read back stale (seen as wrong outputs in ~1 of 10
-  // runs, each with a deferred machine-check report). Host pages are not cached there: buffers the NPU writes use them.
+  // C uses them: with all shared buffers in device memory, deferred data-fabric machine checks (some corrupting an NPU
+  // output) were more frequent; their trigger is the SMU switching fabric / memory clocks during NPU work (results.md).
   Shared& CreateShared(std::size_t bytes, bool host = false) {
     auto s = std::make_unique<Shared>();
     s->bytes = Align(bytes);
