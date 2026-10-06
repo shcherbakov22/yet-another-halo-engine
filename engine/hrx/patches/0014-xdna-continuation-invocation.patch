@@ -1,0 +1,92 @@
+XDNA loader: iree_hal_amd_xdna_executable_query_continuation resolves an entry's control-only continuation
+(no tile setup; valid while the context keeps its resident state). iree-xdna-run --repeat_invocation uses it.
+
+diff --git a/experimental/xdna/executable.c b/experimental/xdna/executable.c
+index 4b1c1ee49..ed9922355 100644
+--- a/experimental/xdna/executable.c
++++ b/experimental/xdna/executable.c
+@@ -302,13 +302,27 @@ iree_status_t iree_hal_amd_xdna_executable_query_invocation(
+     iree_host_size_t storage_count,
+     const iree_hal_amd_xdna_executable_storage_t* storage,
+     amdf_xdna_kernel_command_t* out_command) {
++  return iree_hal_amd_xdna_executable_query_continuation(
++      image, entry_ordinal, storage_count, storage, /*continuation=*/false,
++      out_command);
++}
++
++iree_status_t iree_hal_amd_xdna_executable_query_continuation(
++    const iree_hal_amd_xdna_image_t* image, uint32_t entry_ordinal,
++    iree_host_size_t storage_count,
++    const iree_hal_amd_xdna_executable_storage_t* storage, bool continuation,
++    amdf_xdna_kernel_command_t* out_command) {
+   iree_xdna_elf_entry_record_t entry;
+   IREE_RETURN_IF_ERROR(iree_hal_amd_xdna_executable_entry(
+       image, entry_ordinal, storage_count, storage, &entry));
+   const iree_hal_amd_xdna_image_tables_t* tables =
+       iree_hal_amd_xdna_image_tables(image);
+-  const iree_xdna_elf_invocation_record_t invocation =
++  iree_xdna_elf_invocation_record_t invocation =
+       iree_hal_amd_xdna_image_tables_invocation(tables, entry.first_invocation);
++  if (continuation) {
++    invocation = iree_hal_amd_xdna_image_tables_invocation(
++        tables, entry.first_invocation + invocation.next_invocation);
++  }
+   const uint32_t ordinal = iree_hal_amd_xdna_image_tables_allocation_use(
+       tables, entry.first_allocation_use + invocation.allocation_use);
+   const iree_xdna_elf_allocation_record_t allocation =
+diff --git a/experimental/xdna/executable.h b/experimental/xdna/executable.h
+index 98c80ca45..405083ef3 100644
+--- a/experimental/xdna/executable.h
++++ b/experimental/xdna/executable.h
+@@ -86,6 +86,16 @@ iree_status_t iree_hal_amd_xdna_executable_query_invocation(
+     const iree_hal_amd_xdna_executable_storage_t* storage,
+     amdf_xdna_kernel_command_t* out_command);
+ 
++// Diagnostic: resolves invocation zero, or with |continuation| the image's
++// named continuation after it. The continuation is valid only while context,
++// backing and resident tile state stay intact (not guaranteed when
++// time-sliced).
++iree_status_t iree_hal_amd_xdna_executable_query_continuation(
++    const iree_hal_amd_xdna_image_t* image, uint32_t entry_ordinal,
++    iree_host_size_t storage_count,
++    const iree_hal_amd_xdna_executable_storage_t* storage, bool continuation,
++    amdf_xdna_kernel_command_t* out_command);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif
+diff --git a/experimental/xdna/iree-xdna-run.c b/experimental/xdna/iree-xdna-run.c
+index 541663d14..d109e4361 100644
+--- a/experimental/xdna/iree-xdna-run.c
++++ b/experimental/xdna/iree-xdna-run.c
+@@ -25,6 +25,9 @@ IREE_FLAG(string, entry, "",
+ IREE_FLAG(int32_t, columns, 0,
+           "Logical context column count required by the image, in [1, 8].");
+ IREE_FLAG(int32_t, device, 0, "XDNA endpoint ordinal in the native inventory.");
++IREE_FLAG(bool, repeat_invocation, false,
++          "Diagnostic: after the first submission, follow the image's "
++          "continuation (no tile setup); requires resident state.");
+ IREE_FLAG(int32_t, invocation_count, 1,
+           "Number of independent invocations; each establishes the program's "
+           "device state and waits for completion.");
+@@ -771,13 +774,19 @@ static iree_status_t iree_xdna_run_execute(iree_xdna_run_t* run,
+   IREE_RETURN_IF_ERROR(iree_hal_amd_xdna_executable_query_invocation(
+       run->image, run->entry_ordinal, run->storage.count, run->storage.values,
+       &command));
++  amdf_xdna_kernel_command_t repeat_command = command;
++  if (FLAG_repeat_invocation) {
++    IREE_RETURN_IF_ERROR(iree_hal_amd_xdna_executable_query_continuation(
++        run->image, run->entry_ordinal, run->storage.count,
++        run->storage.values, /*continuation=*/true, &repeat_command));
++  }
+   for (int32_t invocation_ordinal = 0;
+        invocation_ordinal < FLAG_invocation_count; ++invocation_ordinal) {
+     const amdf_xdna_kernel_queue_submission_info_t submission_info = {
+         .type = AMDF_STRUCTURE_TYPE_XDNA_KERNEL_QUEUE_SUBMISSION_INFO,
+         .structure_size = sizeof(submission_info),
+         .command_count = 1,
+-        .commands = &command,
++        .commands = invocation_ordinal ? &repeat_command : &command,
+     };
+     uint64_t submission = 0;
+     fprintf(stderr, "Publishing independent invocation %d/%d\n",
