@@ -17,6 +17,7 @@ from dataclasses import dataclass
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gen_bfp16_encode as GE  # noqa: E402
+import gen_npu_gemm as GN  # noqa: E402
 import gen_gemm_decode as G  # noqa: E402
 
 # Default workgroup: 128 x 256 over 4 x 4 waves (WAVE_FMTS: 4 x 2).
@@ -250,7 +251,7 @@ OSTRIDE = 0
 
 
 # NPU weights (emit_prefill_pp NPU_SPLIT): with DQ_BFP = (ks, passes), the dequant kind writes the NPU's BFP16 weight
-# stream (gen_bfp16_encode "wgt", 64-row columns) instead of f16 rows; K must be 8 * passes * sum(ks).
+# stream (gen_bfp16_encode "wgt", gen_npu_gemm.TN-row columns) instead of f16 rows; K must be 8 * passes * sum(ks).
 # DQ_BFP = (ks, passes, kb_start, kb_total): a K chunk, k_blocks (config) 256-wide blocks from kb_start of kb_total-block rows.
 # Its grid is dq_wgs(): one workgroup per item.
 DQ_BFP = None
@@ -619,11 +620,12 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         if DQ_BFP:
             bks, bpasses = DQ_BFP[:2]
-            bpanel = sum(bpasses * 4 * GE.slab_bytes(k) for k in bks)
+            bpanel = sum(bpasses * GN.NP * GE.slab_bytes(k) for k in bks)
             nfrag = (BM // 8) * (ksub // 8)
             assert BM % 64 == 0 and ksub % 8 == 0 and nfrag <= LANES
             e(f"  %dq_bpanel = index.constant {bpanel} : index")
-            e("  %dq_bcols = index.div %m_rows, %c64 : index")
+            e(f"  %dq_ctn = index.constant {GN.TN} : index")
+            e("  %dq_bcols = index.div %m_rows, %dq_ctn : index")
             e("  %dq_tot = index.mul %dq_bcols, %dq_bpanel : index")
             e("  %dq_out = buffer.view %output_na[%base] : buffer -> view<[%dq_tot]xi8>")
         else:
@@ -679,7 +681,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             e(f"  %bf_nfrag = index.constant {nfrag} : index")
             e("  %bf_live = index.cmp ult, %tid, %bf_nfrag : index")
             e("  scf.if %bf_live {")
-            for nm, v in (("c2", 2), ("c144", 144), ("c72", 72), ("csub", 4), ("cpk", sum(bks)), ("cpass", bpasses),
+            for nm, v in (("c2", 2), ("c144", 144), ("c72", 72), ("csub", GN.NP), ("cpk", sum(bks)), ("cpass", bpasses),
                           ("c8", 8), ("ckq", ksub // 8)):
                 e(f"    %bf_{nm} = index.constant {v} : index")
             # a lane pair takes rows 0-7 and 8-15 of one k-block: its 144 contiguous stream bytes (whole lines per wave)
@@ -694,7 +696,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             e("    %bf_g8 = index.div %bf_gr, %bf_c8 : index")
             e("    %bf_kb0 = index.mul %dq_kp, %bf_ckq : index")
             e("    %bf_kbi = index.add %bf_kb0, %bf_kk : index")
-            frag = GE.emit_offset(e, "wgt", 0, bks, bpasses, 64, True, "%bf_g8", "%bf_kbi", p="bf_")
+            frag = GE.emit_offset(e, "wgt", 0, bks, bpasses, GN.TN, True, "%bf_g8", "%bf_kbi", p="bf_")
             e("    %bf_kc = index.mul %bf_kk, %bf_c8 : index")
 
             def bf_load(r):

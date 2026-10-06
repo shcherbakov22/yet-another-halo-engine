@@ -82,7 +82,7 @@ class LoomPrefill {
       const auto it = geom_.find("npusplit_" + site);
       NpuPlan q;
       if (it == geom_.end()) return q;
-      const std::size_t calls = it->second.tokens / 512, mats = site == "ffn" ? 2 : 1;
+      const std::size_t calls = it->second.tokens / NpuCallRows(), mats = site == "ffn" ? 2 : 1;
       for (const auto& [k0, K] : NpuChunks(site)) {
         const NpuBytes nb = NpuK(K);
         q.a_bytes += nb.a, q.w_bytes += mats * calls * nb.w, q.c_bytes += mats * calls * nb.c;
@@ -1018,6 +1018,8 @@ class LoomPrefill {
     const Geom& g = geom_.at("npubytes_" + std::to_string(K));
     return {g.tokens, g.rowgrp, g.tt};
   }
+  // Output rows per NPU call (dispatch.txt "npurows": 8 columns of gen_npu_gemm.TN).
+  std::uint32_t NpuCallRows() const { return geom_.at("npurows").tokens; }
   // The GPU's share of GEMM HAL hal ("<hal>.npu.hal": its leading rows at the full stride), or "".
   std::string NpuHal(const std::string& hal) const {
     const std::string v = hal.empty() ? "" : hal.substr(0, hal.size() - 4) + ".npu.hal";
@@ -1088,7 +1090,7 @@ class LoomPrefill {
       const std::string dq = "dqbfp" + base.substr(std::strlen("gemm_kstore"), base.size() - std::strlen("gemm_kstore") - 4) +
                              (NpuChunked(site) ? "_c" + std::to_string(c) : "") + ".hal";
       const Geom& g = geom_.at(dq);
-      const std::size_t panel = NpuK(chunks[c].second).w, calls = rows / 512;
+      const std::size_t panel = NpuK(chunks[c].second).w, calls = rows / NpuCallRows();
       auto b = GemmWeights(*t, f);
       b[0].offset += (static_cast<std::size_t>(t->dims[1]) - rows) * row_bytes;
       b[0].length = std::size_t{rows} * row_bytes;
@@ -1102,7 +1104,7 @@ class LoomPrefill {
     graph_ = here;
     return views;
   }
-  // The NPU calls of one matrix: per chunk, per 512 rows; C panels from c_off, chunk-major (the unpack sums the chunks).
+  // The NPU calls of one matrix: per chunk, per NpuCallRows() rows; C panels from c_off, chunk-major (the unpack sums the chunks).
   // Returns the C view they fill.
   NpuView NpuCalls(const std::string& site, const std::vector<NpuView>& a, const std::vector<std::vector<NpuView>>& w,
                    std::size_t& c_off, std::vector<std::uint32_t>& calls) {
@@ -1370,7 +1372,7 @@ class LoomPrefill {
     const std::string qs = nq ? NpuHal(KqgHal(pre + "attn_q.weight", q_af)) : "";
     bool qg_fused = !qs.empty();
     if (qg_fused) {
-      // the NPU's heads of q (whole heads: 512 rows of [256 q | 256 gate] per call) beside the GPU's heads and k / v;
+      // the NPU's heads of q (whole heads of 512 rows [256 q | 256 gate]) beside the GPU's heads and k / v;
       // the norm wrote the row-major input unless q, k and v are all afrag
       const bool tiled = q_af && k_af && v_af;
       const auto a = NpuEncode("q", tiled ? *normt_ : *scratch_, tiled);

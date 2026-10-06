@@ -3,7 +3,7 @@
 
 usage: npu_gemm_check.py <workdir> <cols> <m_blocks> <ks,ks,ks,ks> <passes> [act.f16 wgt.f16]
 
-Operands are random (wide per-row dynamic range) or f16 files: activations [64 * m_blocks][K], weights [64 * cols][K].
+Operands are random (wide per-row dynamic range) or f16 files: activations [64 * m_blocks][K], weights [TN * cols][K] (gen_npu_gemm.TN).
 They are packed with the encoder's numpy oracle (bfp16_check.reference), the image runs through iree-xdna-run, and C is
 compared with the exact product of the bfp16 values; the error is f32 accumulation order only (~1e-7 relative).
 NPU_REPEAT=N also times N invocations with the control-only continuation (perf pmode is the caller's job).
@@ -24,9 +24,9 @@ import hrx_paths  # noqa: E402
 
 
 def unpack_c(raw, cols, nb):
-    """C binding [col][M block][slab mp][slab np][chain][8][8] f32 -> [64 * nb][64 * cols]."""
+    """C binding [col][M block][slab mp][slab np][chain][8][8] f32 -> [TM * nb][TN * cols]."""
     c = raw.reshape(cols, nb, N.MP, N.NP, 2, 2, 8, 8)
-    return c.transpose(1, 2, 4, 6, 0, 3, 5, 7).reshape(64 * nb, 64 * cols)
+    return c.transpose(1, 2, 4, 6, 0, 3, 5, 7).reshape(N.TM * nb, N.TN * cols)
 
 
 def value(x):
@@ -48,7 +48,7 @@ def main():
     work, cols, nb = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
     ks, passes = tuple(int(v) for v in sys.argv[4].split(",")), int(sys.argv[5])
     cfg = N.Config(cols, nb, ks, passes)
-    M, Nn, K = 64 * nb, 64 * cols, 8 * passes * sum(ks)
+    M, Nn, K = N.TM * nb, N.TN * cols, 8 * passes * sum(ks)
     os.makedirs(work, exist_ok=True)
     if len(sys.argv) > 7:
         a = np.fromfile(sys.argv[6], np.float16)[:M * K].reshape(M, K)
@@ -67,7 +67,7 @@ def main():
     a_b, w_b, c_b = (os.path.join(work, n) for n in ("a.bin", "w.bin", "c.bin"))
     sa, sw, sc = N.stream_bytes(cfg)
     ra, _ = B.reference(a, "act", M, list(ks), passes, 64, True)
-    rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, 64, True)
+    rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
     assert ra.size == sa and rw.size == sw
     ra.tofile(a_b)
     rw.tofile(w_b)

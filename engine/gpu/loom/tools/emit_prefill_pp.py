@@ -20,6 +20,7 @@ import gen_gdn_chunk  # noqa: E402
 import gen_kres_persist  # noqa: E402
 import gen_half_norm  # noqa: E402
 import gen_kvq  # noqa: E402
+import gen_npu_gemm as GN  # noqa: E402
 
 
 def rope_kpaged(text):
@@ -607,7 +608,7 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     return rows
 
 
-# NPU column split (YAH_NPU_SPLIT="<site>=<NPU rows>,...", rows multiples of 512; empty: none): the NPU (XDNA2, HRX .xdna)
+# NPU column split (YAH_NPU_SPLIT="<site>=<NPU rows>,...", rows multiples of 640, q also of 512; empty: none): the NPU (XDNA2, HRX .xdna)
 # computes the trailing rows of a GEMM, the GPU the leading ones. Sites (rows x K):
 #   qkv  DeltaNet attn_qkv (10240 x 5120, f16 out)     gate  DeltaNet attn_gate (6144 x 5120, f16 out)
 #   q    attention attn_q (12288 x 5120, kqg: whole heads of [256 q | 256 gate])
@@ -619,11 +620,12 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
 # GEMM HALs, its afrag / persistent / fragment-major-output forms included; gen_gemm_tile.OSTRIDE) and the NPU's rows
 # decoded straight to its BFP16 weight stream ("dqbfp_<fmt>_<mt>_<kb>[_c<chunk>].hal", gen_gemm_tile.DQ_BFP). Per K the
 # activation encoders ("npu_enc_<K>[_c<chunk>][_t].hal", _t: fragment-major input) and the NPU GEMM image
-# ("npu_gemm_<K>.xdna", 8 columns = 512 rows per call); per site the unpack ("npu_unpack_<site>.hal", ffn also
+# ("npu_gemm_<K>.xdna", 8 columns of gen_npu_gemm.TN = 640 rows per call: "npurows"); per site the unpack ("npu_unpack_<site>.hal", ffn also
 # "npu_unpack_ffn_t.hal" with fragment-major output). dispatch.txt: "npusplit_<site> <rows> 0 0", "npubytes_<K> <A>
 # <W per call> <C per call>", and per kernel "<hal> <workgroups> <workgroup size> 0" (the split GEMMs have GEMM rows).
 NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("YAH_NPU_SPLIT", "").split(",") if x))
-NPU_KS = (33, 33, 33, 29)   # k-blocks per pass and K-slice row (gen_npu_gemm); K = 1024 * passes
+NPU_KS = GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
+NPU_ROWS = 8 * GN.TN   # output rows per NPU call (8 columns)
 NPU_SITES = {"qkv": ("kstore", 640, 20), "gate": ("kstore", 384, 20), "q": ("kqg", 768, 20), "out": ("kres", 320, 24),
              "down": ("kres", 320, 68), "ffn": ("ffn", 1088, 20)}
 NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
@@ -653,13 +655,13 @@ def npu_rem_tile(fmt, kbw, kbt):
 def npu_split(rows, combos, B, outdir):
     import gen_bfp16_encode as GE
     import gen_gemm_tile as TG
-    import gen_npu_gemm as GN
     import gen_npu_unpack as GU
     sys.path.insert(0, os.path.dirname(HERE))
     import hrx_paths
     bad = set(NPU_SPLIT) - set(NPU_SITES)
     assert not bad, "unknown NPU split sites %s" % sorted(bad)
-    assert all(v % 512 == 0 and 0 < v < NPU_SITES[k][1] * 16 for k, v in NPU_SPLIT.items()) and B % 512 == 0
+    assert all(v % NPU_ROWS == 0 and 0 < v < NPU_SITES[k][1] * 16 for k, v in NPU_SPLIT.items()) and B % 512 == 0
+    assert NPU_SPLIT.get("q", 0) % 512 == 0, "q: whole heads"
     out = []
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
@@ -815,9 +817,9 @@ def npu_split(rows, combos, B, outdir):
         for f in forms:
             name = "npu_unpack_%s%s.hal" % (site, "_t" if f.get("tiled") else "")
             src = os.path.join(tmp, name[:-4] + ".loom")
-            open(src, "w").write(GU.gen(B, n // 64, N // 2 if site == "q" else N, N - n, **f))
+            open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
             E.emit(src, ["nop=0"], name, outdir)
-            out.append((name, B * (n // 64) * 8 // GU.WG, GU.WG, 0))
+            out.append((name, B * n // 8 // GU.WG, GU.WG, 0))
         out.append(("npusplit_" + site, n, 0, 0))
     # NPU images, one per pass count
     env = dict(hrx_paths.env(), LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1")
@@ -833,6 +835,7 @@ def npu_split(rows, combos, B, outdir):
         if r.returncode:
             raise SystemExit("NPU GEMM compile failed: " + r.stderr[-800:])
         out.append(("npubytes_%d" % K,) + tuple(GN.stream_bytes(cfg)))
+    out.append(("npurows", NPU_ROWS, 0, 0))
     return out
 
 

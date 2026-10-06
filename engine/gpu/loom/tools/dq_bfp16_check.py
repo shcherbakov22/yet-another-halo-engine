@@ -22,6 +22,7 @@ sys.path.insert(0, HERE)
 import bfp16_check as B  # noqa: E402
 import gen_bfp16_encode as GE  # noqa: E402
 import gen_gemm_tile as TG  # noqa: E402
+import gen_npu_gemm as GN  # noqa: E402
 
 EMIT = B.EMIT
 HALRUN, GPURUN = B.HALRUN, B.GPURUN
@@ -90,11 +91,11 @@ def main():
     print(f"{name} ({fmt}) rows {N - nn}..{N} K={K}: dequant f16 vs gguf-py: {exact} of {got.size} differ, "
           f"max |d| {d.max():.3e} (max |w| {np.abs(ref.astype(np.float32)).max():.3e})" + (f" | {ms[0]}" if ms else ""))
     # encode the GPU's f16 (what the NPU will multiply) and check it byte for byte
-    eref, off = B.reference(np.ascontiguousarray(got[:, k_off:k_off + Kc]), "wgt", nn, ks, passes, 64, True)
+    eref, off = B.reference(np.ascontiguousarray(got[:, k_off:k_off + Kc]), "wgt", nn, ks, passes, GN.TN, True)
     total = eref.size
     assert off.min() >= 0 and off.max() + 72 <= total
     esrc = os.path.join(work, "enc.loom")
-    open(esrc, "w").write(GE.gen("wgt", nn, ks, passes, k_off=k_off, k_src=K if chunk else None))
+    open(esrc, "w").write(GE.gen("wgt", nn, ks, passes, GN.TN, k_off=k_off, k_src=K if chunk else None))
     r = subprocess.run([sys.executable, EMIT, esrc, os.path.join(work, "enc"), "nop=0"], capture_output=True, text=True)
     if r.returncode:
         sys.exit(f"encoder emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")

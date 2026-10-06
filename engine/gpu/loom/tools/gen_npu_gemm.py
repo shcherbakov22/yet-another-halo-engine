@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Emit the NPU cascade GEMM (XDNA2 array program + core leaves, Loom low asm) for loom-compile.
 
-C[M x N] = A[M x K] . W[N x K]^T in bfp16ebs8 with f32 accumulation, N = 64 per NPU column (cols <= 8).
+C[M x N] = A[M x K] . W[N x K]^T in bfp16ebs8 with f32 accumulation, N = TN = 80 per NPU column (cols <= 8).
 Each column is a cascade of 4 compute rows: the head (top row) and two mids compute K-slice partials of every 16 x 16
 sub-tile and pass them down the accumulator cascade; the tail (bottom row) adds its slice and the running C.
 K is split per pass over the rows (ks[r] 8-wide k-blocks each, ks = [head, mid, mid, tail]); passes repeat until K.
 Operand streams are the layouts of gen_bfp16_encode.py (act: [slice][M block][pass][slab], wgt: [col][slice][pass][slab]).
 C: per column [M block][4 segments][sub-tile][chain][8 x 8 f32] (see npu_gemm_check.unpack_c).
+The kernel is bound by the operand streams into the compute tiles (36 * (1 / MP + 1 / NP) bytes per MMA over two
+S2MM streams of ~7.7 B/cycle): NP = 5 needs 20% less activation stream than 4; a column's whole weight panel must fit
+its 512 KB memory tile, which caps NP at 5 for K = 5120.
 
 Dataflow: weights stage once per column in its memory tile and replay per M block; each row's activations are one
 stream, staged in a memory tile and multicast along the row. Activations arrive one 16-row slab per record into a
@@ -21,8 +24,9 @@ MBMS4 = "(reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) ->
 ORDER_C = (0, 2, 1, 3)   # MMA order of the 4 chains inside a k step (a-row, w-col: c >> 1, c & 1)
 LAGU = 9                 # pops issue 9 MMAs ahead of their first use (the pop -> operand latency)
 WB = 9                   # pops of the next sub-tile that ride in the cascade-write block (head, mids)
-TM = TN = 64
-MP = NP = 4              # 16-row slabs per M block / per NPU column
+MP, NP = 4, 5            # 16-row slabs per M block / per NPU column
+TM, TN = 16 * MP, 16 * NP
+KS = (35, 35, 35, 23)    # production k-blocks per pass and K-slice row: K = 1024 per pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -32,7 +36,7 @@ class Config:
     ks: tuple           # k-blocks per pass for (head, mid, mid, tail)
     passes: int         # K = 8 * passes * sum(ks)
     mu: int = 2         # M slabs per loop iteration of a leaf
-    acap: int = 4       # activation ring slabs, head and mids
+    acap: int = 2       # activation ring slabs, head and mids
     acap_t: int = 2     # activation ring slabs, tail (its memory also holds C)
     entry: str = "npu_gemm"
 

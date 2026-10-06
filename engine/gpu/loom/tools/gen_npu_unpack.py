@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Emit yah_npu_unpack: the NPU GEMM's C into the GPU output's column slice.
 
-C (gen_npu_gemm): [col][M block][mp][np][chain mh, nh][8 rows][8 cols] f32, 64 x 64 per (col, M block).
+C (gen_npu_gemm): [col][M block][mp][np][chain mh, nh][8 rows][8 cols] f32, 64 x TN per (col, M block).
 out: f32 [tokens][stride], or f16 with out16 (rounded as the f16-output GEMMs round, emit_prefill_pp.O16_MT); C column j
 goes to out column off + j.
 One work item per 8 consecutive C columns of one token: a 32-byte read and a 32-byte write.
-A wave takes 4 tokens x one column's 8 chunks: 8 lanes store a token's 64 columns (256 contiguous bytes) and each chunk's 4 tokens read 128 contiguous bytes of C.
+A run of NJ = TN / 8 items takes one token's TN columns of an NPU column (TN * 4 contiguous bytes); each chunk's 4 tokens
+read 128 contiguous bytes of C.
 The next waves take the next columns, so 4 output rows fill left to right (DRAM-page friendly).
 """
 import sys
 
 import gen_bfp16_encode as GE
 import gen_gemm_tile as TG
+import gen_npu_gemm as GN
 
 WG = 256
 
@@ -23,7 +25,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     f16(silu(gate) * up) with the swiglu epilogue's scalar ops. tiled: f16 out fragment-major ([token / 16][column / 16]
     [token % 16][column % 16], an afrag GEMM's input). qg: the attention q projection's rows (heads x [256 q | 256
     gate], off = first NPU head * 512): C column j goes to q or gate (f32 [token][stride], bindings c, q, gate) at
-    head * 256 + j % 256. rem (with resid): the GPU's f32 [token][64 * cols] partial over the rest of K (the NPU split's K
+    head * 256 + j % 256. rem (with resid): the GPU's f32 [token][TN * cols] partial over the rest of K (the NPU split's K
     remainder) is added to the C chunks before the residual (bindings c, resid, rem, out). bfp = (ks, passes, chunk_k,
     chunks) with swiglu: also the NPU's BFP16 activation stream of the next GEMM (ffn_down, whose input columns these are) for
     the columns in its K chunks (chunk_k columns each, gen_bfp16_encode "act" layout, one stream per chunk back to back;
@@ -32,9 +34,10 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     assert not bfp or swiglu
     assert not qg or not (resid or swiglu or tiled or out16)
     out16 = out16 or swiglu or tiled
-    assert tokens % 64 == 0 and off + 64 * cols <= (2 if qg else 1) * stride
-    items = tokens * cols * 8
-    c_elems = tokens * cols * 64
+    TN, NJ = GN.TN, GN.TN // 8
+    assert tokens % 64 == 0 and off + TN * cols <= (2 if qg else 1) * stride
+    items = tokens * cols * NJ
+    c_elems = tokens * cols * TN
     L = []
     e = L.append
     flags = "".join(f" {k}" for k, v in (("resid", resid), ("rem", rem), ("swiglu", swiglu), ("tiled", tiled), ("qg", qg),
@@ -65,7 +68,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     if resid and rem:
         e("  %c_na, %res_na, %rem_na, %out_na = buffer.assume.noalias %c, %resid, %rem, %out : buffer, buffer, buffer, buffer")
         e("  %rv = buffer.view %res_na[%base] : buffer -> view<[%no]xf32>")
-        e(f"  %nrem = index.constant {tokens * cols * 64} : index")
+        e(f"  %nrem = index.constant {tokens * cols * TN} : index")
         e("  %remv = buffer.view %rem_na[%base] : buffer -> view<[%nrem]xf32>")
     elif resid:
         e("  %c_na, %res_na, %out_na = buffer.assume.noalias %c, %resid, %out : buffer, buffer, buffer")
@@ -86,19 +89,19 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e(f"  %ov = buffer.view %out_na[%base] : buffer -> view<[%no]x{ot}>")
     e("  %wg = kernel.workgroup.id<x> : index")
     e("  %tid = kernel.workitem.id<x> : index")
-    for nm, v in (("cwg", WG), ("c8", 8), ("c2", 2), ("c4", 4), ("c16", 16), ("c64", 64), ("c4096", 4096),
-                  ("cmb", tokens // 64), ("ccols", cols), ("cstride", stride), ("coff", off)):
+    for nm, v in (("cwg", WG), ("c8", 8), ("c2", 2), ("c4", 4), ("c16", 16), ("c64", 64), ("cnj", NJ), ("cnp", GN.NP),
+                  ("ctn", TN), ("ctile", 64 * TN), ("cmb", tokens // 64), ("ccols", cols), ("cstride", stride), ("coff", off)):
         e(f"  %{nm} = index.constant {v} : index")
     if tiled:
         e("  %c256t = index.constant 256 : index")
     if qg:
         e("  %c512q = index.constant 512 : index")
         e("  %c256q = index.constant 256 : index")
-    # item = (((blk * 16 + r4) * cols + col) * 4 + rr) * 8 + j: token blk * 64 + r4 * 4 + rr, j = 8-column chunk (np, nh)
+    # item = (((blk * 16 + r4) * cols + col) * 4 + rr) * NJ + j: token blk * 64 + r4 * 4 + rr, j = 8-column chunk (np, nh)
     e("  %i0 = index.mul %wg, %cwg : index")
     e("  %item = index.add %i0, %tid : index")
-    e("  %j = index.rem %item, %c8 : index")
-    e("  %q1 = index.div %item, %c8 : index")
+    e("  %j = index.rem %item, %cnj : index")
+    e("  %q1 = index.div %item, %cnj : index")
     e("  %rr = index.rem %q1, %c4 : index")
     e("  %q2 = index.div %q1, %c4 : index")
     e("  %col = index.rem %q2, %ccols : index")
@@ -115,8 +118,8 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  %row = index.rem %r, %c8 : index")
     e("  %npi = index.div %j, %c2 : index")
     e("  %nh = index.rem %j, %c2 : index")
-    # C element: tile * 4096 + ((mp * 4 + np) * 4 + mh * 2 + nh) * 64 + row * 8
-    e("  %a0 = index.mul %mpi, %c4 : index")
+    # C element: tile * 64 * TN + ((mp * NP + np) * 4 + mh * 2 + nh) * 64 + row * 8
+    e("  %a0 = index.mul %mpi, %cnp : index")
     e("  %a1 = index.add %a0, %npi : index")
     e("  %a2 = index.mul %a1, %c4 : index")
     e("  %a3 = index.mul %mh, %c2 : index")
@@ -125,12 +128,12 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  %a6 = index.mul %a5, %c64 : index")
     e("  %a7 = index.mul %row, %c8 : index")
     e("  %a8 = index.add %a6, %a7 : index")
-    e("  %a9 = index.mul %tile, %c4096 : index")
+    e("  %a9 = index.mul %tile, %ctile : index")
     e("  %ca = index.add %a9, %a8 : index")
-    # out: token blk * 64 + r, column col * 64 + 8 * j + off
+    # out: token blk * 64 + r, column col * TN + 8 * j + off
     e("  %t0 = index.mul %blk, %c64 : index")
     e("  %tok = index.add %t0, %r : index")
-    e("  %j0 = index.mul %col, %c64 : index")
+    e("  %j0 = index.mul %col, %ctn : index")
     e("  %j1 = index.mul %j, %c8 : index")
     e("  %j2 = index.add %j0, %j1 : index")
     e("  %jo = index.add %j2, %coff : index")
@@ -170,8 +173,8 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         e(f"  %cp{p} = vector.load %cv[%cpa{p}] : view<[%nc]xf32> -> vector<8xf32>")
         e(f"  %cs{p} = vector.addf {val}, %cp{p} : vector<8xf32>")
         val = f"%cs{p}"
-    if rem:   # token tok, NPU column j2 of the [tokens][64 * cols] partial
-        e(f"  %cremw = index.constant {cols * 64} : index")
+    if rem:   # token tok, NPU column j2 of the [tokens][TN * cols] partial
+        e(f"  %cremw = index.constant {cols * TN} : index")
         e("  %rmb = index.mul %tok, %cremw : index")
         e("  %rma = index.add %rmb, %j2 : index")
         e("  %rmv = vector.load %remv[%rma] : view<[%nrem]xf32> -> vector<8xf32>")

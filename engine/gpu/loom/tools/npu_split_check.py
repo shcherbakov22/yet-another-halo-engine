@@ -6,7 +6,7 @@ usage: npu_split_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [
 Emits the GPU kernels (activation encoder, the NPU's rows decoded to BFP16, the split kstore, the C unpack)
 and the NPU image, runs them on one stream with the NPU relay, and checks the output: the GPU's rows bit-identical to
 the full kstore GEMM, the NPU's rows against the float64 product of the bfp16 operands (f32 accumulation order only).
-npu_rows is a multiple of 512 (one NPU call per 512 output features). Needs PYTHONPATH with llama.cpp's gguf-py.
+npu_rows is a multiple of 8 * gen_npu_gemm.TN (one NPU call per 640 output features). Needs PYTHONPATH with llama.cpp's gguf-py.
 """
 import os
 import subprocess
@@ -27,7 +27,8 @@ import hrx_paths  # noqa: E402
 import npu_gemm_check as NC  # noqa: E402
 import split_gemm_check as SC  # noqa: E402
 
-KS = (33, 33, 33, 29)   # k-blocks per pass and row; K = 1024 * passes
+KS = GN.KS   # k-blocks per pass and row; K = 1024 * passes
+ROWS = 8 * GN.TN   # output rows per NPU call
 
 
 def emit_plain(work, tag, text):
@@ -52,19 +53,19 @@ def main():
     fmt = DQ.FMT[tn.tensor_type.name]
     K, N = int(tn.shape[0]), int(tn.shape[1])
     passes = K // 1024
-    assert K == 8 * passes * sum(KS) and nn % 512 == 0
+    assert K == 8 * passes * sum(KS) and nn % ROWS == 0
     x = np.fromfile(act, np.float16)
     tokens = x.size // K
     x = x.reshape(tokens, K)
-    panels, nb = nn // 512, tokens // 64
+    panels, nb = nn // ROWS, tokens // 64
     kb = K // 256 * TG.G.FMTS[fmt].get("kdiv", 1)
     # GPU kernels
     t = TG.default_tile(fmt, "kstore", kb)
     tt = tokens // t.bn
-    full = SC.emit(work, "full", fmt, t, N // 16, kb, tt, 0)
-    split = SC.emit(work, "split", fmt, t, (N - nn) // 16, kb, tt, N)
+    full = SC.emit(work, "full", fmt, "kstore", t, N // 16, kb, tt, 0)
+    split = SC.emit(work, "split", fmt, "kstore", t, (N - nn) // 16, kb, tt, N)
     enc_act = emit_plain(work, "enc_act", GE.gen("act", tokens, list(KS), passes))
-    unpack = emit_plain(work, "unpack", GU.gen(tokens, nn // 64, N, N - nn))
+    unpack = emit_plain(work, "unpack", GU.gen(tokens, nn // GN.TN, N, N - nn))
     # the NPU's rows decoded straight into its BFP16 weight stream (gen_gemm_tile.DQ_BFP)
     dt = TG.dataclasses.replace(TG.default_tile(fmt, "kstore", kb), bm=64, wm=2, wn=4, decahead=False, ksub=64,
                                 dbuf=False)
@@ -80,7 +81,7 @@ def main():
     if r.returncode:
         sys.exit(f"dequant emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
     dq = r.stdout.strip().splitlines()[0]
-    # NPU image: one 512-wide panel (8 columns) per call
+    # NPU image: one ROWS-wide panel (8 columns) per call
     cfg = GN.Config(8, nb, KS, passes)
     xsrc, ximg = os.path.join(work, "npu.loom"), os.path.join(work, "npu.xdna")
     open(xsrc, "w").write(GN.gen(cfg))
@@ -98,7 +99,7 @@ def main():
             "split_hal": split, "split_gx": (N - nn) // 16 // t.rowgrp, "full_hal": full, "full_gx": N // 16 // t.rowgrp, "split_gy": tt, "split_wg": t.lanes,
             "enc_act_hal": enc_act, "enc_act_wgs": tokens // 8 * (K // 8) // GE.WG,
             "dq_hal": dq, "dq_wgs": TG.dq_wgs(nn // 16, kb, dt, fmt), "dq_wg": dt.lanes,
-            "unpack_hal": unpack, "unpack_wgs": tokens * (nn // 64) * 8 // GU.WG,
+            "unpack_hal": unpack, "unpack_wgs": tokens * nn // 8 // GU.WG,
             "npu_xdna": ximg, "npu_entry": cfg.entry, "npu_columns": 8, "tables": ",".join(tables), "iters": iters, "warmup_ms": 4000}
     pf = os.path.join(work, "plan.txt")
     open(pf, "w").write("".join(f"{k}={v}\n" for k, v in plan.items()))
