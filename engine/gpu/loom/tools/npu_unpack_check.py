@@ -7,7 +7,8 @@ Random C into an output filled with NaN: columns [off, off + 64 * cols) must hol
 UNP_PARTS=n (partial Cs summed), UNP_RESID=1 (out = resid + C), UNP_SWIGLU=1 (f16(silu(gate) * up), checked to f16
 rounding: the kernel's exp / reciprocal are not numpy's), UNP_TILED=1 (fragment-major f16 output), UNP_QG=1 (attention q
 rows: <stride> is the q / gate row count, <off> the first NPU row of heads x [256 q | 256 gate]), UNP_REM=1 (with
-UNP_RESID: plus the GPU's K-remainder partial, f32 [tokens][64 * cols]).
+UNP_RESID: plus the GPU's K-remainder partial, f32 [tokens][64 * cols]), UNP_BFP=1 (with UNP_SWIGLU: also the next GEMM's
+BFP16 stream in K chunks of 5120 over <stride> columns, checked per row block against bfp16_check.reference of the f16 out).
 """
 import os
 import subprocess
@@ -28,8 +29,10 @@ def main():
     model, work = sys.argv[1], sys.argv[2]
     tokens, cols, stride, off = (int(v) for v in sys.argv[3:7])
     parts = int(os.environ.get("UNP_PARTS", "1"))
-    resid, swiglu, tiled, qg, rem = (os.environ.get(k) == "1" for k in ("UNP_RESID", "UNP_SWIGLU", "UNP_TILED", "UNP_QG",
-                                                                         "UNP_REM"))
+    resid, swiglu, tiled, qg, rem, bfp = (os.environ.get(k) == "1" for k in ("UNP_RESID", "UNP_SWIGLU", "UNP_TILED", "UNP_QG",
+                                                                              "UNP_REM", "UNP_BFP"))
+    KS, CK = [33, 33, 33, 29], 5120
+    bfpc = (tuple(KS), 5, CK, stride // CK) if bfp else None
     out16 = (len(sys.argv) > 7 and sys.argv[7] != "0") or swiglu or tiled
     dt = np.float16 if out16 else np.float32
     nblk = parts * (2 if swiglu else 1)
@@ -40,7 +43,7 @@ def main():
     np.full(tokens * stride, np.nan, dt).tofile(sf)
     src = os.path.join(work, "unpack.loom")
     open(src, "w").write(G.gen(tokens, cols, stride, off, out16 and not (swiglu or tiled), resid, parts, swiglu, tiled, qg,
-                               rem))
+                               rem, bfpc))
     r = subprocess.run([sys.executable, B.EMIT, src, os.path.join(work, "unpack"), "nop=0"], capture_output=True, text=True)
     if r.returncode:
         sys.exit(f"emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
@@ -54,11 +57,14 @@ def main():
     if rem:
         m_in.tofile(mf)
     obytes = tokens * stride * np.dtype(dt).itemsize
+    cbytes = B.G.layout_bytes("act", tokens, KS, 5) if bfp else 0
+    nab = cbytes * (stride // CK) if bfp else 0
+    abf = os.path.join(work, "ab.bin")
     cmd = [B.GPURUN, "npu-unpack", "--", B.HALRUN, model, hal, str(tokens * cols * 8 // G.WG), str(G.WG),
-           ",".join(str(v) for v in [c.nbytes] + ([obytes] if resid else []) + ([m_in.nbytes] if rem else []) + [obytes]),
-           f"f:{cf}"]
+           ",".join(str(v) for v in [c.nbytes] + ([obytes] if resid else []) + ([m_in.nbytes] if rem else []) + [obytes]
+                    + ([nab] if bfp else [])), f"f:{cf}"]
     gfo = os.path.join(work, "gate_out.f32")
-    cmd += ([f"f:{rf}"] if resid else []) + ([f"f:{mf}"] if rem else []) + [f"io:{sf}:{of}"] + ([f"io:{sf}:{gfo}"] if qg else [])
+    cmd += ([f"f:{rf}"] if resid else []) + ([f"f:{mf}"] if rem else []) + [f"io:{sf}:{of}"] + ([f"o:{nab}:{abf}"] if bfp else []) + ([f"io:{sf}:{gfo}"] if qg else [])
     if qg:
         cmd[cmd.index(f"{c.nbytes},{obytes}")] = f"{c.nbytes},{obytes},{obytes}"
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=dict(os.environ, HAL_RUN_ITERS="4"))
@@ -107,6 +113,21 @@ def main():
         print(f"  swiglu: max {ulp.max()} f16 ulp, {np.count_nonzero(ulp)} of {ulp.size} differ by 1")
     else:
         ok = np.array_equal(sl.view(np.uint16 if out16 else np.uint32), want.view(np.uint16 if out16 else np.uint32))
+    if bfp:   # row blocks of the chunks' k-blocks inside [off, off + 64 cols)
+        ab = np.fromfile(abf, np.uint8)
+        badb = tot = 0
+        for ci in range(stride // CK):
+            lo, hi = max(off, ci * CK), min(off + 64 * cols, (ci + 1) * CK)
+            if lo >= hi:
+                continue
+            ref, offs = B.reference(np.ascontiguousarray(got[:, ci * CK:(ci + 1) * CK].astype(np.float16)), "act", tokens, KS, 5,
+                                    64, True)
+            for kb in range((lo - ci * CK) // 8, (hi - ci * CK) // 8):
+                idx = (offs[:, kb][:, None] + np.arange(72)[None, :]).reshape(-1)
+                badb += int(np.count_nonzero(ab[ci * cbytes + idx] != ref[idx])); tot += idx.size
+        print(f"  bfp: {badb} of {tot} stream bytes differ")
+        ok = ok and badb == 0
+        os.remove(abf)
     rest = np.delete(got, np.s_[off:off + 64 * cols], axis=1)
     kept = bool(np.isnan(rest).all())
     mode = "".join(f" {k}" for k, v in (("f16", out16), ("resid", resid), ("rem", rem), ("swiglu", swiglu), ("tiled", tiled)) if v)

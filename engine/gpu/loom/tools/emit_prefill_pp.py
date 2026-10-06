@@ -777,6 +777,23 @@ def npu_split(rows, combos, B, outdir):
         chunked = len(chunks) > 1 or npu_rem(site)
         for ci, chunk in enumerate(chunks):
             encs.add((K, ci if chunked else None, chunk))
+    # the ffn unpack writes down's BFP16 input for its columns (gen_npu_unpack bfp): down's chunks there need only their
+    # leading k-blocks encoded ("npu_enc_17408_c<i>p")
+    ffn_bfp = "ffn" in NPU_SPLIT and "down" in NPU_SPLIT
+    if ffn_bfp:
+        ffn_off = NPU_SITES["ffn"][1] * 16 - NPU_SPLIT["ffn"]
+        assert NPU_SITES["ffn"][1] * 16 == NPU_SITES["down"][2] * 256
+        for ci, (k_off, passes) in enumerate(npu_chunks("down")):
+            cover = min(k_off + 1024 * passes, ffn_off) - k_off
+            if 0 < cover < 1024 * passes:
+                for tiled in (False, True):
+                    name = "npu_enc_17408_c%dp%s.hal" % (ci, "_t" if tiled else "")
+                    src = os.path.join(tmp, name[:-4] + ".loom")
+                    open(src, "w").write(GE.gen("act", B, list(NPU_KS), passes, tiled=tiled, k_off=k_off, k_src=17408,
+                                                kb_count=cover // 8))
+                    E.emit(src, ["nop=0"], name, outdir)
+                    out.append((name, B // 8 * (cover // 8) // GE.WG, GE.WG, 0))
+        out.append(("npuffnbfp", ffn_off, 0, 0))
     for K, ci, (k_off, passes) in sorted(encs, key=lambda x: (x[0], -1 if x[1] is None else x[1])):
         for tiled in (False, True):
             name = "npu_enc_%d%s%s.hal" % (K, "" if ci is None else "_c%d" % ci, "_t" if tiled else "")
@@ -793,6 +810,8 @@ def npu_split(rows, combos, B, outdir):
                  "out": [dict(resid=True, parts=len(npu_chunks("out")), rem=True)],
                  "down": [dict(resid=True, parts=len(npu_chunks("down")), rem=True)],
                  "ffn": [dict(swiglu=True), dict(swiglu=True, tiled=True)]}[site]
+        if site == "ffn" and ffn_bfp:
+            forms = [dict(f, bfp=(NPU_KS, NPU_PASSES, 1024 * NPU_PASSES, len(npu_chunks("down")))) for f in forms]
         for f in forms:
             name = "npu_unpack_%s%s.hal" % (site, "_t" if f.get("tiled") else "")
             src = os.path.join(tmp, name[:-4] + ".loom")

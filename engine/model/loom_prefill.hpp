@@ -821,8 +821,7 @@ class LoomPrefill {
       RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, gate_af, gs, nn);
       RunSwigluSplit(pre + "ffn_up.weight", up_af, us, nn);
       Cut(Segment::kJoin);
-      NpuUnpack(down_af ? "npu_unpack_ffn_t.hal" : "npu_unpack_ffn.hal", {cg.offset, cg.length + cu.length},
-                {Ref(*ffnup_)}, 2);
+      FfnUnpack(down_af, {cg.offset, cg.length + cu.length});
     } else {
       RunKstore(pre + "ffn_gate.weight", *gateffn_, gate_af);
       RunSwiglu(pre + "ffn_up.weight", up_af, down_af);
@@ -866,8 +865,7 @@ class LoomPrefill {
       Dispatch(Exe(sh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(),
                (MTiles(*tg) - nn / 16) / GeomOf(sh).rowgrp, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
       Cut(Segment::kJoin);
-      NpuUnpack(down_af ? "npu_unpack_ffn_t.hal" : "npu_unpack_ffn.hal", {cg.offset, cg.length + cu.length},
-                {Ref(*ffnup_)}, 2);
+      FfnUnpack(down_af, {cg.offset, cg.length + cu.length});
     } else {
       Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), MTiles(*tg) / g.rowgrp, tt, 1, 32, 1,
                1, b, GemmWrites(b, f, {ffnup_}));
@@ -1034,19 +1032,42 @@ class LoomPrefill {
   // input (row-major, or fragment-major with tiled) encoded into A for each of the site's K chunks; their A views.
   std::vector<NpuView> NpuEncode(const std::string& site, const LoomBuffer& input, bool tiled) {
     const auto chunks = NpuChunks(site);
+    // down after an ffn unpack that wrote its columns (FfnUnpack): only each chunk's columns before them
+    const bool from_ffn = site == "down" && ffn_bfp_;
+    ffn_bfp_ = false;
+    const std::uint32_t ffn_cols = from_ffn ? geom_.at("npuffnbfp").tokens : NpuSiteK(site);
     std::vector<NpuView> views;
     std::size_t off = 0;
     for (std::size_t c = 0; c < chunks.size(); ++c) {
-      const std::string hal = "npu_enc_" + std::to_string(NpuSiteK(site)) + (NpuChunked(site) ? "_c" + std::to_string(c) : "") +
-                              (tiled ? "_t" : "") + ".hal";
-      const Geom& g = geom_.at(hal);
       const std::size_t bytes = NpuK(chunks[c].second).a;
-      Dispatch(Exe(hal), "yah_bfp16_encode_act", g.tokens, 1, 1, g.rowgrp, 1, 1,
-               {Ref(input), {npu_->A().handle, off, bytes}}, 2);
+      const auto [k0, K] = chunks[c];
+      const std::uint32_t cover = ffn_cols > k0 ? std::min(K, ffn_cols - k0) : 0;
+      if (cover) {
+        const std::string hal = "npu_enc_" + std::to_string(NpuSiteK(site)) + (NpuChunked(site) ? "_c" + std::to_string(c) : "") +
+                                (cover < K ? "p" : "") + (tiled ? "_t" : "") + ".hal";
+        const Geom& g = geom_.at(hal);
+        Dispatch(Exe(hal), "yah_bfp16_encode_act", g.tokens, 1, 1, g.rowgrp, 1, 1,
+                 {Ref(input), {npu_->A().handle, off, bytes}}, 2);
+      }
       views.push_back({off, bytes});
       off += bytes;
     }
     return views;
+  }
+  // The ffn site's unpack: f16(silu(gate) * up) into ffnup_ (fragment-major for an afrag down). With "npuffnbfp" (down
+  // split too) it also writes down's BFP16 input for the ffn's NPU columns into A at down's chunk offsets, and
+  // NpuEncode("down") encodes only the columns before them.
+  void FfnUnpack(bool tiled, NpuView c) {
+    std::vector<hrx_buffer_ref_t> rest = {Ref(*ffnup_)};
+    std::uint64_t writes = 2;
+    ffn_bfp_ = geom_.count("npuffnbfp") && NpuRows("down");
+    if (ffn_bfp_) {
+      std::size_t bytes = 0;
+      for (const auto& [k0, K] : NpuChunks("down")) bytes += NpuK(K).a;
+      rest.push_back({npu_->A().handle, 0, bytes});
+      writes |= 4;
+    }
+    NpuUnpack(tiled ? "npu_unpack_ffn_t.hal" : "npu_unpack_ffn.hal", c, rest, writes);
   }
   // The NPU's rows of wname (its last rows) decoded straight into W panels from w_off within this job's W slot
   // ("dqbfp_<fmt>_<mt>_<kb>[_c<i>]", dispatch.txt: <workgroups> <workgroup size>); the W views per chunk and call.
@@ -1559,7 +1580,8 @@ class LoomPrefill {
   NpuSplit* npu_ = nullptr;        // EnableNpu
   bool npu_on_ = false;            // this chunk splits with the NPU
   bool npu_planning_ = false;      // EnableNpu's binding pass: Dispatch records nothing
-  LoomBuffer* npurem_ = nullptr;   // the GPU's K remainder of the NPU's out / down rows (f32 [tokens][rows])
+  LoomBuffer* npurem_ = nullptr;
+  bool ffn_bfp_ = false;           // the last ffn unpack wrote down's BFP16 input for its columns (FfnUnpack)   // the GPU's K remainder of the NPU's out / down rows (f32 [tokens][rows])
   LoomGraph* npu_prev_ = nullptr;  // the last NPU job's GPU segment (NpuDecode records the next job's decode there)
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
   std::map<std::string, std::uint32_t> npu_rows_;  // NPU rows per site (dispatch.txt "npusplit_<site>")
