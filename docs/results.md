@@ -26,6 +26,8 @@ NPU GEMM path pieces (2026-10-06; checks byte-exact against numpy oracles):
 | NPU cascade GEMM, 32 tiles, K = 5120, M = 8192, N = 512 (marginal) | 20.7 TMAC/s (~70% of the tile MMA rate) |
 | GPU-encoded real layer-0 qkv operands through the NPU GEMM, rel RMS vs unquantized | 3.3e-3 |
 
+The split end to end on one stream (`tools/npu_split_check.py`, 2026-10-06; layer-0 attn_qkv Q3_K, 2048 x 10240 x 5120, 4096 rows on the NPU in 8 calls): 5.97 ms vs 5.30 ms for the whole GEMM on the GPU. Device timestamps: activation encode 0.31 ms, dequant 0.27, weight encode 0.56, GPU share 3.14 (beside the NPU), unpack 0.68 (each lane stores 32 bytes 40 KB from its neighbor). The NPU takes 3.75 ms (3.02 with the GPU idle): every call streams all 11.9 MB of activations (~45 GB/s), so it competes with the GPU for DRAM. With the operands in registered host pages (snooped) instead of DMA-BUF-shared device buffers, the encoders ran at ~25 GB/s (weight encode 0.95 ms). The encode -> NPU -> unpack chain is the critical path; the GPU share is not.
+
 OS power knobs under a 32K prefill (2026-10-05): the CPU cores draw 0.2 W during prefill (RAPL), so there is nothing to take from them; forcing the data fabric down (manual DPM, `pp_dpm_fclk` level 1 or 2, both ~1105 MHz, which also pulls the memory clock 999 -> 821 MHz) saves ~5 W of socket power but the GPU clock stays put at its 95 C hotspot limit and the prefill runs 1.6-3.4% slower; `pp_dpm_mclk` cannot be forced on this APU; platform profiles change nothing.
 
 pp8192 rounds from the same <= 55 C start vary by up to ~5% in wall time with the GPU clock (2.0-2.1 GHz) while their counter cycles match to 0.03%, so compare pp8192 on cycles.
