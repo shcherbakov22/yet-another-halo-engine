@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Emit the GPU BFP16 encoder: an f16 [rows][K] matrix to NPU bfp16ebs8 fragments in the cascade GEMM's stream layout.
 
-Fragment = 8 rows x 8 consecutive k: per row [E u8][8 x int8 m], value = m * 2^(E - 133), 72 bytes. E is the f32 exponent
-field of the row block's max |x| (0 for an all-zero block), m = clamp(roundeven(x * 2^(133 - E)), -128, 127). A slab is
-16 rows x KS k-blocks: per k-block the fragments of rows 0-7 then 8-15 (144 bytes), padded to 64 bytes.
+Fragment = 8 rows x 8 consecutive k: per row [E u8][8 x int8 m], value = m * 2^(E - 133), 72 bytes.
+E is the f32 exponent field of the row block's max |x| (0 for an all-zero block); m = clamp(roundeven(x * 2^(133 - E)), -128, 127).
+A slab is 16 rows x KS k-blocks: per k-block the fragments of rows 0-7 then 8-15 (144 bytes), padded to 64 bytes.
 
 The NPU GEMM splits K per pass over the column's rows (K-slices with ks[r] k-blocks each, PK = sum(ks) per pass).
   act: [slice][M block][pass][MP slabs]   rows = tokens, MP = TM / 16 slabs per M block

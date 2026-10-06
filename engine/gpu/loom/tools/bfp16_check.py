@@ -5,7 +5,7 @@ usage: bfp16_check.py <model.gguf> <workdir> act|wgt <rows> <ks,ks,...> <passes>
 
 The input is an f16 [rows][K] file (e.g. a YAH_DUMP_ACT dump) or random rows with a wide per-row dynamic range.
 Every work item's store range is simulated first; the kernel is dispatched only if all of them fit the output.
-Writes <workdir>/<layout>.bfp (the encoded stream) for reuse by the NPU harness.
+Writes <workdir>/<layout>.bfp (the encoded stream) for the NPU harness.
 """
 import os
 import subprocess

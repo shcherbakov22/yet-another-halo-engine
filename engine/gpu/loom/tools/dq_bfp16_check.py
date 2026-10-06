@@ -3,10 +3,10 @@
 
 usage: dq_bfp16_check.py <model.gguf> <workdir> <tensor> <npu_rows> <ks,ks,...> <passes>
 
-Takes the last <npu_rows> output features of <tensor> (the NPU computes the trailing columns), dequantizes them with
-yah_dequant_<fmt> (the same decode as the GPU GEMMs) and checks the f16 against gguf-py's dequantization, then encodes
-them into the cascade GEMM's weight stream with yah_bfp16_encode_wgt and checks those bytes against the numpy oracle of
-the GPU f16. Writes <workdir>/dq.f16 and <workdir>/wgt.bfp.
+Takes the last <npu_rows> output features of <tensor> (the NPU computes the trailing columns).
+Dequantizes them with yah_dequant_<fmt> (the GPU GEMMs' decode) and checks the f16 against gguf-py.
+Encodes that f16 into the cascade GEMM's weight stream with yah_bfp16_encode_wgt and checks the bytes against the numpy oracle.
+Writes <workdir>/dq.f16 and <workdir>/wgt.bfp. Needs PYTHONPATH with llama.cpp's gguf-py.
 """
 import dataclasses
 import os
@@ -17,19 +17,18 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-sys.path.insert(0, "/home/q/llama.cpp/gguf-py")
 import bfp16_check as B  # noqa: E402
 import gen_bfp16_encode as GE  # noqa: E402
 import gen_gemm_tile as TG  # noqa: E402
 
 EMIT = B.EMIT
 HALRUN, GPURUN = B.HALRUN, B.GPURUN
-TABLE_DIR = os.environ.get("YAH_TABLE_DIR", "/home/q/yah-hal-p72")
+TABLE_DIR = os.path.join(HERE, "..", "tables")
 
 
 def table_file(fmt, extra):
     """The tile GEMM's LDS table bindings: the format's grid, and the IQ2 sign table."""
-    return os.path.join(TABLE_DIR, "ksigns_iq2xxs.bin" if extra == "ksigns" else f"grid_{fmt}.bin")
+    return os.path.join(TABLE_DIR, "ksigns_iq2xs.bin" if extra == "ksigns" else f"grid_{fmt}.bin")
 FMT = {"Q3_K": "q3k", "Q4_K": "q4k", "Q5_K": "q5k", "Q6_K": "q6k", "IQ4_XS": "iq4xs", "IQ3_XXS": "iq3xxs",
        "IQ3_S": "iq3s", "IQ2_XXS": "iq2xxs", "IQ2_XS": "iq2xs", "Q8_0": "q8_0"}
 
@@ -59,7 +58,7 @@ def main():
     wf = os.path.join(work, "dq.w")
     share.tofile(wf)
     ref = quants.dequantize(share, t.tensor_type).astype(np.float16)   # [nn][K]
-    # the dequant kind, configured as the driver's decode-free path builds it
+    # the dequant kind as emit_prefill_pp.decode_free builds it
     dt = TG.default_tile(fmt, "kstore", K // 256)
     dt = dataclasses.replace(dt, bm=64, wm=2, wn=4, decahead=False, ksub=64, dbuf=False)
     kb = K // 256 * TG.G.FMTS[fmt].get("kdiv", 1)          # k_blocks counts the format's blocks (q8_0: 32 wide)

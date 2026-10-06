@@ -109,6 +109,14 @@ Off since 2026-10-03: the server does not call `EnableCalibration`, and sets car
 
 Chunked sets also carry a calibration menu: for each tile GEMM, up to 8 `<gemm>.m<i>.hal` tiles one knob away from its own (decode-ahead, KSUB, waves, token tile), built in parallel by the emitter and kept only if they hash the same as the GEMM at a full and a partial chunk, twice. The server (`model/prefill_calib.hpp`) picks among the GEMM, its narrow variants and its menu per token bucket (64 ... 2048) from real prefills: while a bucket is open, each occurrence runs the plain GEMM or the least-sampled open challenger, the chunk's graph is profiled in-process (HRX patch 0006, about 0.2% cost), and each challenger occurrence is timed by the span of its overlap group against the plain GEMM in the same chunk (one clock, no temperature drift). Clearly slower arms drop out; a bucket closes on one arm or 12 samples each and takes a challenger only if it is clearly faster. The state lives in `$XDG_CACHE_HOME/yah/calib-<set>.txt` (a re-emit starts over). Outputs are bit-identical whatever runs; only time moves. Buckets of GEMMs that run a few times per chunk need many prompts to close.
 
+### NPU GEMM path (in progress)
+
+Plan: split each large prefill GEMM by output columns at a runtime ratio; the NPU (XDNA2, 32 compute tiles through HRX `.xdna`) computes the trailing columns, the GPU the rest. Not wired into the driver yet.
+
+The NPU multiplies one-pass BFP16 (`bfp16ebs8`) operands with f32 accumulation. A fragment is 8 rows x 8 consecutive k: per row `[E u8][8 x int8 m]`, value `m * 2^(E - 133)`, 72 bytes; E is the f32 exponent field of the block's max |x|. The NPU GEMM is a cascade: per column, 3 rows compute K-slice partials and pass them down the accumulator cascade, the 4th row adds its slice and holds C across passes.
+
+The GPU writes both operand streams in the NPU's layout (`tools/gen_bfp16_encode.py`): activations from the f16 GEMM input (`yah_bfp16_encode_act`), weights from the NPU's rows decoded by the tile GEMM's dequant kind (`yah_dequant_<fmt>`, f16 `[rows][K]`) into a transient scratch (`yah_bfp16_encode_wgt`). No weight copy persists. `tools/bfp16_check.py` and `tools/dq_bfp16_check.py` check both against numpy oracles byte for byte, for every model format.
+
 ## Engine
 
 `engine/model/engine.hpp` (`Engine`) loads the model, a chunked prefill set and a decode set once and serves `Generate(prompt, params, on_token)` calls one at a time (the `TextGenerator` interface in `engine/model/generator.hpp`; the server in `engine/serve/` talks only to that). Per request: reset the recurrent state, prefill the whole chunks, finish the tail with a partial chunk or with decode steps (whichever its measured costs say is cheaper), then decode. Greedy picks the argmax on the GPU; temperature / top_p sample on the host from the logits.
