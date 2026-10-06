@@ -1356,7 +1356,7 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
         if co:
             e(f"  %et_ql{y} = index.constant {tpa * q * (sr + EPAD)} : index")
             e(f"  %et_qk{y} = index.constant {tpa * q} : index")
-            e(f"  %et_qg{y} = index.mul %et_qk{y}, %m_rows : index")
+            e(f"  %et_qg{y} = index.mul %et_qk{y}, {orw()} : index")
             return f"%et_ql{y}", f"%et_qg{y}"
         e(f"  %et_q{y}c = index.constant {4 * q} : index")
         return f"%et_q{y}c", f"%et_q{y}c"
