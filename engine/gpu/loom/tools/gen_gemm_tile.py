@@ -243,7 +243,7 @@ DQ_BLOCKS = 4
 DQ_WGS = 20
 
 # Column split with the NPU (emit_prefill_pp NPU_SPLIT): the GPU computes output rows [0, m_tiles * 16) of a wider
-# matrix; OSTRIDE (> 0) is the full row count, the output's token stride. kstore only.
+# matrix; OSTRIDE (> 0) is the full row count, the output's (and kres residual's) token stride. kstore / kres.
 OSTRIDE = 0
 
 
@@ -390,7 +390,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %tokens = index.mul %token_tiles, %cwtok : index")
     e("  %m_rows = index.mul %m_tiles, %c16 : index")
     if OSTRIDE:
-        assert kind == "kstore" and not t.tout, "the NPU column split is kstore only"
+        assert kind in ("kstore", "kres") and not t.tout, "the NPU column split covers kstore / kres"
         e(f"  %o_rows = index.constant {OSTRIDE} : index")
     e("  %bpr = index.mul %k_blocks, %cbb : index")
     e("  %hpr = index.mul %k_blocks, %cbbh : index")

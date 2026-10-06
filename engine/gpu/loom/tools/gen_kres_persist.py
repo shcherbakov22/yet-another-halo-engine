@@ -59,6 +59,8 @@ def _rename(lines, names, suffix):
 
 def persist(kres_text, kstore_text, ntiles, lanes=512, bn=512, bm=128):
     L = kres_text.rstrip("\n").split("\n")
+    # the token stride of output / residual: a column-split kres (gen_gemm_tile.OSTRIDE) defines %o_rows
+    orows = "%o_rows" if any(l.strip().startswith("%o_rows = ") for l in L) else "%m_rows"
     S = kstore_text.rstrip("\n").split("\n")
     iwx = next(i for i, l in enumerate(L) if l.strip().startswith("%wg_x = kernel.workgroup.id<x>"))
     iwr = next(i for i, l in enumerate(L) if l.strip().startswith("%wg_row = index.mul %wg_x"))
@@ -94,7 +96,7 @@ def persist(kres_text, kstore_text, ntiles, lanes=512, bn=512, bm=128):
                 f"  %{p}c = index.rem %{p}v, %ps_c32 : index",
                 f"  %{p}tb = index.mul {ty}, %ps_bn : index",
                 f"  %{p}t = index.add %{p}tb, %{p}tok : index",
-                f"  %{p}a0 = index.mul %{p}t, %m_rows : index",
+                f"  %{p}a0 = index.mul %{p}t, {orows} : index",
                 f"  %{p}a1 = index.add %{p}a0, {row} : index",
                 f"  %{p}c4 = index.mul %{p}c, %ps_c4 : index",
                 f"  %{p}off = index.add %{p}a1, %{p}c4 : index"], f"%{p}off"

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Check the GPU half of an NPU column split: kstore over rows [0, N - npu_rows) at the full output stride.
+"""Check the GPU half of an NPU column split: a kstore / kres over rows [0, N - npu_rows) at the full output stride.
 
-usage: split_gemm_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [af]
+usage: split_gemm_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [plain|af|afp] [kres]
 
-Runs the set's kstore GEMM for <tensor> over all N rows, then the split variant (gen_gemm_tile.OSTRIDE = N) into an
-output filled with NaN. The split variant's rows must equal the full GEMM bit for bit and the NPU's trailing rows of
-every token must stay NaN. act.f16 is a [B][K] GEMM input (e.g. a YAH_DUMP_ACT dump).
-af: the afrag form with emit_prefill_pp's knobs for the full shape (input fragment-major); the output is f16 when the
-full shape is in emit_prefill_pp.O16_MT, as in the prefill set.
+Runs the set's GEMM for <tensor> over all N rows, then the split variant (gen_gemm_tile.OSTRIDE = N) into an output
+filled with NaN. The split variant's rows must equal the full GEMM bit for bit and the NPU's trailing rows of every
+token must stay NaN. act.f16 is a [B][K] GEMM input (e.g. a YAH_DUMP_ACT dump).
+af: the afrag form with emit_prefill_pp's knobs for the full shape (input fragment-major); afp: its persistent kres
+(gen_kres_persist, grid y = 1). The kstore output is f16 when the full shape is in emit_prefill_pp.O16_MT, as in the
+prefill set. kres: out = resid + W x, with a random f32 residual.
 Needs PYTHONPATH with llama.cpp's gguf-py.
 """
 import os
@@ -20,6 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import dataclasses  # noqa: E402
 import dq_bfp16_check as DQ  # noqa: E402
+import gen_kres_persist  # noqa: E402
 import emit_prefill_pp as EP  # noqa: E402
 import gen_gemm_tile as TG  # noqa: E402
 
@@ -27,22 +29,28 @@ EMIT = DQ.EMIT
 HALRUN, GPURUN = DQ.HALRUN, DQ.GPURUN
 
 
-def tile(fmt, kb, n, af):
-    """The prefill set's kstore tile for an n-row matrix: the afrag form with its emit_prefill_pp.AF knobs, or the default."""
-    if not af:
-        return TG.default_tile(fmt, "kstore", kb)
-    knobs = dict(EP.AF[(fmt, "kstore", n // 16, kb)])
-    knobs.pop("persist", None)
-    return dataclasses.replace(TG.default_tile(fmt, "kstore", kb), **EP.AF_TILE, **knobs)
+def tile(fmt, kind, kb, n, mode):
+    """The prefill set's tile for an n-row matrix: the afrag form with its emit_prefill_pp.AF knobs, or the default.
+    Returns (tile, persist knobs or None)."""
+    if mode == "plain":
+        return TG.default_tile(fmt, kind, kb), None
+    knobs = dict(EP.AF[(fmt, kind, n // 16, kb)])
+    persist = knobs.pop("persist", None)
+    t = dataclasses.replace(TG.default_tile(fmt, kind, kb), **EP.AF_TILE, **knobs)
+    return t, (dataclasses.replace(t, **persist) if isinstance(persist, dict) else t) if persist else None
 
 
-def emit(work, tag, fmt, t, mt, kb, tt, ostride, out16=False):
+def emit(work, tag, fmt, kind, t, mt, kb, tt, ostride, out16=False, persist=None, ntiles=0):
     TG.OSTRIDE, TG.OUT16 = ostride, out16
     try:
-        text = TG.gen(fmt, "kstore", t)
+        if persist is not None:
+            text = gen_kres_persist.persist(TG.gen(fmt, "kres", persist, False),
+                                            TG.gen(fmt, "kstore", dataclasses.replace(persist, respre=0), False), ntiles)
+        else:
+            text = TG.gen(fmt, kind, t)
     finally:
         TG.OSTRIDE, TG.OUT16 = 0, False
-    sym = "yah_ffn_gemm_" + fmt
+    sym = "yah_ffn_gemm_" + fmt + ("_kres" if kind == "kres" else "")
     src = os.path.join(work, tag + ".loom")
     open(src, "w").write(text)
     r = subprocess.run([sys.executable, EMIT, src, os.path.join(work, tag), f"{sym}.m_tiles={mt}", f"{sym}.k_blocks={kb}",
@@ -65,14 +73,21 @@ def main():
     x = np.fromfile(act, np.float16)
     B = x.size // K
     kb = K // 256 * TG.G.FMTS[fmt].get("kdiv", 1)
-    af = len(sys.argv) > 6 and sys.argv[6] == "af"
-    t = tile(fmt, kb, N, af)
-    out16 = N // 16 in EP.O16_MT
+    mode = sys.argv[6] if len(sys.argv) > 6 else "plain"
+    kind = sys.argv[7] if len(sys.argv) > 7 else "kstore"
+    af = mode != "plain"
+    t, pt = tile(fmt, kind, kb, N, mode)
+    pt = pt if mode == "afp" else None
+    out16 = kind == "kstore" and N // 16 in EP.O16_MT
     mt, mtg = N // 16, (N - nn) // 16
     assert nn % 16 == 0 and mtg % t.rowgrp == 0 and B % t.bn == 0
     tt = B // t.bn
-    full = emit(work, "full", fmt, t, mt, kb, tt, 0, out16)
-    split = emit(work, "split", fmt, t, mtg, kb, tt, N, out16)
+    full = emit(work, "full", fmt, kind, t, mt, kb, tt, 0, out16, pt, tt)
+    split = emit(work, "split", fmt, kind, t, mtg, kb, tt, N, out16, pt, tt)
+    gy = 1 if pt else tt
+    resid = os.path.join(work, "resid.f32")
+    if kind == "kres":
+        np.random.default_rng(5).standard_normal(B * N).astype(np.float32).tofile(resid)
     if af:   # fragment-major input: [token / 16][k / 16][token % 16][k % 16]
         act_t = os.path.join(work, "act_t.f16")
         x.reshape(B // 16, 16, K // 16, 16).transpose(0, 2, 1, 3).tofile(act_t)
@@ -83,9 +98,11 @@ def main():
     env = dict(os.environ, HAL_RUN_ITERS="1")
 
     def run(hal, gx, out_spec):
-        mins = ",".join(str(v) for v in [0] + [os.path.getsize(f) for f in tables] + [B * K * 2, wst, ost, N * B * esz])
-        cmd = [GPURUN, "split-gemm", "--", HALRUN, model, hal, f"{gx},{tt}", str(t.lanes), mins, f"t:{name}"]
-        cmd += [f"f:{f}" for f in tables] + [f"f:{act}", f"o:{wst}:/dev/null", f"o:{ost}:/dev/null", out_spec]
+        rs = [B * N * 4] if kind == "kres" else []
+        mins = ",".join(str(v) for v in [0] + [os.path.getsize(f) for f in tables] + [B * K * 2] + rs + [wst, ost, N * B * esz])
+        cmd = [GPURUN, "split-gemm", "--", HALRUN, model, hal, f"{gx},{gy}", str(t.lanes), mins, f"t:{name}"]
+        cmd += [f"f:{f}" for f in tables] + [f"f:{act}"] + ([f"f:{resid}"] if kind == "kres" else [])
+        cmd += [f"o:{wst}:/dev/null", f"o:{ost}:/dev/null", out_spec]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
         if "hal_run: ok" not in r.stdout:
             sys.exit(f"hal_run failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
@@ -100,9 +117,9 @@ def main():
     ysplit = np.fromfile(ys, dt).reshape(B, N)
     gpu_same = np.array_equal(yfull[:, :N - nn].view(it), ysplit[:, :N - nn].view(it))
     npu_kept = bool(np.isnan(ysplit[:, N - nn:]).all())
-    print(f"{name} ({fmt}{', afrag' if af else ''}{', f16 out' if out16 else ''}) N={N} K={K} B={B}: GPU rows [0, {N - nn}) {'bit-identical' if gpu_same else 'DIFFER'} to the"
+    print(f"{name} ({fmt} {kind}{' ' + mode if af else ''}{', f16 out' if out16 else ''}) N={N} K={K} B={B}: GPU rows [0, {N - nn}) {'bit-identical' if gpu_same else 'DIFFER'} to the"
           f" full GEMM; NPU rows [{N - nn}, {N}) {'untouched' if npu_kept else 'WRITTEN'}")
-    for f in (yf, ys, sentinel) + ((act,) if af else ()):
+    for f in (yf, ys, sentinel) + ((act,) if af else ()) + ((resid,) if kind == "kres" else ()):
         os.remove(f)
     sys.exit(0 if gpu_same and npu_kept else 1)
 
