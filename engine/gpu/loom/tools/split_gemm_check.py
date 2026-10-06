@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Check the GPU half of an NPU column split: a kstore / kres over rows [0, N - npu_rows) at the full output stride.
 
-usage: split_gemm_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [plain|af|afp] [kres]
+usage: split_gemm_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [plain|af|afp|afto] [kstore|kres|swiglu|ffn]
 
 Runs the set's GEMM for <tensor> over all N rows, then the split variant (gen_gemm_tile.OSTRIDE = N) into an output
 filled with NaN. The split variant's rows must equal the full GEMM bit for bit and the NPU's trailing rows of every
 token must stay NaN. act.f16 is a [B][K] GEMM input (e.g. a YAH_DUMP_ACT dump).
 af: the afrag form with emit_prefill_pp's knobs for the full shape (input fragment-major); afp: its persistent kres
 (gen_kres_persist, grid y = 1). The kstore output is f16 when the full shape is in emit_prefill_pp.O16_MT, as in the
-prefill set. kres: out = resid + W x, with a random f32 residual.
+prefill set. kres: out = resid + W x, with a random f32 residual. swiglu (tensor: ffn_up): out = f16(silu(gate) * W x)
+with a random f32 gate; ffn (tensor: ffn_gate): the fused gate + up GEMM (emit_prefill_pp.AF_FFN), its weights the gate
+tensor then the up tensor. afto: the afrag form with fragment-major output (the afrag down projection's input).
 Needs PYTHONPATH with llama.cpp's gguf-py.
 """
 import os
@@ -34,9 +36,12 @@ def tile(fmt, kind, kb, n, mode):
     Returns (tile, persist knobs or None)."""
     if mode == "plain":
         return TG.default_tile(fmt, kind, kb), None
+    if kind == "ffn":
+        t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **EP.AF_TILE, **EP.AF_FFN[fmt], ffn=True)
+        return dataclasses.replace(t, tout=mode == "afto"), None
     knobs = dict(EP.AF[(fmt, kind, n // 16, kb)])
     persist = knobs.pop("persist", None)
-    t = dataclasses.replace(TG.default_tile(fmt, kind, kb), **EP.AF_TILE, **knobs)
+    t = dataclasses.replace(TG.default_tile(fmt, kind, kb), **EP.AF_TILE, **knobs, tout=mode == "afto")
     return t, (dataclasses.replace(t, **persist) if isinstance(persist, dict) else t) if persist else None
 
 
@@ -50,7 +55,7 @@ def emit(work, tag, fmt, kind, t, mt, kb, tt, ostride, out16=False, persist=None
             text = TG.gen(fmt, kind, t)
     finally:
         TG.OSTRIDE, TG.OUT16 = 0, False
-    sym = "yah_ffn_gemm_" + fmt + ("_kres" if kind == "kres" else "")
+    sym = "yah_ffn_gemm_" + fmt + {"kres": "_kres", "swiglu": "_swiglu", "ffn": "_ffn"}.get(kind, "")
     src = os.path.join(work, tag + ".loom")
     open(src, "w").write(text)
     r = subprocess.run([sys.executable, EMIT, src, os.path.join(work, tag), f"{sym}.m_tiles={mt}", f"{sym}.k_blocks={kb}",
@@ -78,7 +83,16 @@ def main():
     af = mode != "plain"
     t, pt = tile(fmt, kind, kb, N, mode)
     pt = pt if mode == "afp" else None
-    out16 = kind == "kstore" and N // 16 in EP.O16_MT
+    out16 = (kind == "kstore" and N // 16 in EP.O16_MT) or kind in ("swiglu", "ffn")
+    tout = mode == "afto"
+    wfile = None
+    if kind == "ffn":   # one weight binding: the gate tensor, then the up tensor
+        up = next(x for x in rd.tensors if x.name == name.replace("ffn_gate", "ffn_up"))
+        wfile = os.path.join(work, "w_ffn.bin")
+        np.concatenate([np.asarray(tn.data).reshape(-1), np.asarray(up.data).reshape(-1)]).tofile(wfile)
+    gfile = os.path.join(work, "gate.f32")
+    if kind == "swiglu":
+        (np.random.default_rng(6).standard_normal(B * N) * 2).astype(np.float32).tofile(gfile)
     mt, mtg = N // 16, (N - nn) // 16
     assert nn % 16 == 0 and mtg % t.rowgrp == 0 and B % t.bn == 0
     tt = B // t.bn
@@ -98,10 +112,12 @@ def main():
     env = dict(os.environ, HAL_RUN_ITERS="1")
 
     def run(hal, gx, out_spec):
-        rs = [B * N * 4] if kind == "kres" else []
+        rs = [B * N * 4] if kind in ("kres", "swiglu") else []
         mins = ",".join(str(v) for v in [0] + [os.path.getsize(f) for f in tables] + [B * K * 2] + rs + [wst, ost, N * B * esz])
-        cmd = [GPURUN, "split-gemm", "--", HALRUN, model, hal, f"{gx},{gy}", str(t.lanes), mins, f"t:{name}"]
+        cmd = [GPURUN, "split-gemm", "--", HALRUN, model, hal, f"{gx},{gy}", str(t.lanes), mins,
+               f"f:{wfile}" if wfile else f"t:{name}"]
         cmd += [f"f:{f}" for f in tables] + [f"f:{act}"] + ([f"f:{resid}"] if kind == "kres" else [])
+        cmd += [f"f:{gfile}"] if kind == "swiglu" else []
         cmd += [f"o:{wst}:/dev/null", f"o:{ost}:/dev/null", out_spec]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
         if "hal_run: ok" not in r.stdout:
@@ -113,13 +129,16 @@ def main():
     sentinel = os.path.join(work, "y_nan.f32")
     np.full(N * B, np.nan, dt).tofile(sentinel)
     run(split, mtg // t.rowgrp, f"io:{sentinel}:{ys}")
-    yfull = np.fromfile(yf, dt).reshape(B, N)
-    ysplit = np.fromfile(ys, dt).reshape(B, N)
+    def rows_major(y):   # fragment-major [token / 16][row / 16][16][16] -> [token][row]
+        return y.reshape(B // 16, N // 16, 16, 16).transpose(0, 2, 1, 3).reshape(B, N) if tout else y.reshape(B, N)
+    yfull = rows_major(np.fromfile(yf, dt))
+    ysplit = rows_major(np.fromfile(ys, dt))
     gpu_same = np.array_equal(yfull[:, :N - nn].view(it), ysplit[:, :N - nn].view(it))
     npu_kept = bool(np.isnan(ysplit[:, N - nn:]).all())
     print(f"{name} ({fmt} {kind}{' ' + mode if af else ''}{', f16 out' if out16 else ''}) N={N} K={K} B={B}: GPU rows [0, {N - nn}) {'bit-identical' if gpu_same else 'DIFFER'} to the"
           f" full GEMM; NPU rows [{N - nn}, {N}) {'untouched' if npu_kept else 'WRITTEN'}")
-    for f in (yf, ys, sentinel) + ((act,) if af else ()) + ((resid,) if kind == "kres" else ()):
+    for f in ((yf, ys, sentinel) + ((act,) if af else ()) + ((resid,) if kind == "kres" else ())
+              + ((wfile,) if wfile else ()) + ((gfile,) if kind == "swiglu" else ())):
         os.remove(f)
     sys.exit(0 if gpu_same and npu_kept else 1)
 

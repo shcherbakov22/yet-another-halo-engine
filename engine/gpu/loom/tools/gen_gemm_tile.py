@@ -243,7 +243,8 @@ DQ_BLOCKS = 4
 DQ_WGS = 20
 
 # Column split with the NPU (emit_prefill_pp NPU_SPLIT): the GPU computes output rows [0, m_tiles * 16) of a wider
-# matrix; OSTRIDE (> 0) is the full row count, the output's (and kres residual's) token stride. kstore / kres.
+# matrix; OSTRIDE (> 0) is the full row count: the token stride of the output (and kres residual, swiglu gate input),
+# the tile count of a fragment-major output, and for ffn the gate rows before the up rows. kstore / kres / swiglu / ffn.
 OSTRIDE = 0
 
 
@@ -391,7 +392,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %tokens = index.mul %token_tiles, %cwtok : index")
     e("  %m_rows = index.mul %m_tiles, %c16 : index")
     if OSTRIDE:
-        assert kind in ("kstore", "kres") and not t.tout, "the NPU column split covers kstore / kres"
+        assert kind in ("kstore", "kres", "swiglu", "ffn") and not MX, "the NPU column split: kstore / kres / swiglu / ffn"
         e(f"  %o_rows = index.constant {OSTRIDE} : index")
     dq_chunk = kind == "dequant" and DQ_BFP is not None and len(DQ_BFP) == 4
     if dq_chunk:   # weight rows keep their full length; the decode starts kb_start blocks in
@@ -410,7 +411,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  %w_halfs = index.div %w_bytes, %c2 : index")
     elif ff:
         # gate rows then up rows
-        e("  %w_rows = index.mul %m_rows, %c2 : index")
+        e(f"  %w_rows = index.mul {orw()}, %c2 : index")
         e("  %w_bytes = index.mul %w_rows, %bpr : index")
         e("  %w_halfs = index.mul %w_rows, %hpr : index")
     else:
@@ -542,7 +543,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         # m_rows further on in the binding (no branch: a branch around the loads drains vmcnt(0) at its join every phase)
         e("  %drow_g = index.rem %drow, %c64 : index")
         e("  %ff_up = index.cmp uge, %drow, %c64 : index")
-        e("  %ff_upr = scf.select %ff_up, %m_rows, %c0 : index")
+        e(f"  %ff_upr = scf.select %ff_up, {orw()}, %c0 : index")
         e("  %drow_t = index.add %drow_g, %ff_upr : index")
         e("  %drow_gi = index.cast %drow_t : index to i32")
         e("  %grow_i = scalar.addi %wg_row_i, %drow_gi : i32")
@@ -1525,7 +1526,7 @@ def _lds_epilogue_ffn(e, t, V8, sr=16):
     e("  %et_rd = index.add %et_tt, %et_h : index")
     e("  %et_rowb = index.add %m_origin, %et_h : index")
     if t.tout:
-        e("  %et_mt = index.div %m_rows, %c16 : index")
+        e(f"  %et_mt = index.div {orw()}, %c16 : index")
     for g in range(FG):
         e(f"  %et_gr{g} = index.constant {g * sr} : index")
         e(f"  %et_row{g} = index.add %et_rowb, %et_gr{g} : index")
@@ -1724,7 +1725,7 @@ def swiglu_epilogue(e, t, arow, masked=False):
     e(f"  %ep_n = index.constant {16 * ES // 32} : index")
     e(f"  %ep_last = index.constant {16 * ES - 1} : index")
     if t.tout:
-        e("  %ep_mt = index.div %m_rows, %c16 : index")
+        e(f"  %ep_mt = index.div {orw()}, %c16 : index")
     for i in range(FM):
         e(f"  %sr{i} = index.add %m_origin, %c{16 * i} : index")
         for h in range(TN // ES):
@@ -1746,7 +1747,7 @@ def swiglu_epilogue(e, t, arow, masked=False):
             e(f"    %v_{q} = view.load %ep_flat[%ef_{q}] : view<{16 * ES}xf32> -> f32")
             e(f"    %grow_{q} = index.add %sr{i}, %er_{q} : index")
             e(f"    %gtok_{q} = index.add %st{q}, %et_{q} : index")
-            e(f"    %gto_{q} = index.mul %gtok_{q}, %m_rows : index")
+            e(f"    %gto_{q} = index.mul %gtok_{q}, {orw()} : index")
             e(f"    %gix0_{q} = index.add %gto_{q}, %grow_{q} : index")
             if t.tout:
                 # the output fragment-major (the gate stays row-major): tile (token / 16, row / 16), row fastest inside
