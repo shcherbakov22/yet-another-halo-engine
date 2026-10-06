@@ -105,6 +105,10 @@ class LoomPrefill {
       if (name.rfind("npusplit_", 0) == 0) npu_rows_[name.substr(9)] = g.tokens;
     if (!npu || npu_rows_.empty()) throw LoomError("prefill: the set has no NPU split");
     npu_ = npu;
+    std::size_t rem = 0;
+    for (const auto& [site, rows] : npu_rows_)
+      if (NpuRem(site)) rem = std::max<std::size_t>(rem, std::size_t{B_} * rows * 4);
+    if (rem) npurem_ = &Alloc(rem);
     // Bind every NPU call of a full chunk now (a pass of the layers that dispatches nothing): a first bind loads the
     // image's storage and patches it, milliseconds per call.
     LoomBuffer *h = hidden_, *h2 = hidden2_;
@@ -997,10 +1001,17 @@ class LoomPrefill {
   }
   // (k offset, K) of a site's NPU calls: one K, or down's 6 + 6 + 5 passes of K = 17408 (its weight panel does not fit
   // a memory tile).
+  // The NPU runs one image (K = 5120 per call; an image switch costs ~0.55 ms): a site's K in chunks of 5120, the rest
+  // of K (out: 1024, down: 2048) on the GPU ("npurem_<site>_<fmt>.hal"), added by the unpack.
+  static std::uint32_t NpuSiteK(const std::string& site) { return site == "down" ? 17408 : site == "out" ? 6144 : 5120; }
   static std::vector<std::pair<std::uint32_t, std::uint32_t>> NpuChunks(const std::string& site) {
-    if (site == "down") return {{0, 6144}, {6144, 6144}, {12288, 5120}};
-    return {{0, site == "out" ? 6144u : 5120u}};
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> v;
+    for (std::uint32_t k = 0; k + 5120 <= NpuSiteK(site); k += 5120) v.push_back({k, 5120});
+    return v;
   }
+  static std::uint32_t NpuRem(const std::string& site) { return NpuSiteK(site) % 5120; }
+  // Chunked sites name their encoders and decoders per chunk ("_c<i>").
+  static bool NpuChunked(const std::string& site) { return NpuChunks(site).size() > 1 || NpuRem(site) != 0; }
   // Bytes per NPU call of a K (dispatch.txt "npubytes_<K>": activations of the chunk, a weight panel, a C panel).
   struct NpuBytes {
     std::size_t a, w, c;
@@ -1023,11 +1034,10 @@ class LoomPrefill {
   // input (row-major, or fragment-major with tiled) encoded into A for each of the site's K chunks; their A views.
   std::vector<NpuView> NpuEncode(const std::string& site, const LoomBuffer& input, bool tiled) {
     const auto chunks = NpuChunks(site);
-    const std::uint32_t K = chunks.back().first + chunks.back().second;
     std::vector<NpuView> views;
     std::size_t off = 0;
     for (std::size_t c = 0; c < chunks.size(); ++c) {
-      const std::string hal = "npu_enc_" + std::to_string(K) + (chunks.size() > 1 ? "_c" + std::to_string(c) : "") +
+      const std::string hal = "npu_enc_" + std::to_string(NpuSiteK(site)) + (NpuChunked(site) ? "_c" + std::to_string(c) : "") +
                               (tiled ? "_t" : "") + ".hal";
       const Geom& g = geom_.at(hal);
       const std::size_t bytes = NpuK(chunks[c].second).a;
@@ -1055,7 +1065,7 @@ class LoomPrefill {
     std::vector<std::vector<NpuView>> views;
     for (std::size_t c = 0; c < chunks.size(); ++c) {
       const std::string dq = "dqbfp" + base.substr(std::strlen("gemm_kstore"), base.size() - std::strlen("gemm_kstore") - 4) +
-                             (chunks.size() > 1 ? "_c" + std::to_string(c) : "") + ".hal";
+                             (NpuChunked(site) ? "_c" + std::to_string(c) : "") + ".hal";
       const Geom& g = geom_.at(dq);
       const std::size_t panel = NpuK(chunks[c].second).w, calls = rows / 512;
       auto b = GemmWeights(*t, f);
@@ -1291,8 +1301,19 @@ class LoomPrefill {
         } else {
           Dispatch(Exe(sh), kname.c_str(), blocks, tt, 1, 32, 1, 1, b, GemmWrites(b, f, {hidden2_}));
         }
+        // the rest of K for the NPU's rows (its last nn weight rows), beside the GPU's rows: f32 [tokens][nn]
+        const std::string rh = "npurem_" + std::string(site) + "_" + f.name + ".hal";
+        const Geom& gr = geom_.at(rh);
+        const std::size_t row_bytes = static_cast<std::size_t>(t->bytes) / M;
+        auto rb = GemmWeights(*t, f);
+        rb[0].offset += (M - nn) * row_bytes, rb[0].length = std::size_t{nn} * row_bytes;
+        for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{&input, wstage_, ostage_}) rb.push_back(Ref(*x));
+        rb.push_back({npurem_->handle, 0, std::size_t{B_} * nn * 4});
+        Dispatch(Exe(rh), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), nn / 16 / gr.rowgrp, gr.tt, 1, 32, 1, 1, rb,
+                 std::uint64_t{1} << (rb.size() - 1));
         Cut(Segment::kJoin);
-        NpuUnpack(std::string("npu_unpack_") + site + ".hal", c, {Ref(*hidden_), Ref(*hidden2_)}, 4);
+        NpuUnpack(std::string("npu_unpack_") + site + ".hal", c,
+                  {Ref(*hidden_), {npurem_->handle, 0, std::size_t{B_} * nn * 4}, Ref(*hidden2_)}, 8);
         std::swap(hidden_, hidden2_);
         return;
       }
@@ -1538,6 +1559,7 @@ class LoomPrefill {
   NpuSplit* npu_ = nullptr;        // EnableNpu
   bool npu_on_ = false;            // this chunk splits with the NPU
   bool npu_planning_ = false;      // EnableNpu's binding pass: Dispatch records nothing
+  LoomBuffer* npurem_ = nullptr;   // the GPU's K remainder of the NPU's out / down rows (f32 [tokens][rows])
   LoomGraph* npu_prev_ = nullptr;  // the last NPU job's GPU segment (NpuDecode records the next job's decode there)
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
   std::map<std::string, std::uint32_t> npu_rows_;  // NPU rows per site (dispatch.txt "npusplit_<site>")

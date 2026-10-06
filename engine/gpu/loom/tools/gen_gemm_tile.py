@@ -254,6 +254,9 @@ OSTRIDE = 0
 # DQ_BFP = (ks, passes, kb_start, kb_total): a K chunk, k_blocks (config) 256-wide blocks from kb_start of kb_total-block rows.
 # Its grid is dq_wgs(): one workgroup per item.
 DQ_BFP = None
+# KWIN = (kb_start, kb_total): a K window of an afrag tiled kstore, k_blocks (config) 256-wide blocks from kb_start of
+# kb_total-block weight rows and kb_total * 256-column activations (the NPU split's K remainder, emit_prefill_pp).
+KWIN = None
 
 
 def dq_wgs(m_tiles, k_blocks, t, fmt):
@@ -396,9 +399,12 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         assert kind in ("kstore", "kres", "swiglu", "ffn", "kqg") and not MX, "the NPU column split: kstore / kres / swiglu / ffn / kqg"
         e(f"  %o_rows = index.constant {OSTRIDE} : index")
     dq_chunk = kind == "dequant" and DQ_BFP is not None and len(DQ_BFP) == 4
-    if dq_chunk:   # weight rows keep their full length; the decode starts kb_start blocks in
+    if KWIN:
+        assert kind == "kstore" and AFRAG and t.atiled and F.get("kdiv", 1) == 1 and not (MX or OSTRIDE)
+    kwin = KWIN or (DQ_BFP[2:] if dq_chunk else None)
+    if kwin:   # weight rows keep their full length; the window starts kb_start blocks in
         assert F.get("kdiv", 1) == 1
-        e(f"  %ckbt = index.constant {DQ_BFP[3]} : index")
+        e(f"  %ckbt = index.constant {kwin[1]} : index")
         e("  %bpr = index.mul %ckbt, %cbb : index")
         e("  %hpr = index.mul %ckbt, %cbbh : index")
     else:
@@ -426,7 +432,10 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     e("  %w_half_last = index.sub %w_halfs, %c1 : index")
     e(f"  %out_total = index.mul {orw()}, %tokens : index")
     e("  %cagpad = index.constant 0 : index")
-    e("  %apitch = index.add %ktot, %cagpad : index")
+    if KWIN:
+        e(f"  %kfull = index.constant {KWIN[1] * 256} : index")
+        e(f"  %kwt0 = index.constant {KWIN[0] * 16} : index")
+    e(f"  %apitch = index.add {'%kfull' if KWIN else '%ktot'}, %cagpad : index")
     e("  %a_total = index.mul %tokens, %apitch : index")
     e("  %a_last8 = index.sub %a_total, %c8 : index")
     e("  %a_layout = encoding.layout.strided [%c1, %ktot] : encoding<layout>")
@@ -439,7 +448,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     if AFRAG:
         e("  %a_rhs = buffer.view %input_na[%base] : buffer -> view<[%ktot]x[%tokens]xf16, %a_layout>")
         if t.atiled:
-            e("  %a_ktiles = index.div %ktot, %c16 : index")
+            e(f"  %a_ktiles = index.div {'%kfull' if KWIN else '%ktot'}, %c16 : index")
             e("  %a_tlay = encoding.layout.strided [%c1, %c16] : encoding<layout>")
     # LDS: decoded weight tile and staged activation tile
     wl_b = BM * G.ROWP * 2 * (2 if DECAHEAD or DBUF or dq else 1)
@@ -551,11 +560,11 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     else:
         e("  %grow_i = scalar.addi %wg_row_i, %drow_i : i32")
     e("  %k_blocks_i = index.cast %k_blocks : index to i32")
-    if dq_chunk:
-        e(f"  %ckbt_i = scalar.constant {DQ_BFP[3]} : i32")
+    if kwin:
+        e(f"  %ckbt_i = scalar.constant {kwin[1]} : i32")
         e("  %bpr_i = scalar.muli %ckbt_i, %cbbi : i32")
         e("  %row_off_i0 = scalar.muli %grow_i, %bpr_i : i32")
-        e(f"  %ckbs_i = scalar.constant {DQ_BFP[2] * bb} : i32")
+        e(f"  %ckbs_i = scalar.constant {kwin[0] * bb} : i32")
         e("  %row_off_i = scalar.addi %row_off_i0, %ckbs_i : i32")
     else:
         e("  %bpr_i = scalar.muli %k_blocks_i, %cbbi : i32")
@@ -845,7 +854,9 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         if t.atiled:
             # tile (token / 16, k / 16) starts at ((token / 16) * (ktot / 16) + k / 16) * 256 halves
             e(f"    %sgtt{st}_{j} = index.div %sgt{st}_{j}, %c16 : index")
-            e(f"    %sgkt{st}_{j} = index.div %sgk{st}_{j}, %c16 : index")
+            e(f"    %sgkt{st}_{j}{'w' if KWIN else ''} = index.div %sgk{st}_{j}, %c16 : index")
+            if KWIN:   # the window's first 16-column tile
+                e(f"    %sgkt{st}_{j} = index.add %sgkt{st}_{j}w, %kwt0 : index")
             e(f"    %sgr{st}_{j} = index.mul %sgtt{st}_{j}, %a_ktiles : index")
             e(f"    %sgi{st}_{j} = index.add %sgr{st}_{j}, %sgkt{st}_{j} : index")
             e(f"    %sgo{st}_{j} = index.mul %sgi{st}_{j}, %c512 : index")

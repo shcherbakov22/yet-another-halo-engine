@@ -6,7 +6,8 @@ usage: npu_unpack_check.py <model.gguf> <workdir> <tokens> <cols> <stride> <off>
 Random C into an output filled with NaN: columns [off, off + 64 * cols) must hold C exactly, all others stay NaN.
 UNP_PARTS=n (partial Cs summed), UNP_RESID=1 (out = resid + C), UNP_SWIGLU=1 (f16(silu(gate) * up), checked to f16
 rounding: the kernel's exp / reciprocal are not numpy's), UNP_TILED=1 (fragment-major f16 output), UNP_QG=1 (attention q
-rows: <stride> is the q / gate row count, <off> the first NPU row of heads x [256 q | 256 gate]).
+rows: <stride> is the q / gate row count, <off> the first NPU row of heads x [256 q | 256 gate]), UNP_REM=1 (with
+UNP_RESID: plus the GPU's K-remainder partial, f32 [tokens][64 * cols]).
 """
 import os
 import subprocess
@@ -27,7 +28,8 @@ def main():
     model, work = sys.argv[1], sys.argv[2]
     tokens, cols, stride, off = (int(v) for v in sys.argv[3:7])
     parts = int(os.environ.get("UNP_PARTS", "1"))
-    resid, swiglu, tiled, qg = (os.environ.get(k) == "1" for k in ("UNP_RESID", "UNP_SWIGLU", "UNP_TILED", "UNP_QG"))
+    resid, swiglu, tiled, qg, rem = (os.environ.get(k) == "1" for k in ("UNP_RESID", "UNP_SWIGLU", "UNP_TILED", "UNP_QG",
+                                                                         "UNP_REM"))
     out16 = (len(sys.argv) > 7 and sys.argv[7] != "0") or swiglu or tiled
     dt = np.float16 if out16 else np.float32
     nblk = parts * (2 if swiglu else 1)
@@ -37,7 +39,8 @@ def main():
     c.tofile(cf)
     np.full(tokens * stride, np.nan, dt).tofile(sf)
     src = os.path.join(work, "unpack.loom")
-    open(src, "w").write(G.gen(tokens, cols, stride, off, out16 and not (swiglu or tiled), resid, parts, swiglu, tiled, qg))
+    open(src, "w").write(G.gen(tokens, cols, stride, off, out16 and not (swiglu or tiled), resid, parts, swiglu, tiled, qg,
+                               rem))
     r = subprocess.run([sys.executable, B.EMIT, src, os.path.join(work, "unpack"), "nop=0"], capture_output=True, text=True)
     if r.returncode:
         sys.exit(f"emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
@@ -46,11 +49,16 @@ def main():
     r_in = np.random.default_rng(4).standard_normal(tokens * stride).astype(np.float32)
     if resid:
         r_in.tofile(rf)
+    mf = os.path.join(work, "rem.f32")
+    m_in = np.random.default_rng(6).standard_normal(tokens * cols * 64).astype(np.float32)
+    if rem:
+        m_in.tofile(mf)
     obytes = tokens * stride * np.dtype(dt).itemsize
     cmd = [B.GPURUN, "npu-unpack", "--", B.HALRUN, model, hal, str(tokens * cols * 8 // G.WG), str(G.WG),
-           ",".join(str(v) for v in [c.nbytes] + ([obytes] if resid else []) + [obytes]), f"f:{cf}"]
+           ",".join(str(v) for v in [c.nbytes] + ([obytes] if resid else []) + ([m_in.nbytes] if rem else []) + [obytes]),
+           f"f:{cf}"]
     gfo = os.path.join(work, "gate_out.f32")
-    cmd += ([f"f:{rf}"] if resid else []) + [f"io:{sf}:{of}"] + ([f"io:{sf}:{gfo}"] if qg else [])
+    cmd += ([f"f:{rf}"] if resid else []) + ([f"f:{mf}"] if rem else []) + [f"io:{sf}:{of}"] + ([f"io:{sf}:{gfo}"] if qg else [])
     if qg:
         cmd[cmd.index(f"{c.nbytes},{obytes}")] = f"{c.nbytes},{obytes},{obytes}"
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=dict(os.environ, HAL_RUN_ITERS="4"))
@@ -87,6 +95,8 @@ def main():
         want = blk[0]
         for b in blk[1:]:
             want = want + b
+        if rem:
+            want = want + m_in.reshape(tokens, 64 * cols)
         if resid:
             want = r_in.reshape(tokens, stride)[:, off:off + 64 * cols] + want
     want = want.astype(dt)
@@ -99,10 +109,10 @@ def main():
         ok = np.array_equal(sl.view(np.uint16 if out16 else np.uint32), want.view(np.uint16 if out16 else np.uint32))
     rest = np.delete(got, np.s_[off:off + 64 * cols], axis=1)
     kept = bool(np.isnan(rest).all())
-    mode = "".join(f" {k}" for k, v in (("f16", out16), ("resid", resid), ("swiglu", swiglu), ("tiled", tiled)) if v)
+    mode = "".join(f" {k}" for k, v in (("f16", out16), ("resid", resid), ("rem", rem), ("swiglu", swiglu), ("tiled", tiled)) if v)
     print(f"unpack tokens={tokens} cols={cols} stride={stride} off={off}{mode}{f' parts={parts}' if parts > 1 else ''}: slice {'exact' if ok else 'DIFFERS'}, "
           f"other columns {'untouched' if kept else 'WRITTEN'}")
-    for f in (cf, of, sf) + ((rf,) if resid else ()):
+    for f in (cf, of, sf) + ((rf,) if resid else ()) + ((mf,) if rem else ()):
         os.remove(f)
     sys.exit(0 if ok and kept else 1)
 

@@ -611,7 +611,9 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
 # computes the trailing rows of a GEMM, the GPU the leading ones. Sites (rows x K):
 #   qkv  DeltaNet attn_qkv (10240 x 5120, f16 out)     gate  DeltaNet attn_gate (6144 x 5120, f16 out)
 #   q    attention attn_q (12288 x 5120, kqg: whole heads of [256 q | 256 gate])
-#   out  ssm_out / attn_output (5120 x 6144, kres)      down  ffn_down (5120 x 17408, kres, K in 6 + 6 + 5 passes)
+#   out  ssm_out / attn_output (5120 x 6144, kres)      down  ffn_down (5120 x 17408, kres)
+# The NPU runs one image (K = 5120 per call: switching images costs ~0.55 ms each): out and down take K chunks of 5120 and
+# the GPU computes the rest of K for the NPU's rows (npu_rem_tile, gen_gemm_tile.KWIN), which the unpack adds.
 #   ffn  ffn_gate + ffn_up (17408 x 5120 each): the same NPU rows of both, silu(gate) * up in the unpack
 # Per site and format, the GPU's share of every variant the driver may run ("<hal>.npu.hal": "<hal>" any of the set's
 # GEMM HALs, its afrag / persistent / fragment-major-output forms included; gen_gemm_tile.OSTRIDE) and the NPU's rows
@@ -624,7 +626,28 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 NPU_KS = (33, 33, 33, 29)   # k-blocks per pass and K-slice row (gen_npu_gemm); K = 1024 * passes
 NPU_SITES = {"qkv": ("kstore", 640, 20), "gate": ("kstore", 384, 20), "q": ("kqg", 768, 20), "out": ("kres", 320, 24),
              "down": ("kres", 320, 68), "ffn": ("ffn", 1088, 20)}
-NPU_DOWN_CHUNKS = ((0, 6), (6144, 6), (12288, 5))   # (k offset, passes) of the K = 17408 chunks
+NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
+
+
+def npu_chunks(site):
+    """(k offset, passes) of the NPU's K chunks of a site; the GPU computes the rest of K (npu_rem) for the NPU's rows."""
+    K = NPU_SITES[site][2] * 256
+    return [(1024 * NPU_PASSES * i, NPU_PASSES) for i in range(K // (1024 * NPU_PASSES))]
+
+
+def npu_rem(site):
+    """The K columns past the NPU's chunks (out: 1024 of 6144, down: 2048 of 17408): the GPU's npurem_<site>_<fmt>.hal."""
+    return NPU_SITES[site][2] * 256 % (1024 * NPU_PASSES)
+
+
+def npu_rem_tile(fmt, kbw, kbt):
+    """The K remainder's tile (gen_gemm_tile.KWIN, kbw of kbt blocks): the afrag kstore with the knobs of the format's
+    K = kbt * 256 kres (emit_prefill_pp.AF; its residual and persistence knobs dropped)."""
+    import gen_gemm_tile as TG
+    knobs = dict(AF.get((fmt, "kres", 320, kbt)) or AF[(fmt, "kres", 320, 24)])
+    knobs.pop("persist", None)
+    knobs["respre"] = 0
+    return dataclasses.replace(TG.default_tile(fmt, "kstore", kbw), **AF_TILE, **knobs)
 
 
 def npu_split(rows, combos, B, outdir):
@@ -677,11 +700,11 @@ def npu_split(rows, combos, B, outdir):
                 if B // ta.bn > 2:
                     split(fmt, kind, mt, kb, ta, base[:-4] + ".af.p3.hal", nn, persist=pt, tokens=B - ta.bn)
 
-    def dqbfp(fmt, mt, kb, nn, chunk=None):
-        """The NPU's rows (the last nn of mt * 16) decoded to its weight stream; chunk: (k offset, passes) of a K chunk."""
+    def dqbfp(fmt, mt, kb, nn, ci=None, chunk=None):
+        """The NPU's rows (the last nn of mt * 16) decoded to its weight stream; chunk ci: (k offset, passes) of a K chunk."""
         dt = dataclasses.replace(TG.default_tile(fmt, "kstore", kb), bm=64, wm=2, wn=4, decahead=False, ksub=64,
                                  dbuf=False)
-        name = "dqbfp_%s_%d_%d%s.hal" % (fmt, mt, kb, "" if chunk is None else "_c%d" % NPU_DOWN_CHUNKS.index(chunk))
+        name = "dqbfp_%s_%d_%d%s.hal" % (fmt, mt, kb, "" if chunk is None else "_c%d" % ci)
         if chunk is None:
             TG.DQ_BFP, kbc, kfull = (NPU_KS, kb * qk_of(fmt) // 1024), kb, 0
         else:
@@ -715,10 +738,26 @@ def npu_split(rows, combos, B, outdir):
                 variants(fmt, skind, mt, kb, "gemm_%s_%s_%d_%d.hal" % (skind, fmt, mt, kb), nn)
             else:
                 continue
-            for chunk in (NPU_DOWN_CHUNKS if site == "down" else (None,)):
+            chunks = npu_chunks(site)
+            chunked = len(chunks) > 1 or npu_rem(site)
+            for ci, chunk in (enumerate(chunks) if chunked else ((None, None),)):
                 if (fmt, mt, kb, chunk) not in done:
                     done.add((fmt, mt, kb, chunk))
-                    dqbfp(fmt, mt, kb, NPU_SPLIT[site], chunk)
+                    dqbfp(fmt, mt, kb, NPU_SPLIT[site], ci, chunk)
+            if npu_rem(site) and (site, fmt) not in done:   # the GPU's K remainder of the NPU's rows (f32 [B][nn])
+                done.add((site, fmt))
+                kbw = npu_rem(site) // 256
+                tr = npu_rem_tile(fmt, kbw, kb)
+
+                def gen_rem(f, k, tr=tr, kb=kb, kbw=kbw):
+                    TG.KWIN = (kb - kbw, kb)
+                    try:
+                        return TG.gen(f, "kstore", tr, False)
+                    finally:
+                        TG.KWIN = None
+                assert nn // 16 not in O16_MT, "the remainder writes f32"
+                out.append(_emit_gen(gen_rem, tr.bn, fmt, nn // 16, kbw, B, "npurem_%s_%s.hal" % (site, fmt), outdir,
+                                     "kstore", tr.rowgrp, kfull=kb))
     if "ffn" in NPU_SPLIT and AFRAG and B % AF_TILE["bn"] == 0:   # the fused gate + up GEMMs (ffn_fused)
         by = {}
         for nm, dims, ty in rows:
@@ -730,16 +769,17 @@ def npu_split(rows, combos, B, outdir):
                 t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
                 for sfx, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
                     split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), NPU_SPLIT["ffn"])
-    # activation encoders: per K (down: per chunk), row-major and fragment-major input
+    # activation encoders: per K (chunked: per chunk), row-major and fragment-major input
     encs = set()
     for site in NPU_SPLIT:
         K = NPU_SITES[site][2] * 256
-        for chunk in (NPU_DOWN_CHUNKS if site == "down" else ((0, K // 1024),)):
-            encs.add((K, chunk))
-    for K, (k_off, passes) in sorted(encs):
+        chunks = npu_chunks(site)
+        chunked = len(chunks) > 1 or npu_rem(site)
+        for ci, chunk in enumerate(chunks):
+            encs.add((K, ci if chunked else None, chunk))
+    for K, ci, (k_off, passes) in sorted(encs, key=lambda x: (x[0], -1 if x[1] is None else x[1])):
         for tiled in (False, True):
-            name = "npu_enc_%d%s%s.hal" % (K, "_c%d" % NPU_DOWN_CHUNKS.index((k_off, passes)) if K == 17408 else "",
-                                         "_t" if tiled else "")
+            name = "npu_enc_%d%s%s.hal" % (K, "" if ci is None else "_c%d" % ci, "_t" if tiled else "")
             src = os.path.join(tmp, name[:-4] + ".loom")
             open(src, "w").write(GE.gen("act", B, list(NPU_KS), passes, tiled=tiled, k_off=k_off,
                                         k_src=K if 1024 * passes != K else None))
@@ -750,7 +790,8 @@ def npu_split(rows, combos, B, outdir):
         skind, mt, kb = NPU_SITES[site]
         N = mt * 16
         forms = {"qkv": [dict(out16=True)], "gate": [dict(out16=True)], "q": [dict(qg=True)],
-                 "out": [dict(resid=True)], "down": [dict(resid=True, parts=len(NPU_DOWN_CHUNKS))],
+                 "out": [dict(resid=True, parts=len(npu_chunks("out")), rem=True)],
+                 "down": [dict(resid=True, parts=len(npu_chunks("down")), rem=True)],
                  "ffn": [dict(swiglu=True), dict(swiglu=True, tiled=True)]}[site]
         for f in forms:
             name = "npu_unpack_%s%s.hal" % (site, "_t" if f.get("tiled") else "")
@@ -761,9 +802,7 @@ def npu_split(rows, combos, B, outdir):
         out.append(("npusplit_" + site, n, 0, 0))
     # NPU images, one per pass count
     env = dict(hrx_paths.env(), LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1")
-    passes_used = sorted({NPU_SITES[s][2] * 256 // 1024 for s in NPU_SPLIT if s != "down"}
-                         | ({p for _, p in NPU_DOWN_CHUNKS} if "down" in NPU_SPLIT else set()))
-    for passes in passes_used:
+    for passes in sorted({p for s in NPU_SPLIT for _, p in npu_chunks(s)}):
         K = 1024 * passes
         cfg = GN.Config(8, B // 64, NPU_KS, passes)
         src = os.path.join(tmp, "npu_gemm_%d.loom" % K)
