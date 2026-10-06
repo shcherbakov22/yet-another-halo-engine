@@ -241,6 +241,14 @@ def gen(fmt, kind="kstore", tile=None, masked=False):
 DQ_BLOCKS = 4
 DQ_WGS = 20
 
+# Column split with the NPU (emit_prefill_pp NPU_SPLIT): the GPU computes output rows [0, m_tiles * 16) of a wider
+# matrix; OSTRIDE (> 0) is the full row count, the output's token stride. kstore only.
+OSTRIDE = 0
+
+
+def orw():
+    return "%o_rows" if OSTRIDE else "%m_rows"
+
 
 def _gen(fmt, kind, t, masked, fmt_up=None):
     BM, BN, WM, WN, TM, TN = t.bm, t.bn, t.wm, t.wn, t.tm, t.tn
@@ -365,6 +373,9 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     else:
         e("  %tokens = index.mul %token_tiles, %cwtok : index")
     e("  %m_rows = index.mul %m_tiles, %c16 : index")
+    if OSTRIDE:
+        assert kind == "kstore" and not t.tout, "the NPU column split is kstore only"
+        e(f"  %o_rows = index.constant {OSTRIDE} : index")
     e("  %bpr = index.mul %k_blocks, %cbb : index")
     e("  %hpr = index.mul %k_blocks, %cbbh : index")
     if MX:
@@ -387,7 +398,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e(f"  %cw{nb} = index.constant {nb} : index")
         e(f"  %w_lim{nb} = index.sub %w_bytes, %cw{nb} : index")
     e("  %w_half_last = index.sub %w_halfs, %c1 : index")
-    e("  %out_total = index.mul %m_rows, %tokens : index")
+    e(f"  %out_total = index.mul {orw()}, %tokens : index")
     e("  %cagpad = index.constant 0 : index")
     e("  %apitch = index.add %ktot, %cagpad : index")
     e("  %a_total = index.mul %tokens, %apitch : index")
@@ -1061,7 +1072,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e("  kernel.return")
         e("}")
         return "\n".join(L) + "\n"
-    e("  %out_layout = encoding.layout.strided [%c1, %m_rows] : encoding<layout>")
+    e(f"  %out_layout = encoding.layout.strided [%c1, {orw()}] : encoding<layout>")
     e("  %out_t_view = buffer.view %output_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
     if kr:
         e("  %res_t_view = buffer.view %resid_na[%base] : buffer -> view<[%m_rows]x[%tokens]xf32, %out_layout>")
@@ -1181,7 +1192,7 @@ def lds_epilogue(e, t, kr, V8, sw=False, qg=False, masked=False):
             # the guard below skips tokens past the last; the clamp lets the compiler prove the addresses in bounds
             e(f"  %es_tkc{j} = index.min %es_tk{j}, %es_tok_last : index")
             es_tka = f"%es_tkc{j}"
-        e(f"  %es_tm{j} = index.mul {es_tka}, %m_rows : index")
+        e(f"  %es_tm{j} = index.mul {es_tka}, {orw()} : index")
         e(f"  %es_ob{j} = index.add %es_tm{j}, %es_row : index")
         if qg:
             e(f"  %qg_tm{j} = index.mul {es_tka}, %qg_rows : index")
@@ -1303,7 +1314,7 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
         e(f"  %et_tc{q0} = index.constant {16 * j} : index")
         e(f"  %et_tk{q0}0 = index.add %token_base, %et_tc{q0} : index")
         e(f"  %et_tk{q0} = index.add %et_tk{q0}0, %et_t : index")
-        e(f"  %et_tm{q0} = index.mul %et_tk{q0}, %m_rows : index")
+        e(f"  %et_tm{q0} = index.mul %et_tk{q0}, {orw()} : index")
         e(f"  %et_ob{q0} = index.add %et_tm{q0}, %et_row{g} : index")
         for q in range(sr // 8):
             y = f"{q0}_{q}"
@@ -1361,7 +1372,7 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                 e(f"  %et_tm{q0} = index.mul {tka}, %qg_rows : index")
                 e(f"  %et_ob{q0} = index.add %et_tm{q0}, %qg_col{g} : index")
             else:
-                e(f"  %et_tm{q0} = index.mul {tka}, %m_rows : index")
+                e(f"  %et_tm{q0} = index.mul {tka}, {orw()} : index")
                 e(f"  %et_ob{q0} = index.add %et_tm{q0}, %et_row{g} : index")
             if masked:
                 e(f"  %et_ok{q0} = index.cmp ult, %et_tk{q0}, %tokens : index")
@@ -1471,7 +1482,7 @@ def _lds_epilogue_ffn(e, t, V8, sr=16):
                     e(f"  %et_j{y} = index.add %et_g{y}, %et_i{y} : index")
                     e(f"  %et_o{y}0 = index.add %et_j{y}, %et_d{y} : index")
                 else:
-                    e(f"  %et_m{y} = index.mul %et_tk{q0}, %m_rows : index")
+                    e(f"  %et_m{y} = index.mul %et_tk{q0}, {orw()} : index")
                     e(f"  %et_o{y}0 = index.add %et_m{y}, %et_r{y} : index")
                 e(f"  %et_o{y} = index.min %et_o{y}0, %et_last4 : index")   # always in range; for the bound proof
                 e(f"  vector.store %et_h{y}, %out_h[%et_o{y}] : vector<4xf16>, view<[%out_total]xf16>")
@@ -1541,7 +1552,7 @@ def _lds_epilogue_ahead(e, t, kr, V8, sw=False, qg=False, masked=False):
             e(f"  %es_tkc{j} = index.min %es_tk{j}, %es_tok_last : index")
             es_tka = f"%es_tkc{j}"
         tka[j] = es_tka
-        e(f"  %es_tm{j} = index.mul {es_tka}, %m_rows : index")
+        e(f"  %es_tm{j} = index.mul {es_tka}, {orw()} : index")
         e(f"  %es_ob{j} = index.add %es_tm{j}, %es_row : index")
         for q in range(4):
             e(f"  %es_q{j}_{q}c = index.constant {4 * q} : index")
