@@ -8,7 +8,8 @@ A slab is 16 rows x KS k-blocks: per k-block the fragments of rows 0-7 then 8-15
 The NPU GEMM splits K per pass over the column's rows (K-slices with ks[r] k-blocks each, PK = sum(ks) per pass).
   act: [slice][M block][pass][MP slabs]   rows = tokens, MP = TM / 16 slabs per M block
   wgt: [column][slice][pass][NP slabs]    rows = output features, NP = TN / 16 slabs per NPU column
-One work item per fragment; adjacent items take adjacent k-blocks of the same 8 rows (coalesced 16-byte loads).
+One work item per fragment; a lane pair takes rows 0-7 and 8-15 of one k-block (its 144 contiguous bytes), adjacent pairs
+adjacent k-blocks: a wave writes whole lines (half records left partial lines for other waves: read-modify-write in DRAM).
 """
 import sys
 
@@ -69,8 +70,13 @@ def gen(layout, rows, ks, passes, tile=64, pad=True, tiled=False, k_off=0, k_src
     for nm, v in (("ckb", kb), ("cK", ksrc), ("c8", 8), ("c2", 2), ("c144", 144), ("c72", 72), ("csub", sub),
                   ("cpk", pk), ("cpass", passes)):
         e(f"    %{nm} = index.constant {v} : index")
-    e("    %g8 = index.div %item, %ckb : index")
-    e("    %kbi = index.rem %item, %ckb : index")
+    # item = (16-row group * kb + k-block) * 2 + half: a lane pair writes one k-block's 144 contiguous bytes
+    e("    %ihalf = index.rem %item, %c2 : index")
+    e("    %ipair = index.div %item, %c2 : index")
+    e("    %g16i = index.div %ipair, %ckb : index")
+    e("    %kbi = index.rem %ipair, %ckb : index")
+    e("    %g16x2 = index.mul %g16i, %c2 : index")
+    e("    %g8 = index.add %g16x2, %ihalf : index")
     frag = emit_offset(e, layout, rows, ks, passes, tile, pad, "%g8", "%kbi")
     # inputs: 8 rows x 8 halves
     e("    %row0 = index.mul %g8, %c8 : index")

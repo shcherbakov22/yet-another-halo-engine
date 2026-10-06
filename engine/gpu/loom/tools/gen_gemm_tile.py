@@ -682,8 +682,13 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             for nm, v in (("c2", 2), ("c144", 144), ("c72", 72), ("csub", 4), ("cpk", sum(bks)), ("cpass", bpasses),
                           ("c8", 8), ("ckq", ksub // 8)):
                 e(f"    %bf_{nm} = index.constant {v} : index")
-            e("    %bf_rr = index.div %tid, %bf_ckq : index")
-            e("    %bf_kk = index.rem %tid, %bf_ckq : index")
+            # a lane pair takes rows 0-7 and 8-15 of one k-block: its 144 contiguous stream bytes (whole lines per wave)
+            e("    %bf_half = index.rem %tid, %bf_c2 : index")
+            e("    %bf_pair = index.div %tid, %bf_c2 : index")
+            e("    %bf_r16 = index.div %bf_pair, %bf_ckq : index")
+            e("    %bf_kk = index.rem %bf_pair, %bf_ckq : index")
+            e("    %bf_r16x2 = index.mul %bf_r16, %bf_c2 : index")
+            e("    %bf_rr = index.add %bf_r16x2, %bf_half : index")
             e("    %bf_r0 = index.mul %bf_rr, %bf_c8 : index")
             e("    %bf_gr = index.add %wg_row, %bf_r0 : index")
             e("    %bf_g8 = index.div %bf_gr, %bf_c8 : index")
