@@ -20,6 +20,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "amdf/amdf.h"
@@ -91,6 +92,12 @@ class LoomNpu {
     if (hsa) export_dmabuf_ = reinterpret_cast<ExportFn>(dlsym(hsa, "hsa_amd_portable_export_dmabuf"));
     if (!export_dmabuf_) throw LoomError("npu: hsa_amd_portable_export_dmabuf not found");
     LoomCheck(hrx_semaphore_create(gpu_.device(), 0, &done_), "hrx_semaphore_create");
+    // Copies from / to a host-visible buffer carry system-scope acquire / release fences (HRX blits), the GPU cache
+    // maintenance around the NPU's accesses that a graph segment boundary does not give.
+    LoomCheck(hrx_buffer_allocate(gpu_.stream(), 64, HRX_MEMORY_TYPE_HOST_LOCAL, HRX_BUFFER_USAGE_TRANSFER, &fence_host_.handle),
+              "hrx_buffer_allocate(fence host)");
+    fence_host_.size = 64;
+    fence_dev_ = gpu_.Allocate(64);
     relay_ = std::thread([this] { Relay(); });
   }
   LoomNpu(const LoomNpu&) = delete;
@@ -212,6 +219,8 @@ class LoomNpu {
   // Queue NPU work behind the GPU stream's current position; the relay runs the kernels in order after it.
   // Pass the returned value to Join before the stream reads the results.
   std::uint64_t Enqueue(std::vector<Kernel*> kernels) {
+    // system-scope release: the GPU's writes to A / W reach memory before the NPU reads them
+    LoomCheck(hrx_stream_copy_buffer(gpu_.stream(), fence_dev_.handle, 0, fence_host_.handle, 0, 64), "fence release");
     LoomCheck(hrx_stream_flush(gpu_.stream()), "hrx_stream_flush");
     hrx_timeline_point_t after{};
     LoomCheck(hrx_stream_get_timeline_position(gpu_.stream(), &after), "hrx_stream_get_timeline_position");
@@ -227,6 +236,9 @@ class LoomNpu {
     LoomCheck(hrx_stream_flush(gpu_.stream()), "hrx_stream_flush");
     LoomCheck(hrx_semaphore_wait(done_, value, UINT64_MAX), "hrx_semaphore_wait(npu)");
     LoomCheck(hrx_stream_wait_on(gpu_.stream(), {done_, value}), "hrx_stream_wait_on");
+    // system-scope acquire: no GPU cache keeps lines of C from an earlier read (the wait above, already signaled, is
+    // resolved in software without a fence)
+    LoomCheck(hrx_stream_copy_buffer(gpu_.stream(), fence_host_.handle, 0, fence_dev_.handle, 0, 64), "fence acquire");
   }
   // Host time of the last finished job from its first submission to the NPU's completion.
   [[nodiscard]] double LastJobMs() const { return last_job_ms_.load(); }
@@ -480,6 +492,7 @@ class LoomNpu {
   std::vector<std::unique_ptr<Shared>> shared_;
   std::vector<std::unique_ptr<Kernel>> kernels_;
   hrx_semaphore_t done_ = nullptr;
+  LoomBuffer fence_host_, fence_dev_;  // Enqueue / Join cache fences
   const void* resident_ = nullptr;  // relay thread only
   std::atomic<double> last_job_ms_{0};
   std::mutex mu_;
@@ -491,27 +504,29 @@ class LoomNpu {
   std::thread relay_;
 };
 
-// The NPU side of LoomPrefill's column split: one shared A, plan.panels W / C panels, one bound kernel per panel.
+// The NPU side of LoomPrefill's column split: the shared A / W / C buffers and the calls bound on views of them.
 class LoomNpuSplit : public NpuSplit {
  public:
   LoomNpuSplit(LoomDevice& gpu, const NpuPlan& plan)
       : npu_(gpu, 8),
         a_(npu_.CreateShared(plan.a_bytes)),
-        w_(npu_.CreateShared(plan.panels * plan.w_panel)),
-        c_(npu_.CreateShared(plan.panels * plan.c_panel)) {
-    for (std::uint32_t p = 0; p < plan.panels; ++p)
-      kernels_.push_back(&npu_.Load(plan.image, "npu_gemm",
-                                    {{&a_, 0, plan.a_bytes},
-                                     {&w_, p * plan.w_panel, plan.w_panel},
-                                     {&c_, p * plan.c_panel, plan.c_panel}}));
-  }
+        w_(npu_.CreateShared(plan.w_bytes)),
+        c_(npu_.CreateShared(plan.c_bytes)) {}
   const LoomBuffer& A() const override { return a_.gpu; }
   const LoomBuffer& W() const override { return w_.gpu; }
   const LoomBuffer& C() const override { return c_.gpu; }
-  std::uint64_t Enqueue(std::uint32_t first, std::uint32_t count) override {
-    if (first + count > kernels_.size()) throw LoomError("npu: call range");
+  std::uint32_t Bind(const std::string& image, NpuView a, NpuView w, NpuView c) override {
+    const auto key = std::make_tuple(image, a.offset, a.length, w.offset, w.length, c.offset, c.length);
+    if (const auto it = ids_.find(key); it != ids_.end()) return it->second;
+    kernels_.push_back(&npu_.Load(image, "npu_gemm",
+                                  {{&a_, a.offset, a.length}, {&w_, w.offset, w.length}, {&c_, c.offset, c.length}}));
+    return ids_[key] = static_cast<std::uint32_t>(kernels_.size() - 1);
+  }
+  std::uint64_t Enqueue(const std::vector<std::uint32_t>& calls) override {
     npu_.CheckHealth();
-    return npu_.Enqueue({kernels_.begin() + first, kernels_.begin() + first + count});
+    std::vector<LoomNpu::Kernel*> k;
+    for (const std::uint32_t id : calls) k.push_back(kernels_.at(id));
+    return npu_.Enqueue(std::move(k));
   }
   void Join(std::uint64_t value) override {
     npu_.Join(value);
@@ -522,6 +537,9 @@ class LoomNpuSplit : public NpuSplit {
   LoomNpu npu_;
   LoomNpu::Shared &a_, &w_, &c_;
   std::vector<LoomNpu::Kernel*> kernels_;
+  std::map<std::tuple<std::string, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>,
+           std::uint32_t>
+      ids_;
 };
 
 }  // namespace yah::model

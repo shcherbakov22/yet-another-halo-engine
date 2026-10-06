@@ -101,11 +101,11 @@ int main(int argc, char** argv) {
     gpu.SetSleepSync(200);
     LoomWeights weights(gpu, gguf.tensor_data_base(), gguf.tensor_data_size());
     LoomPrefill pf(gpu, gguf, cfg, argv[2], weights.handle(), weights.delta(), want);
-    // YAH_NPU=1: the NPU computes the trailing rows of the DeltaNet qkv / gate GEMMs (a set emitted with YAH_NPU_SPLIT).
+    // YAH_NPU=1: the NPU computes the trailing rows of the set's split GEMMs (a set emitted with YAH_NPU_SPLIT).
     std::unique_ptr<yah::model::LoomNpuSplit> npu;
     if (const char* e = std::getenv("YAH_NPU"); e && std::string(e) == "1") {
       const auto plan = pf.npu_plan();
-      if (plan.panels == 0) {
+      if (plan.a_bytes == 0) {
         std::fprintf(stderr, "YAH_NPU=1: the set has no NPU split (emit it with YAH_NPU_SPLIT)\n");
         return 2;
       }

@@ -26,10 +26,11 @@ M, K = mt * 16, kb * qk
 MO = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("ostride=")), M)
 # kfull: a K-chunk dequant (gen_gemm_tile.DQ_BFP) reading kb of each <kfull>-block weight row
 KBW = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("kfull=")), kb)
-wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else M * KBW * bpb * (2 if kind == "ffn" else 1)
-bound = {"weight": wbytes, "input": B * K * 2, "resid": B * MO * 4, "gate": B * M * 4,
+# a split ffn reads the full gate tensor's rows before the up rows
+wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else (MO if kind == "ffn" else M) * KBW * bpb * (2 if kind == "ffn" else 1)
+bound = {"weight": wbytes, "input": B * K * 2, "resid": B * MO * 4, "gate": B * MO * 4,
          "output": M * K * 2 if kind == "dequant" else B * MO * (2 if kind in ("swiglu", "kqg", "ffn") else 4),
-         "gate_out": B * M * 2,
+         "gate_out": B * MO * 2,
          # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words
          "grid": max({"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(f, 0) for f in fmts),
          "ksigns": 128,

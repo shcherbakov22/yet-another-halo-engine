@@ -1,4 +1,4 @@
-// NpuSplit: what LoomPrefill needs from the NPU for the column-split GEMMs (dispatch.txt "npusplit").
+// NpuSplit: what LoomPrefill needs from the NPU for the column-split GEMMs (dispatch.txt "npusplit_<site>").
 // The implementation (LoomNpuSplit in model/loom_npu.hpp) links libamdf and the HRX xdna loader; this header does not.
 #ifndef YAH_MODEL_NPU_SPLIT_HPP_
 #define YAH_MODEL_NPU_SPLIT_HPP_
@@ -6,27 +6,32 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "model/loom_runtime.hpp"
 
 namespace yah::model {
 
-// The NPU GEMM's stream sizes (dispatch.txt "npubytes") and its image.
+// Sizes of the GPU buffers shared with the NPU (LoomPrefill::npu_plan).
 struct NpuPlan {
-  std::size_t a_bytes = 0, w_panel = 0, c_panel = 0;  // activations (whole chunk); weights and C per 512-row call
-  std::uint32_t panels = 0;                            // NPU calls per layer (qkv's, then gate's)
-  std::string image;                                   // the .xdna path
+  std::size_t a_bytes = 0, w_bytes = 0, c_bytes = 0;  // encoded activations, encoded weight panels, f32 C panels
+};
+
+// A byte range of A, W or C.
+struct NpuView {
+  std::size_t offset = 0, length = 0;
 };
 
 class NpuSplit {
  public:
   virtual ~NpuSplit() = default;
-  // GPU buffers the NPU reads and writes: A (encoded activations), W (panels of encoded weights), C (panels of f32 C).
-  virtual const LoomBuffer& A() const = 0;
-  virtual const LoomBuffer& W() const = 0;
-  virtual const LoomBuffer& C() const = 0;
-  // Calls first .. first + count - 1 behind the stream's current position; returns the value to Join on.
-  virtual std::uint64_t Enqueue(std::uint32_t first, std::uint32_t count) = 0;
+  [[nodiscard]] virtual const LoomBuffer& A() const = 0;
+  [[nodiscard]] virtual const LoomBuffer& W() const = 0;
+  [[nodiscard]] virtual const LoomBuffer& C() const = 0;
+  // One call of the NPU GEMM image at path on these views (cold: loads and binds; the same arguments return the same id).
+  virtual std::uint32_t Bind(const std::string& image, NpuView a, NpuView w, NpuView c) = 0;
+  // The calls in order behind the stream's current position; returns the value to Join on.
+  virtual std::uint64_t Enqueue(const std::vector<std::uint32_t>& calls) = 0;
   // Orders the stream after that work (the host waits for it first).
   virtual void Join(std::uint64_t value) = 0;
 };
