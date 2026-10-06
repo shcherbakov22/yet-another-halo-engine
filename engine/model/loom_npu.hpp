@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <sys/mman.h>
 #include <deque>
 #include <fstream>
 #include <map>
@@ -58,6 +59,8 @@ class LoomNpu {
     std::size_t bytes = 0;
     int fd = -1;
     std::uint64_t fd_offset = 0;
+    void* host = nullptr;              // host pages (CreateShared host), else none
+    amdf_memory_t* native = nullptr;   // their libamdf registration, bound directly
   };
   struct View {
     Shared* shared;
@@ -116,7 +119,15 @@ class LoomNpu {
       for (auto* m : k->imports) api_->memory_destroy(m);
     }
     for (auto& [key, image] : images_) iree_hal_amd_xdna_image_destroy(image);
-    for (auto& s : shared_) close(s->fd);
+    for (auto& s : shared_) {
+      if (s->host) {   // the HRX import first, then the registration, then the pages
+        s->gpu.reset();
+        api_->memory_destroy(s->native);
+        munmap(s->host, s->bytes);
+      } else {
+        close(s->fd);
+      }
+    }
     if (queue_) api_->kernel_queue_destroy(queue_);
     if (context_) xdna_->context_destroy(context_);
     if (device_) api_->device_destroy(device_);
@@ -126,9 +137,41 @@ class LoomNpu {
   }
 
   // A zeroed GPU buffer the NPU can bind views of.
-  Shared& CreateShared(std::size_t bytes) {
+  // host: anonymous host pages registered with libamdf and imported into HRX instead of a device buffer the NPU imports.
+  // The NPU's DMA bypasses the SoC's memory-side cache (MALL), which the GPU fills from device memory: a line of a
+  // device buffer the GPU read before the NPU rewrote it can be read back stale (seen as wrong outputs in ~1 of 10
+  // runs, each with a deferred machine-check report). Host pages are not cached there: buffers the NPU writes use them.
+  Shared& CreateShared(std::size_t bytes, bool host = false) {
     auto s = std::make_unique<Shared>();
     s->bytes = Align(bytes);
+    if (host) {
+      s->host = mmap(nullptr, s->bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+      if (s->host == MAP_FAILED) throw LoomError("npu: mmap");
+      amdf_memory_create_info_t ci{};
+      ci.type = AMDF_STRUCTURE_TYPE_MEMORY_CREATE_INFO;
+      ci.structure_size = sizeof(ci);
+      ci.memory_profile_ordinal = RegisterProfile();
+      ci.access_count = 1;
+      ci.accesses = &access_;
+      ci.required_flags = AMDF_MEMORY_FLAG_HOST_VISIBLE;
+      ci.byte_length = s->bytes;
+      ci.minimum_alignment = 4096;
+      ci.registered_host_pointer = s->host;
+      ci.registered_host_cacheability = AMDF_HOST_CACHEABILITY_WRITE_BACK;
+      YAH_AMDF(api_->memory_create(scope_, &ci, &s->native), "memory_create(registered host)");
+      s->device = s->host;
+      s->gpu.size = s->bytes;
+      hrx_buffer_params_t params = {};
+      params.type = HRX_MEMORY_TYPE_DEVICE_VISIBLE;
+      params.access = HRX_MEMORY_ACCESS_READ | HRX_MEMORY_ACCESS_WRITE;
+      params.usage = HRX_BUFFER_USAGE_DEFAULT;
+      LoomCheck(hrx_allocator_import_buffer(hrx_device_allocator(gpu_.device()), params, s->host, s->bytes, &s->gpu.handle),
+                "hrx_allocator_import_buffer(host)");
+      gpu_.Fill(s->gpu, 0);
+      gpu_.Synchronize();
+      shared_.push_back(std::move(s));
+      return *shared_.back();
+    }
     s->gpu = gpu_.Allocate(s->bytes);
     gpu_.Fill(s->gpu, 0);
     gpu_.Synchronize();
@@ -170,11 +213,16 @@ class LoomNpu {
       em.payload.file_descriptor = v.shared->fd;
       em.source_byte_offset = v.shared->fd_offset + v.offset;
       em.byte_length = v.length;
-      amdf_memory_t* mem = nullptr;
-      YAH_AMDF(api_->memory_import(scope_, &ii, &em, &mem), "memory_import");
-      k->imports.push_back(mem);
-      std::uint64_t addr = 0;
+      amdf_memory_t* mem = v.shared->native;
+      std::uint64_t addr = 0, mem_off = 0;
+      if (mem) {   // registered host pages: bound at the view's offset
+        mem_off = v.offset;
+      } else {
+        YAH_AMDF(api_->memory_import(scope_, &ii, &em, &mem), "memory_import");
+        k->imports.push_back(mem);
+      }
       YAH_AMDF(api_->memory_query_address(mem, 0, AMDF_MEMORY_ADDRESS_XDNA_DMA, &addr), "memory_query_address");
+      addr += mem_off;
       // executable_bind checks this wrapper's range and access only; the span is never dereferenced.
       iree_hal_buffer_t* buffer = nullptr;
       NpuCheck(iree_hal_heap_buffer_wrap(
@@ -188,7 +236,7 @@ class LoomNpu {
       k->buffers.push_back(buffer);
       bindings[i].buffer_ref = iree_hal_make_buffer_ref(buffer, 0, v.length);
       bindings[i].memory = mem;
-      bindings[i].memory_byte_offset = 0;
+      bindings[i].memory_byte_offset = mem_off;
       bindings[i].device_address = addr;
     }
     k->storage.resize(rec.allocation_use_count);
@@ -308,6 +356,23 @@ class LoomNpu {
         resident_ = nullptr;
       }
       hrx_status_ignore(hrx_semaphore_signal(done_, job.signal));
+    }
+  }
+
+  // The memory profile that registers caller-owned host pages for NPU access (CreateShared host).
+  uint32_t RegisterProfile() {
+    for (uint32_t ord = 0;; ++ord) {
+      amdf_memory_profile_t p{};
+      p.type = AMDF_STRUCTURE_TYPE_MEMORY_PROFILE;
+      p.structure_size = sizeof(p);
+      amdf_memory_access_capabilities_t caps{};
+      caps.type = AMDF_STRUCTURE_TYPE_MEMORY_ACCESS_CAPABILITIES;
+      caps.structure_size = sizeof(caps);
+      const amdf_status_t st = api_->memory_scope_query_device_profile(scope_, ord, 1, &access_, &p, &caps);
+      if (amdf_status_code(st) == AMDF_STATUS_CODE_OUT_OF_RANGE) throw LoomError("npu: no host registration profile");
+      if (st == amdf_make_api_status(AMDF_STATUS_CODE_UNSUPPORTED)) continue;
+      YAH_AMDF(st, "memory_scope_query_device_profile(register)");
+      if (p.roles & AMDF_MEMORY_PROFILE_ROLE_REGISTER) return p.ordinal;
     }
   }
 
@@ -531,7 +596,7 @@ class LoomNpuSplit : public NpuSplit {
       : npu_(gpu, 8),
         a_(npu_.CreateShared(plan.a_bytes)),
         w_(npu_.CreateShared(plan.w_bytes)),
-        c_(npu_.CreateShared(plan.c_bytes)) {}
+        c_(npu_.CreateShared(plan.c_bytes, true)) {}   // the NPU writes C (see CreateShared)
   const LoomBuffer& A() const override { return a_.gpu; }
   const LoomBuffer& W() const override { return w_.gpu; }
   const LoomBuffer& C() const override { return c_.gpu; }
