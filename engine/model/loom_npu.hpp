@@ -29,6 +29,7 @@
 #include "iree/base/byte_sequence.h"
 #include "iree/hal/drivers/amd/xdna/image/aie2p/npu2.h"
 #include "model/loom_runtime.hpp"
+#include "model/npu_split.hpp"
 
 namespace yah::model {
 
@@ -488,6 +489,39 @@ class LoomNpu {
   bool stop_ = false;
   std::string failure_;
   std::thread relay_;
+};
+
+// The NPU side of LoomPrefill's column split: one shared A, plan.panels W / C panels, one bound kernel per panel.
+class LoomNpuSplit : public NpuSplit {
+ public:
+  LoomNpuSplit(LoomDevice& gpu, const NpuPlan& plan)
+      : npu_(gpu, 8),
+        a_(npu_.CreateShared(plan.a_bytes)),
+        w_(npu_.CreateShared(plan.panels * plan.w_panel)),
+        c_(npu_.CreateShared(plan.panels * plan.c_panel)) {
+    for (std::uint32_t p = 0; p < plan.panels; ++p)
+      kernels_.push_back(&npu_.Load(plan.image, "npu_gemm",
+                                    {{&a_, 0, plan.a_bytes},
+                                     {&w_, p * plan.w_panel, plan.w_panel},
+                                     {&c_, p * plan.c_panel, plan.c_panel}}));
+  }
+  const LoomBuffer& A() const override { return a_.gpu; }
+  const LoomBuffer& W() const override { return w_.gpu; }
+  const LoomBuffer& C() const override { return c_.gpu; }
+  std::uint64_t Enqueue(std::uint32_t first, std::uint32_t count) override {
+    if (first + count > kernels_.size()) throw LoomError("npu: call range");
+    npu_.CheckHealth();
+    return npu_.Enqueue({kernels_.begin() + first, kernels_.begin() + first + count});
+  }
+  void Join(std::uint64_t value) override {
+    npu_.Join(value);
+    npu_.CheckHealth();
+  }
+
+ private:
+  LoomNpu npu_;
+  LoomNpu::Shared &a_, &w_, &c_;
+  std::vector<LoomNpu::Kernel*> kernels_;
 };
 
 }  // namespace yah::model

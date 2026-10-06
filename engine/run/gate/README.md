@@ -19,5 +19,5 @@ gate_run.sh <candidate set> <cand_dir>
 Reading the result:
 
 - `kl_mean` saturates at ~4e-7 for any attention change that is not bit-exact; a single rounding change in attention (o * (1/sum) instead of o / sum) already gives 4.24e-7. Judge such changes on `kl_p999`, top-1 flips and PPL.
-- Exact-change references (hidden md5 of the current default sets, `ids2048` / `ids8192` prompts): pp2048 `ac36332b6b5092a4`, pp8192 `963b7396625e2333`.
+- Exact-change references (hidden md5 of the current default sets, `ids2048` / `ids8192` prompts): pp2048 `5e46a9a9465869c7` (since the f16 qkv / z outputs of 2026-10-05; before: `ac36332b6b5092a4`), pp8192 `963b7396625e2333`.
 - Recalibrating T1 needs a second independent reference; the HIP engine that produced it is gone (tag `hip-final`).

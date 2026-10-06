@@ -607,6 +607,82 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     return rows
 
 
+# NPU column split (YAH_NPU_SPLIT=<qkv rows>,<gate rows>, multiples of 512; empty: none): the NPU (XDNA2, HRX .xdna) computes
+# the trailing rows of the DeltaNet qkv (10240 rows) and gate (6144 rows) GEMMs, the GPU the leading ones. Per format:
+# the GPU's share "<gemm>.npu.hal" / "<gemm>.af.npu.hal" (the set's tile for the shape, gen_gemm_tile.OSTRIDE, f16 output)
+# and the NPU's rows decoded straight to its BFP16 weight stream "dqbfp_<fmt>_<mt>_<kb>.hal" (gen_gemm_tile.DQ_BFP). Once:
+# the activation encoder "npu_enc_act.hal", the C unpacks "npu_unpack_<mt>.hal" and the NPU GEMM "npu_gemm_5120.xdna"
+# (8 columns = 512 rows per call). dispatch.txt: "npusplit <qkv rows> <gate rows> 0", "npubytes <A> <W per call>
+# <C per call>", and per kernel "<hal> <workgroups> <workgroup size> 0" (the split GEMMs have GEMM rows).
+NPU_SPLIT = tuple(int(x) for x in os.environ.get("YAH_NPU_SPLIT", "").split(",") if x)
+NPU_KS = (33, 33, 33, 29)   # k-blocks per pass and K-slice row (gen_npu_gemm); K = 1024 * passes
+
+
+def npu_split(combos, B, outdir):
+    import gen_bfp16_encode as GE
+    import gen_gemm_tile as TG
+    import gen_npu_gemm as GN
+    import gen_npu_unpack as GU
+    sys.path.insert(0, os.path.dirname(HERE))
+    import hrx_paths
+    K, passes = 5120, 5
+    nn = dict(zip((640, 384), NPU_SPLIT))
+    assert len(nn) == 2 and all(v % 512 == 0 and 0 < v < mt * 16 for mt, v in nn.items()) and B % 512 == 0
+    rows = []
+    for kind, fmt, port, mt, kb in sorted(combos):
+        if kind != "kstore" or mt not in nn or kb * qk_of(fmt) != K or fmt not in TILE_FMTS:
+            continue
+        base = "gemm_kstore_%s_%d_%d.hal" % (fmt, mt, kb)
+        knobs = AF.get((fmt, "kstore", mt, kb))
+        if AFRAG and knobs is not None and B % AF_TILE["bn"] == 0:
+            knobs = dict(knobs)
+            knobs.pop("persist", None)
+            t = dataclasses.replace(TG.default_tile(fmt, "kstore", kb), **AF_TILE, **knobs)
+            out = base[:-4] + ".af.npu.hal"
+        else:
+            t = TG.default_tile(fmt, "kstore", kb)
+            if base[:-4] in tiles()["tiles"]:
+                t = dataclasses.replace(t, **tiles()["tiles"][base[:-4]])
+            out = base[:-4] + ".npu.hal"
+        mtg = mt - nn[mt] // 16
+        assert mtg % t.rowgrp == 0 and B % t.bn == 0, (fmt, mt)
+        TG.check(t)
+        rows.append(_emit_gen(lambda f, k, t=t: TG.gen(f, k, t, False), t.bn, fmt, mtg, kb, B, out, outdir, "kstore",
+                              t.rowgrp, ostride=mt * 16))
+        dt = dataclasses.replace(TG.default_tile(fmt, "kstore", kb), bm=64, wm=2, wn=4, decahead=False, ksub=64,
+                                 dbuf=False)
+        dq = "dqbfp_%s_%d_%d.hal" % (fmt, mt, kb)
+        TG.DQ_BFP = (NPU_KS, passes)
+        try:
+            _emit_gen(lambda f, k, dt=dt: TG.gen(f, "dequant", dt), dt.bn, fmt, nn[mt] // 16, kb, B, dq, outdir, "dequant",
+                      dt.rowgrp, sym="yah_dequant_%s_bfp16" % fmt)
+        finally:
+            TG.DQ_BFP = None
+        rows.append((dq, TG.dq_wgs(nn[mt] // 16, kb, dt, fmt), dt.lanes, 0))
+    tmp = os.path.join(outdir, ".emit_tmp")
+    os.makedirs(tmp, exist_ok=True)
+    src = os.path.join(tmp, "yah_bfp16_encode_act.loom")
+    open(src, "w").write(GE.gen("act", B, list(NPU_KS), passes))
+    E.emit(src, ["nop=0"], "npu_enc_act.hal", outdir)   # emit_hal.py wants a config; the encoder has none
+    rows.append(("npu_enc_act.hal", B // 8 * (K // 8) // GE.WG, GE.WG, 0))
+    for mt, n in nn.items():
+        src = os.path.join(tmp, "yah_npu_unpack_%d.loom" % mt)
+        open(src, "w").write(GU.gen(B, n // 64, mt * 16, mt * 16 - n, out16=mt in O16_MT))
+        E.emit(src, ["nop=0"], "npu_unpack_%d.hal" % mt, outdir)
+        rows.append(("npu_unpack_%d.hal" % mt, B * (n // 64) * 8 // GU.WG, GU.WG, 0))
+    cfg = GN.Config(8, B // 64, NPU_KS, passes)
+    src = os.path.join(tmp, "npu_gemm_5120.loom")
+    open(src, "w").write(GN.gen(cfg))
+    env = dict(hrx_paths.env(), LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1")
+    r = subprocess.run([hrx_paths.LOOM_COMPILE, src, "--root=@" + cfg.entry, "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
+                        "--output=" + os.path.join(outdir, "npu_gemm_5120.xdna")], capture_output=True, text=True, env=env)
+    if r.returncode:
+        raise SystemExit("NPU GEMM compile failed: " + r.stderr[-800:])
+    a, w, c = GN.stream_bytes(cfg)
+    rows += [("npusplit", nn[640], nn[384], 0), ("npubytes", a, w, c)]
+    return rows
+
+
 def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     """Emit the tile GEMM (tools/gen_gemm_tile.py) for this shape if it covers it; return its dispatch.txt row, else None.
     geom=(BM, BN, WM, WN) overrides the workgroup geometry for this one kernel."""
@@ -623,24 +699,32 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     return _emit_gen(lambda f, k: TG.gen(f, k, t, masked), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp, masked)
 
 
-def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False):
+def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, sym=None):
+    """ostride: a kstore over the leading mt * 16 rows of an ostride-row output (gen_gemm_tile.OSTRIDE, the NPU split);
+    f16 output then follows the full shape (O16_MT). sym: the kernel symbol, if not the GEMM's or the dequant's."""
     if B % tile and not masked:
         return None
     import gen_gemm_tile as _TG
-    _TG.OUT16 = kind == "kstore" and mt in O16_MT
+    _TG.OUT16 = kind == "kstore" and (ostride // 16 if ostride else mt) in O16_MT
+    _TG.OSTRIDE = ostride
     tt = -(-B // tile)
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
     src = os.path.join(tmp, "yah_sgemm_%s_%s.loom" % (fmt, kind))
-    with open(src, "w") as fh:
-        fh.write(gen(fmt, kind))
-    sym = "yah_ffn_gemm_%s%s" % (fmt.replace(":", "_"), {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
-    if kind == "dequant":
-        sym = "yah_dequant_" + fmt
+    try:
+        with open(src, "w") as fh:
+            fh.write(gen(fmt, kind))
+    finally:
+        _TG.OSTRIDE = 0
+    if sym is None:
+        sym = "yah_ffn_gemm_%s%s" % (fmt.replace(":", "_"), {"swiglu": "_swiglu", "kres": "_kres", "kqg": "_kqg", "ffn": "_ffn"}.get(kind, ""))
+        if kind == "dequant":
+            sym = "yah_dequant_" + fmt
     # Refuse before emitting if any declared operand footprint exceeds the buffer the driver binds: an overrun hangs the ring.
     import subprocess
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, fmt,
-                           kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else []),
+                           kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else [])
+                          + (["ostride=%d" % ostride] if ostride else []),
                           capture_output=True, text=True)
     if gate.returncode != 0:
         raise SystemExit("footprint gate refused %s: %s" % (out, (gate.stdout + gate.stderr).strip()[-400:]))
@@ -727,6 +811,8 @@ def main():
         n += 1
 
     geom.extend(ffn_fused(rows, B, outdir))
+    if NPU_SPLIT:
+        geom.extend(npu_split(combos, B, outdir))
 
     # The calibration menu (calibration_menu, for engine/model/prefill_calib.hpp) is shelved with the calibration;
     # YAH_CALIB_MENU=1 still emits it.

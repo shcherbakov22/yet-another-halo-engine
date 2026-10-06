@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048] [masked]
+"""footprint_gate.py <file.loom> <sym> <fmt> <kind> <m_tiles> <k_blocks> <token_tiles> [B=2048] [masked] [ostride=<rows>]
 
 Compile the source under the exact config and read each root's declared byte envelope from the compile report.
 Refuse (exit 3) unless every envelope fits the buffer loom_forward_pp binds for that root.
@@ -17,13 +17,15 @@ src, sym, fmt, kind, mt, kb, tt = sys.argv[1:8]
 mt, kb, tt = int(mt), int(kb), int(tt)
 B = int(sys.argv[8]) if len(sys.argv) > 8 else 2048
 # masked: the kernel declares its token count (config "tokens") and the last token tile is partial
+# ostride: a column-split kstore (gen_gemm_tile.OSTRIDE) writing into the full <rows>-row output
 # mixed ffn "<gate fmt>:<up fmt>": the weight binding holds both tensors
 fmts = fmt.split(":")
 qk, bpb = QB[fmts[0]]
 M, K = mt * 16, kb * qk
+MO = next((int(a.split("=")[1]) for a in sys.argv[9:] if a.startswith("ostride=")), M)
 wbytes = M * kb * sum(QB[f][1] for f in fmts) if len(fmts) > 1 else M * kb * bpb * (2 if kind == "ffn" else 1)
 bound = {"weight": wbytes, "input": B * K * 2, "resid": B * M * 4, "gate": B * M * 4,
-         "output": M * K * 2 if kind == "dequant" else B * M * (2 if kind in ("swiglu", "kqg", "ffn") else 4),
+         "output": M * K * 2 if kind == "dequant" else B * MO * (2 if kind in ("swiglu", "kqg", "ffn") else 4),
          "gate_out": B * M * 2,
          # the driver's grid buffers (loom_forward_pp.cc): 512 / 256 / 512 / 1024 words
          "grid": max({"iq3s": 2048, "iq3xxs": 1024, "iq2xxs": 2048, "iq2xs": 4096}.get(f, 0) for f in fmts),

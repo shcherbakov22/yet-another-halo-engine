@@ -330,6 +330,7 @@ class LoomGraph {
     LoomCheck(hrx_graph_create(gpu.device(), 0, &graph_), "hrx_graph_create");
   }
   ~LoomGraph() {
+    if (exec_) hrx_graph_exec_release(exec_);
     if (graph_) hrx_graph_release(graph_);
   }
   LoomGraph(const LoomGraph&) = delete;
@@ -373,13 +374,14 @@ class LoomGraph {
   [[nodiscard]] const std::array<uint32_t, 3>& Grid(size_t i) const { return grids_[i]; }
   [[nodiscard]] size_t size() const { return grids_.size(); }
 
-  // Instantiates the graph and queues it on the device stream, after everything queued before.
+  // Instantiates the graph now, so that Launch only queues it (segments joined by host waits launch back to back).
+  void Instantiate() {
+    if (!exec_) LoomCheck(hrx_graph_instantiate(graph_, 0, &exec_), "hrx_graph_instantiate");
+  }
+  // Queues the graph on the device stream, after everything queued before (instantiates it first if needed).
   void Launch() {
-    hrx_graph_exec_t exec = nullptr;
-    LoomCheck(hrx_graph_instantiate(graph_, 0, &exec), "hrx_graph_instantiate");
-    const hrx_status_t status = hrx_graph_exec_launch(exec, gpu_.stream());
-    hrx_graph_exec_release(exec);
-    LoomCheck(status, "hrx_graph_exec_launch");
+    Instantiate();
+    LoomCheck(hrx_graph_exec_launch(exec_, gpu_.stream()), "hrx_graph_exec_launch");
   }
 
  private:
@@ -405,6 +407,7 @@ class LoomGraph {
 
   LoomDevice& gpu_;
   hrx_graph_t graph_ = nullptr;
+  hrx_graph_exec_t exec_ = nullptr;
   std::set<hrx_buffer_t> read_only_;
   std::map<hrx_buffer_t, std::vector<Access>> accesses_;
   std::deque<std::vector<hrx_buffer_ref_t>> bindings_;

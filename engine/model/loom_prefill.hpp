@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -29,6 +30,7 @@
 #include "core/gguf.hpp"
 #include "model/loom_decoder.hpp"
 #include "model/loom_runtime.hpp"
+#include "model/npu_split.hpp"
 #include "model/prefill_calib.hpp"
 
 namespace yah::model {
@@ -70,6 +72,24 @@ class LoomPrefill {
     return {attn_kq4_ ? 4u : attn_kq8_ ? 8u : 16u, attn_vq4_ ? 4u : attn_vq8_ ? 8u : 16u};
   }
   LoomBuffer& hidden() { return *hidden_; }
+
+  // The NPU column split this set carries (dispatch.txt "npusplit" / "npubytes"); panels == 0: none.
+  [[nodiscard]] NpuPlan npu_plan() const {
+    NpuPlan p;
+    const auto s = geom_.find("npusplit"), b = geom_.find("npubytes");
+    if (s == geom_.end() || b == geom_.end()) return p;
+    p.a_bytes = b->second.tokens, p.w_panel = b->second.rowgrp, p.c_panel = b->second.tt;
+    p.panels = (s->second.tokens + s->second.rowgrp) / 512;
+    p.image = dir_ + "/npu_gemm_5120.xdna";
+    return p;
+  }
+  // Split the DeltaNet qkv / gate GEMMs of full chunks with the NPU from now on: it computes their trailing
+  // npusplit rows. npu (built from npu_plan()) outlives this object.
+  void EnableNpu(NpuSplit* npu) {
+    const auto s = geom_.find("npusplit");
+    if (!npu || s == geom_.end()) throw LoomError("prefill: the set has no NPU split");
+    npu_ = npu, npu_qkv_ = s->second.tokens, npu_gate_ = s->second.rowgrp;
+  }
 
   // Zero the recurrent state before a new sequence. KV rows need no reset: attention reads only keys <= the query.
   void Reset() {
@@ -122,15 +142,14 @@ class LoomPrefill {
       gpu_.Synchronize();
       return;
     }
-    LoomGraph graph(gpu_);
-    graph.ReadOnly(weights_);
-    for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, ksigns_, eps_, reszero_})
-      graph.ReadOnly(t->handle);
     if (!df_planned_) PlanDecodeFree(ci);
-    graph_ = &graph;
+    // NPU split: full chunks only; the chunk then launches as several graph segments joined by NPU calls
+    npu_on_ = npu_ && n_ == B_;
+    segments_.clear();
+    NewSegment();
     nodes_.clear();
-    const bool calibrate = calib_ && calib_->BeginChunk(n_);
-    df_on_ = !df_plan_.empty() && n_ > kDfMinTokens;
+    const bool calibrate = !npu_on_ && calib_ && calib_->BeginChunk(n_);
+    df_on_ = !npu_on_ && !df_plan_.empty() && n_ > kDfMinTokens;
     df_k_ = 0;
     if (df_on_) DispatchDequant(0);
     RecordLayers(ci, hook);
@@ -145,8 +164,15 @@ class LoomPrefill {
         calib_.reset();
       }
     }
-    if (gpu_.profiling()) session_chunks_.push_back(nodes_);  // every graph of the session, to match them in order
-    graph.Launch();
+    // every graph of the session, to match them in order (one graph per chunk; NPU chunks are not matched)
+    if (gpu_.profiling() && segments_.size() == 1) session_chunks_.push_back(nodes_);
+    for (auto& seg : segments_) seg.graph->Instantiate();
+    std::uint64_t ticket = 0;
+    for (auto& seg : segments_) {
+      seg.graph->Launch();
+      if (seg.after == Segment::kEnqueue) ticket = npu_->Enqueue(seg.first, seg.count);
+      if (seg.after == Segment::kJoin) npu_->Join(ticket);
+    }
   }
 
   // The last RunLayers graph's dispatches in node order (= the command index of their dispatch timestamps).
@@ -895,6 +921,68 @@ class LoomPrefill {
   }
   void DfNext() { ++df_k_; }
 
+  // NPU split (EnableNpu): the GPU's share of a kstore GEMM is "<hal>.npu.hal" ("<hal>.af.npu.hal" for the afrag form),
+  // its leading rows at the full output stride; "" if the set has none for this tensor.
+  std::string SplitHal(const std::string& wname, bool af) const {
+    Fmt f{};
+    const std::string base = GemmHal("gemm_kstore", *Find(wname), &f);
+    const std::string hal = (af ? base.substr(0, base.size() - 4) + ".af.hal" : base);
+    const std::string v = hal.substr(0, hal.size() - 4) + ".npu.hal";
+    return geom_.count(v) ? v : "";
+  }
+  // The GPU's rows [0, rows - npu_rows) of kstore wname (hal: SplitHal); out keeps the full row stride.
+  void RunKstoreSplit(const std::string& wname, const LoomBuffer& out, bool af, const std::string& hal,
+                      std::uint32_t npu_rows) {
+    const auto* t = Find(wname);
+    Fmt f{};
+    GemmHal("gemm_kstore", *t, &f);
+    const Geom g = GeomOf(hal);
+    auto b = GemmWeights(*t, f);
+    const std::size_t first = b.size();
+    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{af ? normt_ : scratch_, wstage_, ostage_})
+      b.push_back(Ref(*x));
+    b.push_back(Ref(out));
+    const std::uint32_t tt = Trim(b, first, {std::size_t(t->dims[0]) * 2, 0, 0, std::size_t(t->dims[1]) * 4}, g);
+    Dispatch(Exe(hal), ("yah_ffn_gemm_" + std::string(f.name)).c_str(), (MTiles(*t) - npu_rows / 16) / g.rowgrp, tt, 1,
+             32, 1, 1, b, GemmWrites(b, f, {&out}));
+  }
+  // The NPU's rows of wname (its last npu_rows) decoded straight into its BFP16 weight panels at w
+  // ("dqbfp_<fmt>_<mt>_<kb>.hal", dispatch.txt: <workgroups> <workgroup size>).
+  void NpuWeights(const std::string& wname, std::uint32_t npu_rows, const hrx_buffer_ref_t& w) {
+    const auto* t = Find(wname);
+    Fmt f{};
+    const std::string base = GemmHal("gemm_kstore", *t, &f);
+    const std::string dq = "dqbfp" + base.substr(std::strlen("gemm_kstore"));
+    const auto& g = geom_.at(dq);
+    auto b = GemmWeights(*t, f);
+    const std::size_t row_bytes = static_cast<std::size_t>(t->bytes) / static_cast<std::size_t>(t->dims[1]);
+    b[0].offset += (static_cast<std::size_t>(t->dims[1]) - npu_rows) * row_bytes;
+    b[0].length = std::size_t{npu_rows} * row_bytes;
+    b.push_back(w);
+    Dispatch(Exe(dq), ("yah_dequant_" + std::string(f.name) + "_bfp16").c_str(), g.tokens, 1, 1, g.rowgrp, 1, 1, b,
+             std::uint64_t{1} << (b.size() - 1));
+  }
+  // Graph segments of a chunk: each launches after the previous one; after it, the NPU calls [first, first + count)
+  // are enqueued behind it, or the stream joins the NPU work last enqueued.
+  struct Segment {
+    enum After { kNone, kEnqueue, kJoin };
+    std::unique_ptr<LoomGraph> graph;
+    After after = kNone;
+    std::uint32_t first = 0, count = 0;
+  };
+  void NewSegment() {
+    segments_.push_back(Segment{std::make_unique<LoomGraph>(gpu_)});
+    LoomGraph& g = *segments_.back().graph;
+    g.ReadOnly(weights_);
+    for (const LoomBuffer* t : {grid_iq3s_, grid_iq3xxs_, grid_iq2xxs_, grid_iq2xs_, ksigns_, eps_, reszero_})
+      g.ReadOnly(t->handle);
+    graph_ = &g;
+  }
+  void Cut(Segment::After after, std::uint32_t first = 0, std::uint32_t count = 0) {
+    segments_.back().after = after, segments_.back().first = first, segments_.back().count = count;
+    NewSegment();
+  }
+
   // af: the afrag form, input normt_ (fragment-major)
   void RunKstore(const std::string& wname, const LoomBuffer& out, bool af = false) {
     const auto* t = Find(wname);
@@ -1113,10 +1201,35 @@ class LoomPrefill {
     const std::uint32_t si = l - l / cfg_.full_attention_interval;
     // alpha / beta first: they read the norm's row-major copy (21 MB), which the qkv / gate GEMMs would evict from the
     // last-level cache (0.18 vs ~0.39 M cycles each)
-    RunKstore(pre + "ssm_alpha.weight", *alpha_);
-    RunKstore(pre + "ssm_beta.weight", *beta_);
-    RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af);
-    RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
+    const std::string qkv_split = npu_on_ ? SplitHal(pre + "attn_qkv.weight", qkv_af) : "";
+    const std::string gate_split = npu_on_ ? SplitHal(pre + "attn_gate.weight", gate_af) : "";
+    if (!qkv_split.empty() && !gate_split.empty()) {
+      // NPU split: the NPU's operands, its calls beside alpha / beta and the GPU's rows of qkv / gate, then its C
+      const NpuPlan plan = npu_plan();
+      const std::uint32_t pq = npu_qkv_ / 512, pg = npu_gate_ / 512;
+      const auto& enc = geom_.at("npu_enc_act.hal");
+      Dispatch(Exe("npu_enc_act.hal"), "yah_bfp16_encode_act", enc.tokens, 1, 1, enc.rowgrp, 1, 1,
+               {Ref(*scratch_), Ref(npu_->A())});
+      NpuWeights(pre + "attn_qkv.weight", npu_qkv_, {npu_->W().handle, 0, pq * plan.w_panel});
+      NpuWeights(pre + "attn_gate.weight", npu_gate_, {npu_->W().handle, pq * plan.w_panel, pg * plan.w_panel});
+      Cut(Segment::kEnqueue, 0, pq + pg);
+      RunKstore(pre + "ssm_alpha.weight", *alpha_);
+      RunKstore(pre + "ssm_beta.weight", *beta_);
+      RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, npu_qkv_);
+      RunKstoreSplit(pre + "attn_gate.weight", *gate_, gate_af, gate_split, npu_gate_);
+      Cut(Segment::kJoin);
+      for (const auto& [hal, first, n, out] : {std::tuple{"npu_unpack_640.hal", 0u, pq, qkv_},
+                                               std::tuple{"npu_unpack_384.hal", pq, pg, gate_}}) {
+        const auto& u = geom_.at(hal);
+        Dispatch(Exe(hal), "yah_npu_unpack", u.tokens, 1, 1, u.rowgrp, 1, 1,
+                 {{npu_->C().handle, first * plan.c_panel, n * plan.c_panel}, Ref(*out)}, 2);
+      }
+    } else {
+      RunKstore(pre + "ssm_alpha.weight", *alpha_);
+      RunKstore(pre + "ssm_beta.weight", *beta_);
+      RunKstore(pre + "attn_qkv.weight", *qkv_, qkv_af);
+      RunKstore(pre + "attn_gate.weight", *gate_, gate_af);
+    }
     const hrx_buffer_ref_t cs{conv_state_->handle, std::size_t{si} * kQkv * 4 * 4, std::size_t{kQkv} * 4 * 4};
     const hrx_buffer_ref_t st{state_->handle, std::size_t{si} * kTs * kState * kState * 4,
                               std::size_t{kTs} * kState * kState * 4};
@@ -1174,6 +1287,10 @@ class LoomPrefill {
   std::uint32_t qrot_first_ = 0;  // first chunk whose attention reads yah_qrot's rotated Q (dispatch.txt "qrot")
   std::uint32_t n_ = 0;  // real tokens of the chunk from the last Embed
   LoomGraph* graph_ = nullptr;  // open while RunLayers records
+  std::vector<Segment> segments_;  // the chunk's graph segments (one without the NPU)
+  NpuSplit* npu_ = nullptr;        // EnableNpu
+  bool npu_on_ = false;            // this chunk splits with the NPU
+  std::uint32_t npu_qkv_ = 0, npu_gate_ = 0;  // NPU rows of the DeltaNet qkv / gate GEMMs
   // The last RunLayers graph's dispatches in node order.
   std::vector<Node> nodes_;
   std::unique_ptr<PrefillCalib> calib_;

@@ -32,23 +32,7 @@ cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_bench.cc" \
     -o "$root/engine/build/hal_bench" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
-# Prefill driver.
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_forward_pp.cc" \
-    -o "$root/engine/build/loom_forward_pp" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
-# Decode driver (tools/emit_decode.py sets).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_decode.cc" \
-    -o "$root/engine/build/loom_decode" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
-# Tile-GEMM variant bench for the autotuner (engine/tune).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/gemm_bench.cc" \
-    -o "$root/engine/build/gemm_bench" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
-# One-dispatch correctness harness for generated kernels (tools/gemv_check.py).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_run.cc" \
-    -o "$root/engine/build/hal_run" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
-# NPU (libamdf + the xdna loader, static from the HRX build): the GPU / NPU split harness (tools/npu_split_check.py).
+# NPU (libamdf + the xdna loader, static from the HRX build): the prefill driver's NPU split (YAH_NPU) and its harness.
 npu_inc=(-I"$YAH_HRX" -I"$YAH_HRX/runtime/src" -I"$H/runtime/src" -I"$YAH_HRX/libamdf/include" -I"$H"
          -isystem "$H/_deps/linux_uapi/include")
 npu_libs=()
@@ -67,7 +51,25 @@ for a in experimental/xdna/libiree_experimental_xdna_amdf_status.a experimental/
          runtime/src/iree/base/internal/libiree_base_internal_time.a runtime/src/iree/base/libiree_base_base.a; do
   npu_libs+=("$H/$a")
 done
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_inc[@]}" -DIREE_ALLOCATOR_SYSTEM_CTL=iree_allocator_libc_ctl \
+npu_flags=("${npu_inc[@]}" -DIREE_ALLOCATOR_SYSTEM_CTL=iree_allocator_libc_ctl)
+# Prefill driver.
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" "$root/engine/run/loom_forward_pp.cc" \
+    -o "$root/engine/build/loom_forward_pp" "$root/engine/build/libyah_core.a" \
+    -Wl,--start-group "${npu_libs[@]}" -Wl,--end-group -L"$libhrx" -lhrx -licuuc -lpthread -lm -ldl
+# Decode driver (tools/emit_decode.py sets).
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/loom_decode.cc" \
+    -o "$root/engine/build/loom_decode" "$root/engine/build/libyah_core.a" \
+    -L"$libhrx" -lhrx -licuuc -lpthread
+# Tile-GEMM variant bench for the autotuner (engine/tune).
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/gemm_bench.cc" \
+    -o "$root/engine/build/gemm_bench" "$root/engine/build/libyah_core.a" \
+    -L"$libhrx" -lhrx -licuuc -lpthread
+# One-dispatch correctness harness for generated kernels (tools/gemv_check.py).
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_run.cc" \
+    -o "$root/engine/build/hal_run" "$root/engine/build/libyah_core.a" \
+    -L"$libhrx" -lhrx -licuuc -lpthread
+# GPU / NPU split harness (tools/npu_split_check.py).
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "${npu_flags[@]}" \
     "$root/engine/run/npu_split_run.cc" -o "$root/engine/build/npu_split_run" "$root/engine/build/libyah_core.a" \
     -Wl,--start-group "${npu_libs[@]}" -Wl,--end-group -L"$libhrx" -lhrx -licuuc -lpthread -lm -ldl
 # The Responses API server (engine/serve).
