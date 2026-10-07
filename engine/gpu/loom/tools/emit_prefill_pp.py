@@ -813,6 +813,15 @@ def npu_split(rows, combos, B, outdir):
             E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
                          "yah_half_norm.fused=0"], name, outdir)
         out.append(("npunormbfp", 1, 0, 0))
+    # the DeltaNet postnorm over heads 0 .. DNSPLIT[0] - 1 (exactly ssm_out's NPU K chunk) also writes the NPU's BFP16
+    # input (gen_postnorm_bfp): "postnorm[_t]_a_bfp.hal"
+    if "out" in NPU_SPLIT and DNSPLIT and DNSPLIT[0] * 128 == 1024 * NPU_PASSES:
+        import gen_postnorm_bfp
+        for tiled, name in ((False, "postnorm_a_bfp.hal"), (True, "postnorm_t_a_bfp.hal")):
+            src = os.path.join(tmp, name[:-4] + ".loom")
+            open(src, "w").write(gen_postnorm_bfp.gen(B, 0, DNSPLIT[0], list(NPU_KS), NPU_PASSES, tiled, 384 in O16_MT))
+            E.emit(src, ["yah_ssm_postnorm_fp16.head_count=%d" % (DNSPLIT[0] * B)], name, outdir)
+        out.append(("npupostnormbfp", 1, 0, 0))
     # unpacks
     for site, n in sorted(NPU_SPLIT.items()):
         skind, mt, kb = NPU_SITES[site]

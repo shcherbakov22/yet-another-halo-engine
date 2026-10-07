@@ -1568,8 +1568,13 @@ class LoomPrefill {
     const hrx_buffer_ref_t gate{gate_->handle, 0, std::size_t{B_} * kInner * 4};
     if (dnsplit_a_) {
       const std::string pn = out_af ? "postnorm_t" : "postnorm";
-      Dispatch(Exe(pn + "_a.hal"), "yah_ssm_postnorm_fp16", dnsplit_a_ * B_ / 8, 1, 1, 256, 1, 1,
-               {Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
+      // heads [0, a) are ssm_out's NPU K chunk: with "npupostnormbfp" this part also writes the NPU's input into A and
+      // NpuEncode("out") skips the encoder (RunResidual splits only full chunks; an unused A costs nothing)
+      const bool bfp = geom_.count("npupostnormbfp") && NpuRows("out") && trim_row_ == kAllRows && tail_ == kAllRows;
+      norm_bfp_ = bfp ? "out" : "";
+      std::vector<hrx_buffer_ref_t> b{Ref(*raw_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)};
+      if (bfp) b.push_back({npu_->A().handle, 0, NpuK(5120).a});
+      Dispatch(Exe(pn + (bfp ? "_a_bfp.hal" : "_a.hal")), "yah_ssm_postnorm_fp16", dnsplit_a_ * B_ / 8, 1, 1, 256, 1, 1, b);
       Dispatch(Exe(pn + "_b.hal"), "yah_ssm_postnorm_fp16", dnsplit_b_ * B_ / 8, 1, 1, 256, 1, 1,
                {Ref(*raw2_), TRef(*Find(pre + "ssm_norm.weight")), gate, Ref(*scratch_)});
     } else {
