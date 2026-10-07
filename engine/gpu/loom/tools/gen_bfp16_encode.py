@@ -6,14 +6,22 @@ E is the f32 exponent field of the row block's max |x| (0 for an all-zero block)
 A slab is 16 rows x KS k-blocks: per k-block the fragments of rows 0-7 then 8-15 (144 bytes), padded to 64 bytes.
 
 The NPU GEMM splits K per pass over the column's rows (K-slices with ks[r] k-blocks each, PK = sum(ks) per pass).
-  act: [slice][M block][pass][MP slabs]   rows = tokens, MP = TM / 16 slabs per M block
-  wgt: [column][slice][pass][NP slabs]    rows = output features, NP = TN / 16 slabs per NPU column
+Its memory tiles replay the passes of a call in groups (GROUPS: all M blocks over passes 0-1, then over 2-4), so both
+streams are group-major:
+  act: [slice][group][M block][pass in group][MP slabs]   rows = tokens, MP = TM / 16 slabs per M block
+  wgt: [column][group][slice][pass in group][NP slabs]    rows = output features, NP = TN / 16 slabs per NPU column
+A call of other pass counts is one group (the layouts without the group level).
 One work item per fragment; a lane pair takes rows 0-7 and 8-15 of one k-block (its 144 contiguous bytes), adjacent pairs
 adjacent k-blocks: a wave writes whole lines (half records left partial lines for other waves: read-modify-write in DRAM).
 """
 import sys
 
 WG = 256
+GROUPS = (2, 3)   # passes per replay group of a 5-pass call (gen_npu_gemm)
+
+
+def pass_groups(passes):
+    return GROUPS if sum(GROUPS) == passes else (passes,)
 
 
 def slab_bytes(ks, pad=True):
@@ -136,11 +144,16 @@ def emit_offset(e, layout, rows, ks, passes, tile, pad, g8, kbi, p="", ind="    
     The caller defines the index constants %{p}c2, %{p}c144, %{p}c72, %{p}csub (tile / 16), %{p}cpk (sum(ks)) and %{p}cpass."""
     sb = [slab_bytes(k, pad) for k in ks]
     sub = tile // 16
+    groups = pass_groups(passes)
+    ga, gb = groups[0], groups[-1]
     if layout == "act":
         nblk = rows // tile
         base = [sum(nblk * passes * sub * sb[j] for j in range(i)) for i in range(len(ks))]
     else:
-        base = [sum(passes * sub * sb[j] for j in range(i)) for i in range(len(ks))]
+        # per group: the slices' bases inside the group's region of the column panel
+        base = [sum(ga * sub * sb[j] for j in range(i)) for i in range(len(ks))]
+        base_b = [sum(gb * sub * sb[j] for j in range(i)) for i in range(len(ks))]
+        region_b = sum(ga * sub * b for b in sb)
         panel = sum(passes * sub * b for b in sb)
     start = [sum(ks[:i]) for i in range(len(ks))]
 
@@ -152,10 +165,21 @@ def emit_offset(e, layout, rows, ks, passes, tile, pad, g8, kbi, p="", ind="    
     x(f"%{p}slab = index.rem %{p}g16, %{p}csub : index")
     x(f"%{p}pass = index.div {kbi}, %{p}cpk : index")
     x(f"%{p}o = index.rem {kbi}, %{p}cpk : index")
+    # replay group of the pass (its size; group offsets fold into non-negative constants, no subtraction to prove)
+    x(f"%{p}cga = index.constant {ga} : index")
+    x(f"%{p}cgb = index.constant {gb} : index")
+    x(f"%{p}cz = index.constant 0 : index")
+    x(f"%{p}gy = index.cmp uge, %{p}pass, %{p}cga : index")
+    x(f"%{p}gsz = scf.select %{p}gy, %{p}cgb, %{p}cga : index")
     # K-slice of o: a compare chain over the cumulative starts
     sel_base, sel_start, sel_sb = f"%{p}cb0", f"%{p}cs0", f"%{p}csb0"
     for i in range(len(ks)):
-        x(f"%{p}cb{i} = index.constant {base[i]} : index")
+        if layout == "act":
+            x(f"%{p}cb{i} = index.constant {base[i]} : index")
+        else:
+            x(f"%{p}cba{i} = index.constant {base[i]} : index")
+            x(f"%{p}cbb{i} = index.constant {base_b[i] + region_b - ga * sub * sb[i]} : index")
+            x(f"%{p}cb{i} = scf.select %{p}gy, %{p}cbb{i}, %{p}cba{i} : index")
         x(f"%{p}cs{i} = index.constant {start[i]} : index")
         x(f"%{p}csb{i} = index.constant {sb[i]} : index")
     for i in range(1, len(ks)):
@@ -166,8 +190,12 @@ def emit_offset(e, layout, rows, ks, passes, tile, pad, g8, kbi, p="", ind="    
         sel_base, sel_start, sel_sb = f"%{p}sb_{i}", f"%{p}ss_{i}", f"%{p}sz_{i}"
     x(f"%{p}kin = index.sub %{p}o, {sel_start} : index")
     if layout == "act":
-        x(f"%{p}r0 = index.mul %{p}blk, %{p}cpass : index")
-        x(f"%{p}r1 = index.add %{p}r0, %{p}pass : index")
+        # record (gst * nblk + blk * gsz + pass - gst) * sub + slab of the slice, gst the group's first pass
+        x(f"%{p}cgo = index.constant {ga * (nblk - 1)} : index")
+        x(f"%{p}r0 = scf.select %{p}gy, %{p}cgo, %{p}cz : index")
+        x(f"%{p}r1a = index.mul %{p}blk, %{p}gsz : index")
+        x(f"%{p}r1b = index.add %{p}r0, %{p}r1a : index")
+        x(f"%{p}r1 = index.add %{p}r1b, %{p}pass : index")
         x(f"%{p}r2 = index.mul %{p}r1, %{p}csub : index")
         x(f"%{p}rec = index.add %{p}r2, %{p}slab : index")
         x(f"%{p}slo = index.mul %{p}rec, {sel_sb} : index")

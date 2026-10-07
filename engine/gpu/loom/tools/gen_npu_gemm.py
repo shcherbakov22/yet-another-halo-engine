@@ -16,10 +16,18 @@ Dataflow: weights stage once per column in its memory tile and replay per M bloc
 stream, staged in a memory tile and multicast along the row. Activations arrive one 16-row slab per record into a
 leaf-synchronized ring (the leaf acquires and releases slabs, constrain.leaf_sync); the tail holds C as 4
 leaf-synchronized segments, acquired on a segment's first pass and released after its last.
-Needs HRX patch 0013; compile with LOOM_EXP_LOCKED_PACK=1 LOOM_EXP_LATE_STORAGE=1 LOOM_EXP_LS_SEND_PITCH=2.
+A 5-pass call replays its passes in groups (gen_bfp16_encode.GROUPS: every M block over passes 0-1, then over 2-4), each
+group a C partial ([col][group][M block]..., summed by the GPU unpack): a group's memory-tile slots refill with the next
+call's weights while the other group computes, so calls stream back to back (Loom LOOM_EXP_PANEL_GROUPS /
+LOOM_EXP_PANEL_STREAM: counting locks, a looping fill, invocations [setup | even push | odd push | waits] and fills
+paced a few columns at a time so they do not starve the activation streams of DRAM; LoomNpu submits the pushes one call
+ahead of the waits).
+Needs HRX patch 0013; compile with LOOM_ENV.
 """
 import dataclasses
 import sys
+
+import gen_bfp16_encode as GE
 
 MBMS4 = "(reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>, reg<aie2p.mbms>) -> reg<aie2p.mbms x4>"
 ORDER_C = (0, 2, 1, 3)   # MMA order of the 4 chains inside a k step (a-row, w-col: c >> 1, c & 1)
@@ -28,6 +36,9 @@ WB = 9                   # pops of the next sub-tile that ride in the cascade-wr
 MP, NP = 4, 5            # 16-row slabs per M block / per NPU column
 TM, TN = 16 * MP, 16 * NP
 KS = (35, 35, 35, 23)    # production k-blocks per pass and K-slice row: K = 1024 per pass
+# loom-compile environment for the NPU image
+LOOM_ENV = dict(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2",
+                LOOM_EXP_PANEL_GROUPS=",".join(map(str, GE.GROUPS)), LOOM_EXP_PANEL_STREAM="1")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,6 +53,13 @@ class Config:
     entry: str = "npu_gemm"
 
 
+def groups(cfg):
+    """The call's replay groups of passes, () for a single group."""
+    g = GE.pass_groups(cfg.passes)
+    assert len(g) <= 2
+    return g if len(g) > 1 else ()
+
+
 def slab(ks):
     return (144 * ks + 63) // 64 * 64
 
@@ -50,7 +68,7 @@ def stream_bytes(cfg):
     """(activation, weight, C) binding sizes."""
     a = sum(cfg.nb * cfg.passes * MP * slab(k) for k in cfg.ks)
     w = cfg.cols * sum(cfg.passes * NP * slab(k) for k in cfg.ks)
-    return a, w, cfg.cols * cfg.nb * MP * NP * 2 * 256
+    return a, w, max(1, len(groups(cfg))) * cfg.cols * cfg.nb * MP * NP * 2 * 256
 
 
 def bump(L, dst, src, off):
@@ -90,8 +108,9 @@ def array_program(L, cfg):
     # C first: rings are placed in channel order, so the tail's C claims whole banks before its input rings
     e(f"  %ncols = constant.u32 {cols} : reg<aie2p.array.scalar : index>")
     seg = MP * NP * 4 * 256 // MP
-    e(f"  %nseg = constant.u32 {nb * MP} : reg<aie2p.array.scalar : index>")
-    e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nb * MP}x{seg // 8}xi32>>")
+    ng = max(1, len(groups(cfg)))   # C segments per M block and group
+    e(f"  %nseg = constant.u32 {ng * nb * MP} : reg<aie2p.array.scalar : index>")
+    e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{ng * nb * MP}x{seg // 8}xi32>>")
     for c in range(cols):
         e(f"  %cr{c} = partition.receiver %c_all, %origin, %n{c}, %ncols : reg<aie2p.array.receiver : tile<{seg // 8}xi32>>")
         e(f"  %sc{c} = sender %k{c}_{rows - 1}, 2 : reg<aie2p.array.sender : tile<{seg // 8}xi32>>")
@@ -167,11 +186,27 @@ def leaf(L, cfg, role, ks):
         # pass counter in private storage; C segments are acquired on the first pass and released after the last
         e("  %cst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
         e("  %cnp = storage_address %cst : low.storage<private> -> reg<aie2p.ep>")
-        e(f"  %npass = mova.i32 {cfg.passes}")
-        e("  %cnt = lda %cnp, 0")
-        e("  %first = lt %cnt, %one")
-        e(f"  %pm2 = mova.i32 {cfg.passes - 2}")
-        e("  %clast = lt %pm2, %cnt")
+        grp = groups(cfg)
+        if grp:
+            # %cnt: the pass within the group; %gs: the group (0 / 1); %gd: the passes done in the group's phase
+            ga, gb = grp
+            e("  %cnt = lda %cnp, 0")
+            e("  %gs = lda %cnp, 4")
+            e("  %gd = lda %cnp, 8")
+            e(f"  %gdiff = mova.i32 {gb - ga}")
+            e(f"  %ga = mova.i32 {ga}")
+            e("  %gsd = mul %gs, %gdiff")
+            e("  %gsz = add.rr %ga, %gsd")
+            e("  %first = lt %cnt, %one")
+            e(f"  %gam2 = mova.i32 {ga - 2}")
+            e("  %pm2 = add.rr %gam2, %gsd")
+            e("  %clast = lt %pm2, %cnt")
+        else:
+            e(f"  %npass = mova.i32 {cfg.passes}")
+            e("  %cnt = lda %cnp, 0")
+            e("  %first = lt %cnt, %one")
+            e(f"  %pm2 = mova.i32 {cfg.passes - 2}")
+            e("  %clast = lt %pm2, %cnt")
         # first pass: C loads read a 1 KB zero buffer with step 0
         e("  %zst = storage {byte_alignment = 64, byte_length = 1024} : low.storage<private>")
         e("  %zbp = storage_address %zst : low.storage<private> -> reg<aie2p.ep>")
@@ -189,10 +224,29 @@ def leaf(L, cfg, role, ks):
             e(f"  vst.acc %zp, %zbb, {64 * q - 512}")
         e("  low.br ^start(%zbb: reg<aie2p.ep>)")
         e("^start(%plb: reg<aie2p.ep>):")
-        e("  %cn1 = add.rr %cnt, %one")
-        e("  %cwrap = lt %cn1, %npass")
-        e("  %cnn = mul %cn1, %cwrap")
-        e("  st %cnn, %cnp, 0")
+        if grp:
+            e("  %cn1 = add.rr %cnt, %one")
+            e("  %cwrap = lt %cn1, %gsz")
+            e("  %cnn = mul %cn1, %cwrap")
+            e("  st %cnn, %cnp, 0")
+            e(f"  %gnb = mova.i32 {cfg.nb}")
+            e("  %gplen = mul %gnb, %gsz")
+            e("  %gd1 = add.rr %gd, %one")
+            e("  %gmore = lt %gd1, %gplen")   # 1 while the group's phase continues
+            e("  %gdn = mul %gd1, %gmore")
+            e("  st %gdn, %cnp, 8")
+            e("  %gsw = lt %gmore, %one")     # 1 at the phase switch: s <- 1 - s
+            e("  %gs2 = add.rr %gs, %gs")
+            e("  %gt = mul %gs2, %gsw")
+            e("  %gsa = add.rr %gs, %gsw")
+            e("  %gtn = mul %gt, %am1")
+            e("  %gsn = add.rr %gsa, %gtn")
+            e("  st %gsn, %cnp, 4")
+        else:
+            e("  %cn1 = add.rr %cnt, %one")
+            e("  %cwrap = lt %cn1, %npass")
+            e("  %cnn = mul %cn1, %cwrap")
+            e("  st %cnn, %cnp, 0")
     body(L, cfg, role, ks, a_adv, acap)
 
 

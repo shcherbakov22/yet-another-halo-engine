@@ -4,14 +4,14 @@
 usage: npu_gemm_check.py <workdir> <cols> <m_blocks> <ks,ks,ks,ks> <passes> [act.f16 wgt.f16]
 
 Operands are random (wide per-row dynamic range) or f16 files: activations [64 * m_blocks][K], weights [TN * cols][K] (gen_npu_gemm.TN).
-They are packed with the encoder's numpy oracle (bfp16_check.reference), the image runs through iree-xdna-run, and C is
-compared with the exact product of the bfp16 values; C is bf16: within half an ulp of the exact product (f32 accumulation order is ~1e-7 below that).
-NPU_REPEAT=N also times N invocations with the control-only continuation (perf pmode is the caller's job).
+They are packed with the encoder's numpy oracle (bfp16_check.reference), the image runs through iree-xdna-run, and each C
+partial (one per replay group of passes, gen_npu_gemm.groups) is compared with the exact product of its K range of the
+bfp16 values; C is bf16: within half an ulp of the exact product (f32 accumulation order is ~1e-7 below that).
+Time the NPU with the counter profiler, not wall clock.
 """
 import os
 import subprocess
 import sys
-import time
 
 import numpy as np
 
@@ -23,9 +23,17 @@ import gen_npu_gemm as N  # noqa: E402
 import hrx_paths  # noqa: E402
 
 
-def unpack_c(raw, cols, nb):
-    """C binding [col][M block][slab mp][slab np][chain][8][8] (as f32) -> [TM * nb][TN * cols]."""
-    c = raw.reshape(cols, nb, N.MP, N.NP, 2, 2, 8, 8)
+def unpack_c(raw, cols, nb, groups=1, group=None):
+    """C binding [col][group][M block][slab mp][slab np][chain][8][8] (as f32) -> [TM * nb][TN * cols]: the sum of the
+    groups' partials in order (as the GPU unpack adds them), or partial group only."""
+    c = raw.reshape(cols, groups, nb, N.MP, N.NP, 2, 2, 8, 8)
+    if group is not None:
+        c = c[:, group]
+    else:
+        acc = c[:, 0]
+        for g in range(1, groups):
+            acc = acc + c[:, g]
+        c = acc
     return c.transpose(1, 2, 4, 6, 0, 3, 5, 7).reshape(N.TM * nb, N.TN * cols)
 
 
@@ -61,7 +69,7 @@ def main():
     img = os.path.join(work, "npu_gemm.xdna")
     open(src, "w").write(N.gen(cfg))
     env = hrx_paths.env()
-    env.update(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2")
+    env.update(N.LOOM_ENV)
     run([hrx_paths.LOOM_COMPILE, src, f"--root=@{cfg.entry}", "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
          f"--output={img}"], env, "loom-compile")
     a_b, w_b, c_b = (os.path.join(work, n) for n in ("a.bin", "w.bin", "c.bin"))
@@ -86,25 +94,22 @@ def main():
             sys.exit(f"iree-xdna-run failed\n{r.stderr[-2000:]}")
     if width is None:
         sys.exit("no context width admitted the image")
-    got = unpack_c((np.fromfile(co, np.uint16).astype(np.uint32) << 16).view(np.float32), cols, nb)   # bf16 C
-    ref = value(a) @ value(w).T
-    ulp = np.exp2(np.floor(np.log2(np.maximum(np.abs(ref), 1e-30))) - 7)   # of bf16 at ref
-    err = (np.abs(got - ref) / ulp).max()
+    raw = (np.fromfile(co, np.uint16).astype(np.uint32) << 16).view(np.float32)   # bf16 C
+    grp = N.groups(cfg) or (passes,)
+    err, k0 = 0.0, 0
+    for g, gp in enumerate(grp):   # each group's partial: its K range
+        k1 = k0 + 8 * gp * sum(ks)
+        part = unpack_c(raw, cols, nb, len(grp), g)
+        ref = value(a[:, k0:k1]) @ value(w[:, k0:k1]).T
+        ulp = np.exp2(np.floor(np.log2(np.maximum(np.abs(ref), 1e-30))) - 7)   # of bf16 at ref
+        err = max(err, (np.abs(part - ref) / ulp).max())
+        k0 = k1
+    got = unpack_c(raw, cols, nb, len(grp))
     exact = a.astype(np.float64) @ w.astype(np.float64).T
     rms = np.sqrt(np.mean((got - exact) ** 2) / np.mean(exact ** 2))
-    print(f"npu gemm {M}x{Nn}x{K} ks={list(ks)} passes={passes} (context {width} columns): max |err| "
+    print(f"npu gemm {M}x{Nn}x{K} ks={list(ks)} passes={passes} groups={list(grp)} (context {width} columns): max |err| "
           f"{err:.3f} bf16 ulp vs the bfp16 oracle; rel RMS {rms:.2e} vs unquantized f16")
-    reps = int(os.environ.get("NPU_REPEAT", "0"))
-    if reps:
-        def timed(n):
-            t0 = time.perf_counter()
-            run([hrx_paths.XDNA_RUN, f"--columns={width}", "--repeat_invocation", f"--invocation_count={n}"] + base,
-                env, "timing")
-            return time.perf_counter() - t0
-        t1, t2 = min(timed(2) for _ in range(3)), min(timed(2 + reps) for _ in range(3))
-        us = (t2 - t1) / reps * 1e6
-        print(f"  {us:.1f} us per repeat invocation, {M * Nn * K / us / 1e6:.2f} TMAC/s")
-    sys.exit(0 if err <= 0.501 else 1)   # C rounded once (RNE) from f32 accumulation
+    sys.exit(0 if err <= 0.501 else 1)   # each partial rounded once (RNE) from f32 accumulation
 
 
 if __name__ == "__main__":

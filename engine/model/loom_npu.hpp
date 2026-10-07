@@ -70,6 +70,10 @@ class LoomNpu {
   struct Kernel {
     const void* image_key = nullptr;
     amdf_xdna_kernel_command_t first{}, repeat{};
+    // A streamed image (gen_npu_gemm groups: four invocations) queues a call with push[parity] and retires the
+    // oldest queued call with wait; first sets the array up and runs one whole call.
+    bool stream = false;
+    amdf_xdna_kernel_command_t push[2]{}, wait{};
     std::vector<iree_hal_amd_xdna_executable_storage_t> storage;
     std::vector<amdf_host_mapping_t*> storage_maps;
     std::vector<amdf_memory_t*> imports;
@@ -112,6 +116,10 @@ class LoomNpu {
     }
     cv_.notify_all();
     if (relay_.joinable()) relay_.join();
+    for (auto& a : arenas_) {
+      api_->host_mapping_destroy(a.map);
+      api_->memory_destroy(a.storage.memory);
+    }
     for (auto& k : kernels_) {
       for (auto* m : k->storage_maps) api_->host_mapping_destroy(m);
       for (auto& s : k->storage) api_->memory_destroy(s.memory);
@@ -259,6 +267,13 @@ class LoomNpu {
     NpuCheck(iree_hal_amd_xdna_executable_query_continuation(image, entry_ordinal, n, k->storage.data(), true,
                                                              &k->repeat),
              "query_continuation");
+    if (rec.invocation_count == 4) {
+      k->stream = true;
+      for (uint32_t i = 0; i < 3; ++i)
+        NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(image, entry_ordinal, n, k->storage.data(), i + 1,
+                                                                       i < 2 ? &k->push[i] : &k->wait),
+                 "query_invocation_ordinal");
+    }
     kernels_.push_back(std::move(k));
     return *kernels_.back();
   }
@@ -309,6 +324,66 @@ class LoomNpu {
   }
 
  private:
+  // A streamed run of calls as one command: [push c0][push c1][wait][push c2][wait] ... [wait][wait] (pushes on
+  // alternating descriptor sets, at most two calls queued), the bodies of the calls' own relocated commands under one
+  // native transaction header (format 0.1: operation count at byte 8, byte length at 12). Built once per call list
+  // into command arenas (allocating per command cost ~1 ms on the relay thread).
+  struct Arena {
+    iree_hal_amd_xdna_executable_storage_t storage{};
+    amdf_host_mapping_t* map = nullptr;
+    std::size_t used = 0;
+  };
+  static constexpr std::size_t kArenaBytes = 8u << 20, kCommandAlign = 32768;
+  static const std::uint8_t* CommandBytes(const Kernel& k, const amdf_xdna_kernel_command_t& c) {
+    for (const auto& st : k.storage)
+      if (st.memory == c.memory) return static_cast<const std::uint8_t*>(st.mapping.data) + (c.byte_offset - st.memory_byte_offset);
+    throw LoomError("npu: command outside its kernel storage");
+  }
+  const amdf_xdna_kernel_command_t& FusedCommand(const std::vector<Kernel*>& calls) {
+    if (const auto it = fused_.find(calls); it != fused_.end()) return it->second;
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t ops = 0;
+    auto append = [&](const Kernel& k, const amdf_xdna_kernel_command_t& c) {
+      const std::uint8_t* src = CommandBytes(k, c);
+      std::uint32_t n = 0, size = 0;
+      std::memcpy(&n, src + 8, 4), std::memcpy(&size, src + 12, 4);
+      if (size != c.byte_length) throw LoomError("npu: unexpected command header");
+      if (bytes.empty()) bytes.assign(src, src + 16);
+      bytes.insert(bytes.end(), src + 16, src + size);
+      ops += n;
+    };
+    int queued = 0;
+    for (std::size_t i = 0; i < calls.size(); ++i) {
+      append(*calls[i], calls[i]->push[i & 1]);
+      if (++queued == 2) append(*calls[i], calls[i]->wait), --queued;
+    }
+    for (; queued > 0; --queued) append(*calls.back(), calls.back()->wait);
+    const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
+    std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
+    if (size > kArenaBytes) throw LoomError("npu: fused command exceeds its arena");
+    if (arenas_.empty() || arenas_.back().used + size > kArenaBytes) {
+      arenas_.emplace_back();
+      iree_xdna_elf_allocation_record_t req{};
+      req.domain = IREE_XDNA_ELF_ALLOCATION_DOMAIN_COMMAND;
+      req.byte_length = kArenaBytes;
+      req.alignment = kCommandAlign;
+      AllocateStorage(req, &arenas_.back().storage, &arenas_.back().map);
+    }
+    Arena& a = arenas_.back();
+    std::memcpy(static_cast<std::uint8_t*>(a.storage.mapping.data) + a.used, bytes.data(), size);
+    YAH_AMDF(api_->host_mapping_cache_control(a.map, AMDF_HOST_CACHE_OPERATION_FLUSH, a.used, size),
+             "host_mapping_cache_control(fused)");
+    amdf_xdna_kernel_command_t c{};
+    c.memory = a.storage.memory;
+    c.access_ordinal = a.storage.access_ordinal;
+    c.byte_offset = a.storage.memory_byte_offset + a.used;
+    c.byte_length = size;
+    a.used += (size + kCommandAlign - 1) / kCommandAlign * kCommandAlign;
+    return fused_[calls] = c;
+  }
+  std::map<std::vector<Kernel*>, amdf_xdna_kernel_command_t> fused_;
+  std::deque<Arena> arenas_;
+
   struct Job {
     hrx_timeline_point_t after;
     std::vector<Kernel*> kernels;
@@ -330,17 +405,33 @@ class LoomNpu {
         LoomCheck(hrx_semaphore_wait(job.after.semaphore, job.after.value, UINT64_MAX), "relay: GPU wait");
         const auto t0 = std::chrono::steady_clock::now();
         std::uint64_t submission = 0;
-        for (Kernel* k : job.kernels) {
-          // The control-only continuation needs the image's array state resident.
-          // The first run of an image, or a run after another image, sets it up.
-          const bool resident = resident_ == k->image_key;
+        auto submit = [&](const amdf_xdna_kernel_command_t* command) {
           amdf_xdna_kernel_queue_submission_info_t si{};
           si.type = AMDF_STRUCTURE_TYPE_XDNA_KERNEL_QUEUE_SUBMISSION_INFO;
           si.structure_size = sizeof(si);
           si.command_count = 1;
-          si.commands = resident ? &k->repeat : &k->first;
+          si.commands = command;
           YAH_AMDF(xdna_->kernel_queue_submit(queue_, &si, &submission), "kernel_queue_submit");
-          resident_ = k->image_key;
+        };
+        // A run of streamed calls goes out as one fused command (FusedCommand): calls overlap inside it, and no
+        // command boundary falls while a call's DMA work is in flight (separate commands at that point hung the NPU
+        // firmware under DRAM contention).
+        std::size_t i = 0;
+        while (i < job.kernels.size()) {
+          Kernel* k = job.kernels[i];
+          // The control-only continuation needs the image's array state resident.
+          // The first run of an image, or a run after another image, sets it up.
+          const bool resident = resident_ == k->image_key;
+          if (!k->stream || !resident) {
+            submit(resident ? &k->repeat : &k->first);
+            resident_ = k->image_key;
+            ++i;
+            continue;
+          }
+          std::size_t j = i;
+          while (j < job.kernels.size() && job.kernels[j]->stream && job.kernels[j]->image_key == k->image_key) ++j;
+          submit(&FusedCommand(std::vector<Kernel*>(job.kernels.begin() + i, job.kernels.begin() + j)));
+          i = j;
         }
         YAH_AMDF(api_->kernel_queue_wait(queue_, submission, AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait");
         last_job_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

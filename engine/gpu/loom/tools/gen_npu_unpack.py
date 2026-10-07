@@ -17,6 +17,9 @@ import gen_npu_gemm as GN
 
 
 
+CG = len(GE.GROUPS)   # C partials per NPU call, one per replay group, summed here
+
+
 def wg(cols):
     """Workgroup size of an unpack over cols NPU columns: 8 tokens x 32 column chunks, 16 where 32 do not divide them."""
     nch = cols * GN.TN // 8
@@ -43,7 +46,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     TN, NJ = GN.TN, GN.TN // 8
     assert tokens % 64 == 0 and off + TN * cols <= (2 if qg else 1) * stride
     items = tokens * cols * NJ
-    c_elems = tokens * cols * TN
+    c_elems = tokens * cols * TN * CG   # one call's C: per column [group][M block][...]
     L = []
     e = L.append
     flags = "".join(f" {k}" for k, v in (("resid", resid), ("rem", rem), ("swiglu", swiglu), ("tiled", tiled), ("qg", qg),
@@ -104,7 +107,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  %wg = kernel.workgroup.id<x> : index")
     e("  %tid = kernel.workitem.id<x> : index")
     for nm, v in (("c8", 8), ("c2", 2), ("c4", 4), ("c16", 16), ("c64", 64), ("cnj", NJ), ("cnp", GN.NP),
-                  ("ctn", TN), ("ctile", 64 * TN), ("cmb", tokens // 64), ("ccols", cols), ("cstride", stride), ("coff", off)):
+                  ("ctn", TN), ("ctile", 64 * TN), ("cmb", tokens // 64 * CG), ("ccols", cols), ("cstride", stride), ("coff", off)):
         e(f"  %{nm} = index.constant {v} : index")
     if tiled:
         e("  %c256t = index.constant 256 : index")
@@ -135,7 +138,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  %row = index.rem %r, %c8 : index")
     e("  %npi = index.div %j, %c2 : index")
     e("  %nh = index.rem %j, %c2 : index")
-    # C element: tile * 64 * TN + ((mp * NP + np) * 4 + mh * 2 + nh) * 64 + row * 8
+    # C element (group 0): tile * 64 * TN + ((mp * NP + np) * 4 + mh * 2 + nh) * 64 + row * 8
     e("  %a0 = index.mul %mpi, %cnp : index")
     e("  %a1 = index.add %a0, %npi : index")
     e("  %a2 = index.mul %a1, %c4 : index")
@@ -182,12 +185,13 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     else:
         e("  %tb = index.mul %tok, %cstride : index")
         e("  %oa = index.add %tb, %jo : index")
-    load_c(e, "%v", "%ca")
+    e(f"  %cgs = index.constant {tokens * TN} : index")   # group stride inside a column
+    load_cg(e, "%v", "%ca")
     val = "%v"
     for p in range(1, parts):   # the K chunks' partial sums
         e(f"  %cpo{p} = index.constant {p * c_elems} : index")
         e(f"  %cpa{p} = index.add %ca, %cpo{p} : index")
-        load_c(e, f"%cp{p}", f"%cpa{p}")
+        load_cg(e, f"%cp{p}", f"%cpa{p}")
         e(f"  %cs{p} = vector.addf {val}, %cp{p} : vector<8xf32>")
         val = f"%cs{p}"
     if rem:   # token tok, NPU column j2 of the [tokens][TN * cols] partial
@@ -204,7 +208,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     if swiglu:   # silu(gate) * up per element, the swiglu epilogue's ops (gen_gemm_tile)
         e(f"  %cuo = index.constant {c_elems} : index")
         e("  %cua = index.add %ca, %cuo : index")
-        load_c(e, "%vu", "%cua")
+        load_cg(e, "%vu", "%cua")
         e("  %one = scalar.constant 1.0 : f32")
         e("  %negone = scalar.constant -1.0 : f32")
         TG.rcp_consts(e)
@@ -238,6 +242,22 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def load_cg(e, dst, idx):
+    """The 8 C values at element idx of a call's group 0 plus the same values of its other groups (%cgs apart)."""
+    if CG == 1:
+        load_c(e, dst, idx)
+        return
+    n = dst[1:]
+    load_c(e, f"%{n}g0", idx)
+    acc = f"%{n}g0"
+    for g in range(1, CG):
+        e(f"  %{n}gi{g} = index.add {idx if g == 1 else f'%{n}gi{g - 1}'}, %cgs : index")
+        load_c(e, f"%{n}g{g}", f"%{n}gi{g}")
+        nxt = dst if g == CG - 1 else f"%{n}gs{g}"
+        e(f"  {nxt} = vector.addf {acc}, %{n}g{g} : vector<8xf32>")
+        acc = nxt
 
 
 def load_c(e, dst, idx):

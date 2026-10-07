@@ -38,7 +38,7 @@ def main():
     dt = np.float16 if out16 else np.float32
     nblk = parts * (2 if swiglu else 1)
     os.makedirs(work, exist_ok=True)
-    c = np.random.default_rng(3).standard_normal(nblk * tokens * cols * TN).astype(np.float32) * 3
+    c = np.random.default_rng(3).standard_normal(nblk * tokens * cols * TN * G.CG).astype(np.float32) * 3
     cb = ((c.view(np.uint32) + 0x7FFF + ((c.view(np.uint32) >> 16) & 1)) >> 16).astype(np.uint16)   # C is bf16 (RNE)
     c = (cb.astype(np.uint32) << 16).view(np.float32)
     cf, of, sf = (os.path.join(work, n) for n in ("c.f32", "out.f32", "nan.f32"))
@@ -78,7 +78,7 @@ def main():
         if "hal_run: ok" not in r.stdout:
             sys.exit(f"hal_run failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
         q, g = np.fromfile(of, np.float32).reshape(tokens, stride), np.fromfile(gfo, np.float32).reshape(tokens, stride)
-        want = N.unpack_c(c, cols, tokens // 64)
+        want = N.unpack_c(c, cols, tokens // 64, G.CG)
         exp_q = np.full((tokens, stride), np.nan, np.float32)
         exp_g = exp_q.copy()
         for j in range(TN * cols):
@@ -95,8 +95,8 @@ def main():
     if tiled:   # back to row-major
         got = got.reshape(tokens // 16, stride // 16, 16, 16).transpose(0, 2, 1, 3)
     got = got.reshape(tokens, stride)
-    pe = tokens * cols * TN
-    blk = [N.unpack_c(c[i * pe:(i + 1) * pe], cols, tokens // 64) for i in range(nblk)]
+    pe = tokens * cols * TN * G.CG
+    blk = [N.unpack_c(c[i * pe:(i + 1) * pe], cols, tokens // 64, G.CG) for i in range(nblk)]
     if swiglu:
         g, u = blk[0].astype(np.float32), blk[1].astype(np.float32)
         want = (g * (np.float32(1) / (np.float32(1) + np.exp(-g))) * u).astype(np.float32)

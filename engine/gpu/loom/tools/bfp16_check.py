@@ -44,11 +44,14 @@ def offsets(layout, rows, ks, passes, tile, pad):
     sb = np.array([G.slab_bytes(k, pad) for k in ks])
     sub = tile // 16
     start = np.cumsum([0] + ks[:-1])
+    groups = G.pass_groups(passes)
+    ga, gb = groups[0], groups[-1]
     if layout == "act":
         nblk = rows // tile
         base = np.cumsum([0] + [nblk * passes * sub * b for b in sb[:-1]])
     else:
-        base = np.cumsum([0] + [passes * sub * b for b in sb[:-1]])
+        base_g = [np.cumsum([0] + [g * sub * b for b in sb[:-1]]) for g in (ga, gb)]
+        region_b = int(sum(ga * sub * b for b in sb))
         panel = int(sum(passes * sub * b for b in sb))
     g8 = np.arange(rows // 8)[:, None]
     kbi = np.arange(kb)[None, :]
@@ -57,11 +60,15 @@ def offsets(layout, rows, ks, passes, tile, pad):
     p, o = kbi // pk, kbi % pk
     sl = np.searchsorted(start, o, side="right") - 1
     kin = o - start[sl]
+    gy = p >= ga                                # replay group (gen_bfp16_encode GROUPS)
+    gst = np.where(gy, ga, 0)
+    gsz = np.where(gy, gb, ga)
+    pin = p - gst
     if layout == "act":
-        rec = (blk * passes + p) * sub + slab
+        rec = (gst * nblk + blk * gsz + pin) * sub + slab
         off = base[sl] + rec * sb[sl]
     else:
-        off = blk * panel + base[sl] + (p * sub + slab) * sb[sl]
+        off = blk * panel + np.where(gy, region_b, 0) + np.where(gy, base_g[1][sl], base_g[0][sl]) + (pin * sub + slab) * sb[sl]
     return off + kin * 144 + h * 72
 
 

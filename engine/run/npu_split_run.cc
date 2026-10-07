@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
       npu.Join(ticket);
       {
         hrx_buffer_ref_t b[] = {{sc.gpu.handle, 0, panels * c_panel}, {out.handle, 0, out.size}};
-        gpu.Dispatch(unpack, 0, cfg1(num("unpack_wgs"), 256), nullptr, 0, b, 2);
+        gpu.Dispatch(unpack, 0, cfg1(num("unpack_wgs"), num("unpack_wg")), nullptr, 0, b, 2);
       }
       gpu.Synchronize();
       npu.CheckHealth();

@@ -5,7 +5,8 @@ usage: npu_split_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [
 
 Emits the GPU kernels (activation encoder, the NPU's rows decoded to BFP16, the split kstore, the C unpack)
 and the NPU image, runs them on one stream with the NPU relay, and checks the output: the GPU's rows bit-identical to
-the full kstore GEMM, the NPU's rows against the float64 product of the bfp16 operands (within half a bf16 ulp: C is bf16).
+the full kstore GEMM, the NPU's rows against the float64 product of the bfp16 operands: C is one bf16 partial per replay
+group of passes (gen_npu_gemm.groups), summed by the unpack, so within half a bf16 ulp of each group's exact product.
 npu_rows is a multiple of 8 * gen_npu_gemm.TN (one NPU call per 640 output features). Needs PYTHONPATH with llama.cpp's gguf-py.
 """
 import os
@@ -86,7 +87,7 @@ def main():
     xsrc, ximg = os.path.join(work, "npu.loom"), os.path.join(work, "npu.xdna")
     open(xsrc, "w").write(GN.gen(cfg))
     env = hrx_paths.env()
-    env.update(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2")
+    env.update(GN.LOOM_ENV)
     r = subprocess.run([hrx_paths.LOOM_COMPILE, xsrc, f"--root=@{cfg.entry}",
                         "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11", f"--output={ximg}"],
                        capture_output=True, text=True, env=env)
@@ -99,7 +100,7 @@ def main():
             "split_hal": split, "split_gx": (N - nn) // 16 // t.rowgrp, "full_hal": full, "full_gx": N // 16 // t.rowgrp, "split_gy": tt, "split_wg": t.lanes,
             "enc_act_hal": enc_act, "enc_act_wgs": tokens // 8 * (K // 8) // GE.WG,
             "dq_hal": dq, "dq_wgs": TG.dq_wgs(nn // 16, kb, dt, fmt), "dq_wg": dt.lanes,
-            "unpack_hal": unpack, "unpack_wgs": tokens * nn // 8 // GU.wg(nn // GN.TN),
+            "unpack_hal": unpack, "unpack_wgs": tokens * nn // 8 // GU.wg(nn // GN.TN), "unpack_wg": GU.wg(nn // GN.TN),
             "npu_xdna": ximg, "npu_entry": cfg.entry, "npu_columns": 8, "tables": ",".join(tables), "iters": iters, "warmup_ms": 4000}
     pf = os.path.join(work, "plan.txt")
     open(pf, "w").write("".join(f"{k}={v}\n" for k, v in plan.items()))
@@ -123,17 +124,21 @@ def main():
     yfull = np.fromfile(yf, np.float32).reshape(tokens, N)
     gpu_same = np.array_equal(y[:, :N - nn].view(np.uint32), yfull[:, :N - nn].view(np.uint32))
     w = quants.dequantize(np.ascontiguousarray(np.asarray(tn.data)[N - nn:]), tn.tensor_type).astype(np.float16)
-    ref = NC.value(x) @ NC.value(w).T
+    xv, wv = NC.value(x), NC.value(w)
+    ref, bound, k0 = 0, 0, 0
+    for gp in GN.groups(cfg) or (passes,):   # each group's partial is bf16 (RNE): half an ulp of its exact product
+        k1 = k0 + 8 * gp * sum(KS)
+        part = xv[:, k0:k1] @ wv[:, k0:k1].T
+        ref, bound, k0 = ref + part, bound + 0.5 * np.exp2(np.floor(np.log2(np.maximum(np.abs(part), 1e-30))) - 7), k1
     got = y[:, N - nn:]
-    ulp = np.exp2(np.floor(np.log2(np.maximum(np.abs(ref), 1e-30))) - 7)   # the NPU's C is bf16
-    err = (np.abs(got - ref) / ulp).max()
+    err = (np.abs(got - ref) / bound).max()   # in units of the bound
     rms = np.sqrt(np.mean((got - yfull[:, N - nn:]) ** 2) / np.mean(yfull[:, N - nn:].astype(np.float64) ** 2))
     print(f"{name} ({fmt}) {tokens}x{N}x{K}, NPU rows {nn} ({panels} calls): GPU rows "
-          f"{'bit-identical' if gpu_same else 'DIFFER'}; NPU rows max |err| {err:.3f} bf16 ulp vs the bfp16 oracle, "
-          f"rel RMS {rms:.2e} vs the GPU GEMM")
+          f"{'bit-identical' if gpu_same else 'DIFFER'}; NPU rows max |err| {err:.3f} of the half-ulp-per-partial bound vs "
+          f"the bfp16 oracle, rel RMS {rms:.2e} vs the GPU GEMM")
     for f in (out, yf):
         os.remove(f)
-    sys.exit(0 if gpu_same and err <= 0.501 else 1)
+    sys.exit(0 if gpu_same and err <= 1.002 else 1)
 
 
 if __name__ == "__main__":
