@@ -17,6 +17,7 @@ import emit_prefill as E  # noqa: E402
 import gen_attn_fa  # noqa: E402
 import gen_deltanet_hip  # noqa: E402
 import gen_gdn_chunk  # noqa: E402
+import gen_conv_kq  # noqa: E402
 import gen_kres_persist  # noqa: E402
 import gen_half_norm  # noqa: E402
 import gen_kvq  # noqa: E402
@@ -1124,11 +1125,16 @@ def main():
     dn_src = os.path.join(tmp, "yah_deltanet_hip_f32.loom")
     open(dn_src, "w").write(gen_gdn_chunk.gen() if B % 32 == 0 else gen_deltanet_hip.gen())
     # the conv pairs with the DeltaNet kernel: f16 normalized hand-off to the chunked one, f32 conv_out otherwise
-    text = open(os.path.join(E.LOOM, "yah_ssm_conv_kq_f32.loom")).read()
-    if 640 in O16_MT:
-        text = conv_x16(text)
-    if B % 32 == 0 and gen_gdn_chunk.CONV16:
-        text = conv_n16(text)
+    # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
+    conv_tb = 640 in O16_MT and B % gen_conv_kq.TB == 0 and B % 32 == 0 and gen_gdn_chunk.CONV16
+    if conv_tb:
+        text = gen_conv_kq.gen()
+    else:
+        text = open(os.path.join(E.LOOM, "yah_ssm_conv_kq_f32.loom")).read()
+        if 640 in O16_MT:
+            text = conv_x16(text)
+        if B % 32 == 0 and gen_gdn_chunk.CONV16:
+            text = conv_n16(text)
     conv_src = os.path.join(tmp, "yah_ssm_conv_kq.loom")
     open(conv_src, "w").write(text)
     prepab_src = os.path.join(tmp, "yah_deltanet_prep_ab.loom")
@@ -1148,6 +1154,8 @@ def main():
             open(src, "w").write(gen_gdn_chunk.gen(h0, nh))
             dn_parts.append((tag, h0, nh, src))
         geom.append(("dnsplit", 0, ha, hb))
+    if conv_tb:
+        geom.append(("convtb", gen_conv_kq.TB, 0, 0))
 
     # loom_forward_pp reads the launch geometry from dispatch.txt instead of recomputing the grid.
     # So the dispatch site and the compiled kernel cannot disagree; a mismatch is silent and wrong, not a crash.

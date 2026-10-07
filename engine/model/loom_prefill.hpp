@@ -1542,7 +1542,10 @@ class LoomPrefill {
     const hrx_buffer_ref_t st{state_->handle, std::size_t{si} * kTs * kState * kState * 4,
                               std::size_t{kTs} * kState * kState * 4};
     // The conv with the q / k L2 norm (prep_kq) fused in.
-    Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", 40, B_, 1, 256, 1, 1,
+    // dispatch.txt "convtb <tokens>": a workgroup per tokens (gen_conv_kq), else per token
+    const auto ctb = geom_.find("convtb");
+    const std::uint32_t conv_tb = ctb != geom_.end() ? ctb->second.tokens : 1;
+    Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", 40, B_ / conv_tb, 1, 256, 1, 1,
              {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
     // One lane index does two jobs: advance the conv ring past the real tokens (i < qkv_size; the next chunk and the
     // decoder read it) and alpha / beta (i < B * heads). So the grid covers max() of the two.
