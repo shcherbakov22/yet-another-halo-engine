@@ -340,6 +340,8 @@ Prefill attention, DeltaNet and pipeline:
 - Freeing host power (no busy-poll) for GPU clock: no clock gain; the GPU is thermal-limited, not power-limited.
 - HIP graph capture / persistent kernels for prefill: ~0.02%; a kernel boundary is free when the kernel has real work.
 - NPU-side weight decode in a decoder column (2026-10-07): column 7's tiles decode raw GGUF rows into the GEMM columns' memory-tile panels instead of the GPU writing BFP16. A Q4_K decoder leaf was byte-exact (~41 cycles per 64-value fragment with scale tables from the GPU; the IQ3 formats need ~30 vector moves per fragment for gathers, indices and signs), but the column it takes is worth about as much as the decode: the 8th NPU column adds 10.5% NPU throughput (7 columns: 438 us per 560-row call vs 448 us per 640-row call, ffn), ~90 ms of GPU work against ~100 ms of decode, and 560-row calls meet the GPU's 128-row tile groups only every 4480 rows. AIE2P facts from it are in hardware.md.
+- GPU weight decode for the NPU placed after its segment, inside the NPU join wait (2026-10-07): pp2048 1947.0 / 1946.0 / 1949.4 -> 1959.2 / 1966.3 / 1967.9 ms (+16), bit-identical; the decode then sits on the critical path instead of under the GEMMs.
+- Non-temporal (GLC + SLC) stores for the GPU decode's BFP16 output (2026-10-07, local Loom gfx11 cache-policy encoding): pp2048 +6 / +8 / +27 ms, bit-identical. GL2C counters: the decode kernels' L2-to-DRAM write requests +19% (19.8 -> 23.6 M; streaming evicts lines before the 8-byte-per-lane stores fill them) and the other kernels' L2 hits unchanged (+0.3%), so nothing to win back. The ~40 ms of pollution the store-window ablation showed is likely MALL residency, which gfx11 stores cannot steer.
 
 Decode:
 
