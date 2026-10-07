@@ -29,7 +29,8 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     remainder) is added to the C chunks before the residual (bindings c, resid, rem, out). bfp = (ks, passes, chunk_k,
     chunks) with swiglu: also the NPU's BFP16 activation stream of the next GEMM (ffn_down, whose input columns these are) for
     the columns in its K chunks (chunk_k columns each, gen_bfp16_encode "act" layout, one stream per chunk back to back;
-    binding a after out): an item's 8 columns of one token are one bfp16ebs8 row block, encoded from the f16 values."""
+    binding a after out): an item's 8 columns of one token are one bfp16ebs8 row block, encoded from the f16 values
+    (stage_bfp: a workgroup takes 8 tokens x 32 column chunks, so each chunk's row blocks are one stream fragment)."""
     assert not (resid and (swiglu or tiled or out16)) and not (swiglu and parts > 1) and (resid or not rem)
     assert not bfp or swiglu
     assert not qg or not (resid or swiglu or tiled or out16)
@@ -82,6 +83,9 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         e("  %c_na, %out_na, %ab_na = buffer.assume.noalias %c, %out, %ab : buffer, buffer, buffer")
         e(f"  %nab = index.constant {bcb * bnck} : index")
         e("  %abv = buffer.view %ab_na[%base] : buffer -> view<[%nab]xi8>")
+        e("  %bs_bytes = index.constant 2304 : offset")   # 32 column chunks x 8 tokens x 9 bytes
+        e("  %bs_buf = buffer.alloca<workgroup> align(16) %bs_bytes : buffer")
+        e("  %bs_view = buffer.view %bs_buf[%base] : buffer -> view<2304xi8>")
     else:
         e("  %c_na, %out_na = buffer.assume.noalias %c, %out : buffer, buffer")
     e("  %cv = buffer.view %c_na[%base] : buffer -> view<[%nc]xi32>")
@@ -99,19 +103,36 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     if qg:
         e("  %c512q = index.constant 512 : index")
         e("  %c256q = index.constant 256 : index")
-    # item = (((blk * 16 + r4) * cols + col) * 4 + rr) * NJ + j: token blk * 64 + r4 * 4 + rr, j = 8-column chunk (np, nh)
-    e("  %i0 = index.mul %wg, %cwg : index")
-    e("  %item = index.add %i0, %tid : index")
-    e("  %j = index.rem %item, %cnj : index")
-    e("  %q1 = index.div %item, %cnj : index")
-    e("  %rr = index.rem %q1, %c4 : index")
-    e("  %q2 = index.div %q1, %c4 : index")
-    e("  %col = index.rem %q2, %ccols : index")
-    e("  %q3 = index.div %q2, %ccols : index")
-    e("  %r4 = index.rem %q3, %c16 : index")
-    e("  %blk = index.div %q3, %c16 : index")
-    e("  %r0 = index.mul %r4, %c4 : index")
-    e("  %r = index.add %r0, %rr : index")
+    if bfp:   # a workgroup takes 8 tokens x 32 column chunks, token fastest: each chunk's 8 row blocks are one stream fragment
+        nq = cols * NJ // 32
+        assert cols * NJ % 32 == 0 and tokens % 8 == 0 and WG == 256
+        e(f"  %cnq = index.constant {nq} : index")
+        e("  %c32b = index.constant 32 : index")
+        e("  %tr = index.rem %tid, %c8 : index")
+        e("  %cl = index.div %tid, %c8 : index")
+        e("  %wq = index.rem %wg, %cnq : index")
+        e("  %wp = index.div %wg, %cnq : index")
+        e("  %tg8 = index.mul %wp, %c8 : index")
+        e("  %tokg = index.add %tg8, %tr : index")
+        e("  %jq = index.mul %wq, %c32b : index")
+        e("  %jg = index.add %jq, %cl : index")
+        e("  %col = index.div %jg, %cnj : index")
+        e("  %j = index.rem %jg, %cnj : index")
+        e("  %blk = index.div %tokg, %c64 : index")
+        e("  %r = index.rem %tokg, %c64 : index")
+    else:   # item = (((blk * 16 + r4) * cols + col) * 4 + rr) * NJ + j: token blk * 64 + r4 * 4 + rr, j = 8-column chunk
+        e("  %i0 = index.mul %wg, %cwg : index")
+        e("  %item = index.add %i0, %tid : index")
+        e("  %j = index.rem %item, %cnj : index")
+        e("  %q1 = index.div %item, %cnj : index")
+        e("  %rr = index.rem %q1, %c4 : index")
+        e("  %q2 = index.div %q1, %c4 : index")
+        e("  %col = index.rem %q2, %ccols : index")
+        e("  %q3 = index.div %q2, %ccols : index")
+        e("  %r4 = index.rem %q3, %c16 : index")
+        e("  %blk = index.div %q3, %c16 : index")
+        e("  %r0 = index.mul %r4, %c4 : index")
+        e("  %r = index.add %r0, %rr : index")
     e("  %tc = index.mul %col, %cmb : index")
     e("  %tile = index.add %tc, %blk : index")
     e("  %mpi = index.div %r, %c16 : index")
@@ -208,7 +229,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         e(f"  %vh = vector.from_elements {', '.join(hs)} : vector<8xf16>")
         e("  vector.store %vh, %ov[%oa] : vector<8xf16>, view<[%no]xf16>")
         if bfp:
-            emit_bfp(e, hs, tokens, bfp)
+            stage_bfp(e, hs, tokens, bfp)
     elif qg:
         e("  scf.if %qisq {")
         e(f"    vector.store {val}, %ov[%oa] : vector<8xf32>, view<[%no]xf32>")
@@ -241,33 +262,62 @@ def load_c(e, dst, idx):
     e(f"  {dst} = vector.from_elements {', '.join(vals)} : vector<8xf32>")
 
 
-def emit_bfp(e, hs, tokens, bfp, p="bu_", jo="%jo", tok="%tok", c8="%c8"):
-    """The item's 8 f16 values (column jo.. of token tok) as one bfp16ebs8 row block of the next GEMM's stream
-    (gen_bfp16_encode.emit_encode's arithmetic on one row); p prefixes the names, c8 is an index constant 8."""
+def stage_bfp(e, hs, tokens, bfp):
+    """The bfp form's row blocks (the item's 8 f16 values of token %tokg, column %jo..) staged in LDS as
+    [chunk %cl][token %tr][9 bytes]; after a barrier the workgroup copies each live chunk's fragment (8 tokens, 72 bytes)
+    into the stream as 8-byte stores (one stream offset per fragment)."""
     bks, bpasses, bck, bnck = bfp
     bcb = GE.layout_bytes("act", tokens, bks, bpasses)
-    for nm, v in (("ck", bck), ("nck", bnck), ("cb", bcb), ("c9", 9), ("c2", 2), ("c144", 144), ("c72", 72), ("csub", 4),
-                  ("cpk", sum(bks)), ("cpass", bpasses)):
-        e(f"  %{p}{nm} = index.constant {v} : index")
-    e(f"  %{p}ci = index.div {jo}, %{p}ck : index")
-    e(f"  %{p}live = index.cmp ult, %{p}ci, %{p}nck : index")
-    e(f"  scf.if %{p}live {{")
-    e(f"    %{p}kcol = index.rem {jo}, %{p}ck : index")
-    e(f"    %{p}kbi = index.div %{p}kcol, {c8} : index")
-    e(f"    %{p}g8 = index.div {tok}, {c8} : index")
-    e(f"    %{p}rr = index.rem {tok}, {c8} : index")
-    frag = GE.emit_offset(e, "act", tokens, list(bks), bpasses, 64, True, f"%{p}g8", f"%{p}kbi", p=p, ind="    ")
-    e(f"    %{p}ro = index.mul %{p}rr, %{p}c9 : index")
-    e(f"    %{p}co = index.mul %{p}ci, %{p}cb : index")
-    e(f"    %{p}rq = index.add {frag}, %{p}ro : index")
-    e(f"    %{p}rb = index.add %{p}rq, %{p}co : index")
-    def store(x, v):   # x = 0: the exponent at rb, else mantissa x - 1 at rb + x
+    for nm, v in (("ck", bck), ("nck", bnck), ("cb", bcb), ("c9", 9), ("c72", 72)):
+        e(f"  %bs_{nm} = index.constant {v} : index")
+    e("  %bs_ci = index.div %jo, %bs_ck : index")
+    e("  %bs_live = index.cmp ult, %bs_ci, %bs_nck : index")
+    e("  scf.if %bs_live {")
+    e("    %bs_r0 = index.mul %cl, %c8 : index")
+    e("    %bs_r1 = index.add %bs_r0, %tr : index")
+    e("    %bs_sb = index.mul %bs_r1, %bs_c9 : index")
+
+    def store(x, v):
+        a = "%bs_sb"
         if x:
-            e(f"    %{p}o{x - 1} = index.constant {x} : index")
-            e(f"    %{p}a{x - 1}o = index.add %{p}rb, %{p}o{x - 1} : index")
-        e(f"    view.store {v}, %abv[{f'%{p}a{x - 1}o' if x else f'%{p}rb'}] : i8, view<[%nab]xi8>")
-    bfp_block(e, hs, p, store)
+            e(f"    %bs_so{x} = index.constant {x} : index")
+            e(f"    %bs_sa{x} = index.add %bs_sb, %bs_so{x} : index")
+            a = f"%bs_sa{x}"
+        e(f"    view.store {v}, %bs_view[{a}] : i8, view<2304xi8>")
+    bfp_block(e, hs, "bq_", store)
     e("  }")
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    for i in range(2):   # 32 fragments x 9 words = 288 copies over 256 lanes
+        q = f"bc{i}_"
+        e(f"  %{q}d0 = index.constant {256 * i} : index")
+        e(f"  %{q}d = index.add %tid, %{q}d0 : index")
+        e(f"  %{q}n = index.constant 288 : index")
+        e(f"  %{q}in = index.cmp ult, %{q}d, %{q}n : index")
+        e(f"  scf.if %{q}in {{")
+        e(f"    %{q}cl = index.div %{q}d, %bs_c9 : index")
+        e(f"    %{q}w = index.rem %{q}d, %bs_c9 : index")
+        e(f"    %{q}jg = index.add %jq, %{q}cl : index")
+        e(f"    %{q}jo0 = index.mul %{q}jg, %c8 : index")
+        e(f"    %{q}jo = index.add %{q}jo0, %coff : index")   # TN = 8 NJ: the chunk's first output column
+        e(f"    %{q}ci = index.div %{q}jo, %bs_ck : index")
+        e(f"    %{q}live = index.cmp ult, %{q}ci, %bs_nck : index")
+        e(f"    scf.if %{q}live {{")
+        for nm, v in (("c2", 2), ("c144", 144), ("c72", 72), ("csub", 4), ("cpk", sum(bks)), ("cpass", bpasses)):
+            e(f"      %{q}{nm} = index.constant {v} : index")
+        e(f"      %{q}kcol = index.rem %{q}jo, %bs_ck : index")
+        e(f"      %{q}kbi = index.div %{q}kcol, %c8 : index")
+        frag = GE.emit_offset(e, "act", tokens, list(bks), bpasses, 64, True, "%wp", f"%{q}kbi", p=q, ind="      ")
+        e(f"      %{q}co = index.mul %{q}ci, %bs_cb : index")
+        e(f"      %{q}wo = index.mul %{q}w, %c8 : index")
+        e(f"      %{q}g0 = index.add {frag}, %{q}co : index")
+        e(f"      %{q}ga = index.add %{q}g0, %{q}wo : index")
+        e(f"      %{q}fb = index.mul %{q}cl, %bs_c72 : index")
+        e(f"      %{q}la = index.add %{q}fb, %{q}wo : index")
+        e(f"      %{q}v = vector.load %bs_view[%{q}la] : view<2304xi8> -> vector<8xi8>")
+        e(f"      vector.store %{q}v, %abv[%{q}ga] : vector<8xi8>, view<[%nab]xi8>")
+        e("    }")
+        e("  }")
+
 
 def bfp_block(e, hs, p, store):
     """One bfp16ebs8 row block of 8 f16 values hs (gen_bfp16_encode.emit_encode's arithmetic): store(0, exponent byte),
