@@ -99,7 +99,7 @@ def main():
             "split_hal": split, "split_gx": (N - nn) // 16 // t.rowgrp, "full_hal": full, "full_gx": N // 16 // t.rowgrp, "split_gy": tt, "split_wg": t.lanes,
             "enc_act_hal": enc_act, "enc_act_wgs": tokens // 8 * (K // 8) // GE.WG,
             "dq_hal": dq, "dq_wgs": TG.dq_wgs(nn // 16, kb, dt, fmt), "dq_wg": dt.lanes,
-            "unpack_hal": unpack, "unpack_wgs": tokens * nn // 8 // GU.WG,
+            "unpack_hal": unpack, "unpack_wgs": tokens * nn // 8 // GU.wg(nn // GN.TN),
             "npu_xdna": ximg, "npu_entry": cfg.entry, "npu_columns": 8, "tables": ",".join(tables), "iters": iters, "warmup_ms": 4000}
     pf = os.path.join(work, "plan.txt")
     open(pf, "w").write("".join(f"{k}={v}\n" for k, v in plan.items()))

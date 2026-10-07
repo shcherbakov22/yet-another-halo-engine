@@ -837,7 +837,7 @@ def npu_split(rows, combos, B, outdir):
             src = os.path.join(tmp, name[:-4] + ".loom")
             open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
             E.emit(src, ["nop=0"], name, outdir)
-            out.append((name, B * n // 8 // GU.WG, GU.WG, 0))
+            out.append((name, B * n // 8 // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))
         out.append(("npusplit_" + site, n, 0, 0))
     # NPU images, one per pass count
     env = dict(hrx_paths.env(), LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2")

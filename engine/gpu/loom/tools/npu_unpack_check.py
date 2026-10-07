@@ -63,7 +63,7 @@ def main():
     cbytes = B.G.layout_bytes("act", tokens, KS, 5) if bfp else 0
     nab = cbytes * (stride // CK) if bfp else 0
     abf = os.path.join(work, "ab.bin")
-    cmd = [B.GPURUN, "npu-unpack", "--", B.HALRUN, model, hal, str(tokens * cols * (TN // 8) // G.WG), str(G.WG),
+    cmd = [B.GPURUN, "npu-unpack", "--", B.HALRUN, model, hal, str(tokens * cols * (TN // 8) // G.wg(cols)), str(G.wg(cols)),
            ",".join(str(v) for v in [cb.nbytes] + ([obytes] if resid else []) + ([m_in.nbytes] if rem else []) + [obytes]
                     + ([nab] if bfp else [])), f"f:{cf}"]
     gfo = os.path.join(work, "gate_out.f32")
