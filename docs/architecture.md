@@ -43,7 +43,7 @@ Full-attention layer:
 Gated DeltaNet layer:
 
 1. `gemm_kstore` attn_qkv (10240 rows), attn_gate (z, 6144), ssm_alpha and ssm_beta (48 rows each).
-2. `yah_ssm_conv_kq`: the causal conv over the 10240 channels with the q / k L2 normalization (`prep_kq`) fused in.
+2. `yah_ssm_conv_kq`: the causal conv over the 10240 channels with the q / k L2 normalization (`prep_kq`) fused in (`tools/gen_conv_kq.py` for the f16 hand-off to the chunked DeltaNet: a workgroup per 256 channels and 16 tokens, inputs read once).
 3. `yah_deltanet_prep_ab`: decay alpha and beta per token and head, and the conv ring (the last 4 inputs) for the next chunk or the decoder.
 4. `yah_deltanet`: chunked WY Gated DeltaNet (see below).
 5. `yah_ssm_postnorm_fp16`: gated RMSNorm per head with z, f16 out.
