@@ -129,3 +129,14 @@ Steady state per instruction mix (5 s probe, default tctl):
 | host CPU during prefill, sleep-polled final wait | 3-4% of a core (busy-poll: 104%) |
 
 HRX counters, rocprofv3, ATT and what does not work (PC sampling, RGP) are listed in build-and-run.md, Profiling.
+
+## NPU compute tile (AIE2P) (2026-10-07)
+
+Measured on low-asm leaves compiled by `loom-compile` (static bundle counts of straight-line code; the tile has no interlocks, so bundles are cycles) and checked on the NPU:
+
+- A locked leaf (`schedule(locked)`) issues one op per bundle unless compiled with `LOOM_EXP_LOCKED_PACK=1`; then adjacent independent ops share a bundle. `schedule(phased)` is rejected for XDNA.
+- A dependent accumulate costs ~9 cycles for both the elementwise bf16 MAC (`mma.bf16bf16.m8n8k1`, 64 lanes) and the bfp16 MMA (`mma.bfp16ebs8.m8n8k8`), whatever their descriptors' bypass stages say. With 5 accumulator registers (x4) that caps dependent MAC chains at ~0.5 per cycle.
+- `vst.push.bfp16ebs8[.from.fp32]` pushes 576 bits into a 1024-bit store FIFO that writes 512-bit lines: after 8 pushes a whole line is pending and the next push overflows, losing lines silently. Drain it with `vst.flush.512` after every 8th push.
+- `vst.push.bfp16ebs8.from.fp32` converts 64 f32 lanes like the GEMM encoder (E = exponent of the block max) except that E goes up by one only when a rounded mantissa leaves int8 (-128 stays), and subnormal inputs flush to 0.
+- Budgets: 24 vec256 units, 5 accumulators of 2048 bits, 8 pointer registers. Pointer adds take immediates in multiples of 64 (others through a modifier register), scalar loads / stores -32..28 bytes, 512-bit loads -512..448. A `concat` of separately loaded halves often costs register moves.
+- `vshuffle` modes 0-55 are permutations (56 and up are not); among them byte, 16-bit and 32-bit (de)interleaves and transposes, e.g. mode 35 is an 8 x 8 byte transpose. There is no data-dependent lane permute; `vldb.4x{16,32,64}` gathers four 64-bit windows from four pointers held in a vector.

@@ -165,6 +165,7 @@ It checks the C++ chat template byte for byte against `engine/serve/testdata/cha
 | `tools/gemv_check.py <gguf> <work> [kind ...]` | every decode GEMV (format, K) against a float64 gguf-py oracle through `hal_run` | GEMV changes |
 | `tools/dattn_check.py <gguf> <work> [T] [pos]` | fp16 decode attention against numpy, scrambled page table | decode attention changes |
 | `tools/dattn_q_check.py <gguf> <work> 8\|4\|kb,vb [T] [pos]` | quantized decode attention and the appends against numpy models of the formats | quantized KV changes |
+| `tools/npu_dequant_check.py <gguf> <work> [groups]` | the NPU Q4_K weight decoder (`gen_npu_dequant`) on real blocks against a numpy model of its f32 op order and the hardware bfp16 rule, byte for byte; prints the leaf's bundles per group | NPU decoder changes |
 | `engine/run/gate/` (`gate_run.sh`, `accgate2.py`) | tiered accuracy gate on wikitext windows, all-position logits (`YAH_LOGITS_FROM`): T1 rounding level, T2 quantization level. See `engine/run/gate/README.md` | any numerics change |
 | `engine/run/kvq/` (`run_rowstats.sh`, `gate2.py`, `needle_score.py`) | KV format quality at 32K: long-document KL / dPPL with bootstrap CIs and multi-key retrieval, from `YAH_ROWSTATS` row stats of an fp16-KV reference set and a `YAH_KV` candidate set. See `engine/run/kvq/README.md` | KV format work |
 | `engine/tests/m0_gate.sh <gguf> [set]` | greedy next token on 3 fixed prompts | after any change, cheap |
