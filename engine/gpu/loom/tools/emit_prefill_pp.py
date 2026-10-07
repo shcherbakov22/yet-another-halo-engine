@@ -831,7 +831,7 @@ def npu_split(rows, combos, B, outdir):
             out.append((name, B * n // 8 // GU.WG, GU.WG, 0))
         out.append(("npusplit_" + site, n, 0, 0))
     # NPU images, one per pass count
-    env = dict(hrx_paths.env(), LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1")
+    env = dict(hrx_paths.env(), LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2")
     for passes in sorted({p for s in NPU_SPLIT for _, p in npu_chunks(s)}):
         K = 1024 * passes
         cfg = GN.Config(8, B // 64, NPU_KS, passes)

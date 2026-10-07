@@ -6,7 +6,8 @@ Each column is a cascade of 4 compute rows: the head (top row) and two mids comp
 sub-tile and pass them down the accumulator cascade; the tail (bottom row) adds its slice and the running C.
 K is split per pass over the rows (ks[r] 8-wide k-blocks each, ks = [head, mid, mid, tail]); passes repeat until K.
 Operand streams are the layouts of gen_bfp16_encode.py (act: [slice][M block][pass][slab], wgt: [col][slice][pass][slab]).
-C: per column [M block][4 segments][sub-tile][chain][8 x 8 f32] (see npu_gemm_check.unpack_c).
+C: per column [M block][4 segments][sub-tile][chain][8 x 8 bf16] (see npu_gemm_check.unpack_c); the tail accumulates f32 and
+packs each segment to bf16 in place on its last pass, and the C ring sends the packed half (LOOM_EXP_LS_SEND_PITCH=2).
 The kernel is bound by the operand streams into the compute tiles (36 * (1 / MP + 1 / NP) bytes per MMA over two
 S2MM streams of ~7.7 B/cycle): NP = 5 needs 20% less activation stream than 4; a column's whole weight panel must fit
 its 512 KB memory tile, which caps NP at 5 for K = 5120.
@@ -15,7 +16,7 @@ Dataflow: weights stage once per column in its memory tile and replay per M bloc
 stream, staged in a memory tile and multicast along the row. Activations arrive one 16-row slab per record into a
 leaf-synchronized ring (the leaf acquires and releases slabs, constrain.leaf_sync); the tail holds C as 4
 leaf-synchronized segments, acquired on a segment's first pass and released after its last.
-Needs HRX patch 0013; compile with LOOM_EXP_LOCKED_PACK=1 LOOM_EXP_LATE_STORAGE=1.
+Needs HRX patch 0013; compile with LOOM_EXP_LOCKED_PACK=1 LOOM_EXP_LATE_STORAGE=1 LOOM_EXP_LS_SEND_PITCH=2.
 """
 import dataclasses
 import sys
@@ -49,7 +50,7 @@ def stream_bytes(cfg):
     """(activation, weight, C) binding sizes."""
     a = sum(cfg.nb * cfg.passes * MP * slab(k) for k in cfg.ks)
     w = cfg.cols * sum(cfg.passes * NP * slab(k) for k in cfg.ks)
-    return a, w, cfg.cols * cfg.nb * MP * NP * 4 * 256
+    return a, w, cfg.cols * cfg.nb * MP * NP * 2 * 256
 
 
 def bump(L, dst, src, off):
@@ -90,11 +91,11 @@ def array_program(L, cfg):
     e(f"  %ncols = constant.u32 {cols} : reg<aie2p.array.scalar : index>")
     seg = MP * NP * 4 * 256 // MP
     e(f"  %nseg = constant.u32 {nb * MP} : reg<aie2p.array.scalar : index>")
-    e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nb * MP}x{seg // 4}xi32>>")
+    e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nb * MP}x{seg // 8}xi32>>")
     for c in range(cols):
-        e(f"  %cr{c} = partition.receiver %c_all, %origin, %n{c}, %ncols : reg<aie2p.array.receiver : tile<{seg // 4}xi32>>")
-        e(f"  %sc{c} = sender %k{c}_{rows - 1}, 2 : reg<aie2p.array.sender : tile<{seg // 4}xi32>>")
-        e(f"  %chc{c} = channel %sc{c}, %cr{c}, %n{MP}, %nseg : reg<aie2p.array.channel : tile<{seg // 4}xi32>>")
+        e(f"  %cr{c} = partition.receiver %c_all, %origin, %n{c}, %ncols : reg<aie2p.array.receiver : tile<{seg // 8}xi32>>")
+        e(f"  %sc{c} = sender %k{c}_{rows - 1}, 2 : reg<aie2p.array.sender : tile<{seg // 8}xi32>>")
+        e(f"  %chc{c} = channel %sc{c}, %cr{c}, %n{MP}, %nseg : reg<aie2p.array.channel : tile<{seg // 8}xi32>>")
         e(f"  constrain.leaf_sync %chc{c}")
     # weights: per-column panels [slice][pass][record], staged in that column's memory tile, replayed per M block
     for c in range(cols):
@@ -142,6 +143,8 @@ def leaf(L, cfg, role, ks):
         e("  set.scd-enable 1")
     if role != "tail":
         e("  set.mcd-enable 1")
+    else:
+        e("  set.rounding 12")   # round to nearest even (the bf16 C)
     e("  %conf = mova.i32 780")
     e("  %am1 = mova.i32 -1")
     e("  %addmode = mova.i32 60")
@@ -378,15 +381,50 @@ def body(L, cfg, role, ks, a_adv, acap):
                     e(f"  %l{t + 1}_{c}_{q} = vlda.acc {pl[t + 1]}, {256 * c + 64 * q - 512}")
                 e(f"  %o{t}_{c}_{q} = slice {cur[c]}[{q}] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>")
                 e(f"  vst.acc %o{t}_{c}_{q}, {pc[t]}, {256 * c + 64 * q - 512}")
-        if row_end:
+        def convert(base, back, group):
+            """Last pass: pack the segment's f32 C (NP sub-tiles) in place to bf16 in its first half, which the C ring sends
+            (LOOM_EXP_LS_SEND_PITCH=2). base is a store pointer back bytes past the segment's slot + 512. No pointer
+            register is free here, so base itself walks the destination and is rebuilt for the join. group: quarters in
+            flight (the free accumulator registers). Returns the join's pointer, which replaces base."""
+            e(f"  low.cond_br %clast, ^cv{t}, ^nc{t} : reg<aie2p.er>")
+            e(f"^nc{t}:")
+            e(f"  low.br ^cj{t}({base}: reg<aie2p.ep>)")
+            e(f"^cv{t}:")
+            # per sub-tile b the destination pointer is fixed at slot + 512 b + 256 (stores at 32 j - 256), so the 16 loads
+            # (index 512 b + 64 j - 256) do not wait on the stores; it advances once per sub-tile
+            cur_p, k, fwd, back = base, 0, back + 256 - 512 * (NP - 1), back + 256
+            while back > 0:
+                step = min(back, 448)
+                back -= step
+                e(f"  %cvb{t}_{k} = padda {cur_p}, {-step}")
+                cur_p, k = f"%cvb{t}_{k}", k + 1
+            for b_ in range(NP):
+                for g0 in range(0, 16, group):   # loads in flight: the free accumulator registers
+                    for j in range(g0, g0 + group):
+                        e(f"  %cvo{t}_{b_}_{j} = mov.static-byte-offset {512 * b_ + 64 * j - 256}")
+                        e(f"  %cvx{t}_{b_}_{j} = mov.address-index %cvo{t}_{b_}_{j}")
+                        e(f"  %cvl{t}_{b_}_{j} = vlda.acc.index {cur_p}, %cvx{t}_{b_}_{j}")
+                    for j in range(g0, g0 + group):
+                        e(f"  vst.convert.f32x16.to.bf16x16 %cvl{t}_{b_}_{j}, {cur_p}, {32 * j - 256}")
+                if b_ + 1 < NP:
+                    bump(L, f"%cvp{t}_{b_}", cur_p, 512)
+                    cur_p = f"%cvp{t}_{b_}"
+            bump(L, f"%cvr{t}", cur_p, fwd)
+            e(f"  low.br ^cj{t}(%cvr{t}: reg<aie2p.ep>)")
+            e(f"^cj{t}(%cj{t}p: reg<aie2p.ep>):")
             e(f"  %cqr{t} = copy %clast : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
             e(f"  rel.cond %one, %cqr{t}, 2")
+            return f"%cj{t}p"
+        if row_end and not nxt:
+            pc[t] = convert(pc[t], 1024 * (NP - 1), 16)
         if nxt:
             e(f"  %pcc{t + 1} = copy {pc[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
             e(f"  %pc{t + 1} = padds.modifier %pcc{t + 1}, %mcs")
             for c in range(4):
                 e(f"  %z{t + 1}_{c} = concat(%l{t + 1}_{c}_0, %l{t + 1}_{c}_1, %l{t + 1}_{c}_2, %l{t + 1}_{c}_3) : {MBMS4}")
                 cur[c] = f"%z{t + 1}_{c}"
+            if row_end:   # from the next store pointer, so this one is dead
+                pc[t + 1] = convert(pc[t + 1], 1024 * NP, 4)   # the next sub-tile's C holds 16 of 20
     e("  rel %one, 0")
     e("  %pac = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>")
     e(f"  %pan0 = padds.modifier %pac, {'%mf' if a_adv else '%mz'}")

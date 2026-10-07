@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Emit yah_npu_unpack: the NPU GEMM's C into the GPU output's column slice.
 
-C (gen_npu_gemm): [col][M block][mp][np][chain mh, nh][8 rows][8 cols] f32, 64 x TN per (col, M block).
+C (gen_npu_gemm): [col][M block][mp][np][chain mh, nh][8 rows][8 cols] bf16, 64 x TN per (col, M block).
 out: f32 [tokens][stride], or f16 with out16 (rounded as the f16-output GEMMs round, emit_prefill_pp.O16_MT); C column j
 goes to out column off + j.
 One work item per 8 consecutive C columns of one token: a 32-byte read and a 32-byte write.
@@ -63,7 +63,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     else:
         e("} launch(%c: buffer, %out: buffer) {")
     e("  %base = index.constant 0 : offset")
-    e(f"  %nc = index.constant {c_elems * nblk} : index")
+    e(f"  %nc = index.constant {c_elems * nblk // 2} : index")   # bf16 pairs
     e(f"  %no = index.constant {tokens * stride} : index")
     if resid and rem:
         e("  %c_na, %res_na, %rem_na, %out_na = buffer.assume.noalias %c, %resid, %rem, %out : buffer, buffer, buffer, buffer")
@@ -84,7 +84,9 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         e("  %abv = buffer.view %ab_na[%base] : buffer -> view<[%nab]xi8>")
     else:
         e("  %c_na, %out_na = buffer.assume.noalias %c, %out : buffer, buffer")
-    e("  %cv = buffer.view %c_na[%base] : buffer -> view<[%nc]xf32>")
+    e("  %cv = buffer.view %c_na[%base] : buffer -> view<[%nc]xi32>")
+    e("  %c16i = scalar.constant 16 : i32")
+    e("  %chii = scalar.constant -65536 : i32")
     ot = "f16" if out16 else "f32"
     e(f"  %ov = buffer.view %out_na[%base] : buffer -> view<[%no]x{ot}>")
     e("  %wg = kernel.workgroup.id<x> : index")
@@ -165,12 +167,12 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     else:
         e("  %tb = index.mul %tok, %cstride : index")
         e("  %oa = index.add %tb, %jo : index")
-    e("  %v = vector.load %cv[%ca] : view<[%nc]xf32> -> vector<8xf32>")
+    load_c(e, "%v", "%ca")
     val = "%v"
     for p in range(1, parts):   # the K chunks' partial sums
         e(f"  %cpo{p} = index.constant {p * c_elems} : index")
         e(f"  %cpa{p} = index.add %ca, %cpo{p} : index")
-        e(f"  %cp{p} = vector.load %cv[%cpa{p}] : view<[%nc]xf32> -> vector<8xf32>")
+        load_c(e, f"%cp{p}", f"%cpa{p}")
         e(f"  %cs{p} = vector.addf {val}, %cp{p} : vector<8xf32>")
         val = f"%cs{p}"
     if rem:   # token tok, NPU column j2 of the [tokens][TN * cols] partial
@@ -187,7 +189,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     if swiglu:   # silu(gate) * up per element, the swiglu epilogue's ops (gen_gemm_tile)
         e(f"  %cuo = index.constant {c_elems} : index")
         e("  %cua = index.add %ca, %cuo : index")
-        e("  %vu = vector.load %cv[%cua] : view<[%nc]xf32> -> vector<8xf32>")
+        load_c(e, "%vu", "%cua")
         e("  %one = scalar.constant 1.0 : f32")
         e("  %negone = scalar.constant -1.0 : f32")
         TG.rcp_consts(e)
@@ -221,6 +223,22 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def load_c(e, dst, idx):
+    """The 8 C values from element idx (a multiple of 8) as vector<8xf32>: 4 words of bf16 pairs, the low half first."""
+    n = dst[1:]
+    e(f"  %{n}_w = index.div {idx}, %c2 : index")
+    e(f"  %{n}_v = vector.load %cv[%{n}_w] : view<[%nc]xi32> -> vector<4xi32>")
+    vals = []
+    for w in range(4):
+        e(f"  %{n}_e{w} = vector.extract %{n}_v[{w}] : vector<4xi32> -> i32")
+        e(f"  %{n}_l{w} = scalar.shli %{n}_e{w}, %c16i : i32")
+        e(f"  %{n}_h{w} = scalar.andi %{n}_e{w}, %chii : i32")
+        e(f"  %{n}_lf{w} = scalar.bitcast %{n}_l{w} : i32 to f32")
+        e(f"  %{n}_hf{w} = scalar.bitcast %{n}_h{w} : i32 to f32")
+        vals += [f"%{n}_lf{w}", f"%{n}_hf{w}"]
+    e(f"  {dst} = vector.from_elements {', '.join(vals)} : vector<8xf32>")
 
 
 def emit_bfp(e, hs, tokens, bfp, p="bu_", jo="%jo", tok="%tok", c8="%c8"):

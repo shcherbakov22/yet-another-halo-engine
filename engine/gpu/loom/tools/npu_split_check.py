@@ -5,7 +5,7 @@ usage: npu_split_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [
 
 Emits the GPU kernels (activation encoder, the NPU's rows decoded to BFP16, the split kstore, the C unpack)
 and the NPU image, runs them on one stream with the NPU relay, and checks the output: the GPU's rows bit-identical to
-the full kstore GEMM, the NPU's rows against the float64 product of the bfp16 operands (f32 accumulation order only).
+the full kstore GEMM, the NPU's rows against the float64 product of the bfp16 operands (within half a bf16 ulp: C is bf16).
 npu_rows is a multiple of 8 * gen_npu_gemm.TN (one NPU call per 640 output features). Needs PYTHONPATH with llama.cpp's gguf-py.
 """
 import os
@@ -86,7 +86,7 @@ def main():
     xsrc, ximg = os.path.join(work, "npu.loom"), os.path.join(work, "npu.xdna")
     open(xsrc, "w").write(GN.gen(cfg))
     env = hrx_paths.env()
-    env.update(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1")
+    env.update(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2")
     r = subprocess.run([hrx_paths.LOOM_COMPILE, xsrc, f"--root=@{cfg.entry}",
                         "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11", f"--output={ximg}"],
                        capture_output=True, text=True, env=env)
@@ -125,14 +125,15 @@ def main():
     w = quants.dequantize(np.ascontiguousarray(np.asarray(tn.data)[N - nn:]), tn.tensor_type).astype(np.float16)
     ref = NC.value(x) @ NC.value(w).T
     got = y[:, N - nn:]
-    err = np.abs(got - ref).max() / np.abs(ref).max()
+    ulp = np.exp2(np.floor(np.log2(np.maximum(np.abs(ref), 1e-30))) - 7)   # the NPU's C is bf16
+    err = (np.abs(got - ref) / ulp).max()
     rms = np.sqrt(np.mean((got - yfull[:, N - nn:]) ** 2) / np.mean(yfull[:, N - nn:].astype(np.float64) ** 2))
     print(f"{name} ({fmt}) {tokens}x{N}x{K}, NPU rows {nn} ({panels} calls): GPU rows "
-          f"{'bit-identical' if gpu_same else 'DIFFER'}; NPU rows max |err| / max |ref| {err:.2e} vs the bfp16 oracle, "
+          f"{'bit-identical' if gpu_same else 'DIFFER'}; NPU rows max |err| {err:.3f} bf16 ulp vs the bfp16 oracle, "
           f"rel RMS {rms:.2e} vs the GPU GEMM")
     for f in (out, yf):
         os.remove(f)
-    sys.exit(0 if gpu_same and err < 1e-5 else 1)
+    sys.exit(0 if gpu_same and err <= 0.501 else 1)
 
 
 if __name__ == "__main__":

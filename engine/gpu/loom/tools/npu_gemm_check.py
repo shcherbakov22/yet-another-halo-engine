@@ -5,7 +5,7 @@ usage: npu_gemm_check.py <workdir> <cols> <m_blocks> <ks,ks,ks,ks> <passes> [act
 
 Operands are random (wide per-row dynamic range) or f16 files: activations [64 * m_blocks][K], weights [TN * cols][K] (gen_npu_gemm.TN).
 They are packed with the encoder's numpy oracle (bfp16_check.reference), the image runs through iree-xdna-run, and C is
-compared with the exact product of the bfp16 values; the error is f32 accumulation order only (~1e-7 relative).
+compared with the exact product of the bfp16 values; C is bf16: within half an ulp of the exact product (f32 accumulation order is ~1e-7 below that).
 NPU_REPEAT=N also times N invocations with the control-only continuation (perf pmode is the caller's job).
 """
 import os
@@ -24,7 +24,7 @@ import hrx_paths  # noqa: E402
 
 
 def unpack_c(raw, cols, nb):
-    """C binding [col][M block][slab mp][slab np][chain][8][8] f32 -> [TM * nb][TN * cols]."""
+    """C binding [col][M block][slab mp][slab np][chain][8][8] (as f32) -> [TM * nb][TN * cols]."""
     c = raw.reshape(cols, nb, N.MP, N.NP, 2, 2, 8, 8)
     return c.transpose(1, 2, 4, 6, 0, 3, 5, 7).reshape(N.TM * nb, N.TN * cols)
 
@@ -61,7 +61,7 @@ def main():
     img = os.path.join(work, "npu_gemm.xdna")
     open(src, "w").write(N.gen(cfg))
     env = hrx_paths.env()
-    env.update(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1")
+    env.update(LOOM_EXP_LOCKED_PACK="1", LOOM_EXP_LATE_STORAGE="1", LOOM_EXP_LS_SEND_PITCH="2")
     run([hrx_paths.LOOM_COMPILE, src, f"--root=@{cfg.entry}", "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
          f"--output={img}"], env, "loom-compile")
     a_b, w_b, c_b = (os.path.join(work, n) for n in ("a.bin", "w.bin", "c.bin"))
@@ -86,13 +86,14 @@ def main():
             sys.exit(f"iree-xdna-run failed\n{r.stderr[-2000:]}")
     if width is None:
         sys.exit("no context width admitted the image")
-    got = unpack_c(np.fromfile(co, np.float32), cols, nb)
+    got = unpack_c((np.fromfile(co, np.uint16).astype(np.uint32) << 16).view(np.float32), cols, nb)   # bf16 C
     ref = value(a) @ value(w).T
-    err = np.abs(got - ref).max() / np.abs(ref).max()
+    ulp = np.exp2(np.floor(np.log2(np.maximum(np.abs(ref), 1e-30))) - 7)   # of bf16 at ref
+    err = (np.abs(got - ref) / ulp).max()
     exact = a.astype(np.float64) @ w.astype(np.float64).T
     rms = np.sqrt(np.mean((got - exact) ** 2) / np.mean(exact ** 2))
-    print(f"npu gemm {M}x{Nn}x{K} ks={list(ks)} passes={passes} (context {width} columns): max |err| / max |ref| "
-          f"{err:.2e} vs bfp16 oracle; rel RMS {rms:.2e} vs unquantized f16")
+    print(f"npu gemm {M}x{Nn}x{K} ks={list(ks)} passes={passes} (context {width} columns): max |err| "
+          f"{err:.3f} bf16 ulp vs the bfp16 oracle; rel RMS {rms:.2e} vs unquantized f16")
     reps = int(os.environ.get("NPU_REPEAT", "0"))
     if reps:
         def timed(n):
@@ -103,7 +104,7 @@ def main():
         t1, t2 = min(timed(2) for _ in range(3)), min(timed(2 + reps) for _ in range(3))
         us = (t2 - t1) / reps * 1e6
         print(f"  {us:.1f} us per repeat invocation, {M * Nn * K / us / 1e6:.2f} TMAC/s")
-    sys.exit(0 if err < 1e-5 else 1)
+    sys.exit(0 if err <= 0.501 else 1)   # C rounded once (RNE) from f32 accumulation
 
 
 if __name__ == "__main__":

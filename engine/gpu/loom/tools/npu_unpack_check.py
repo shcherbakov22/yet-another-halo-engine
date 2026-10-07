@@ -39,8 +39,10 @@ def main():
     nblk = parts * (2 if swiglu else 1)
     os.makedirs(work, exist_ok=True)
     c = np.random.default_rng(3).standard_normal(nblk * tokens * cols * TN).astype(np.float32) * 3
+    cb = ((c.view(np.uint32) + 0x7FFF + ((c.view(np.uint32) >> 16) & 1)) >> 16).astype(np.uint16)   # C is bf16 (RNE)
+    c = (cb.astype(np.uint32) << 16).view(np.float32)
     cf, of, sf = (os.path.join(work, n) for n in ("c.f32", "out.f32", "nan.f32"))
-    c.tofile(cf)
+    cb.tofile(cf)
     np.full(tokens * stride, np.nan, dt).tofile(sf)
     src = os.path.join(work, "unpack.loom")
     open(src, "w").write(G.gen(tokens, cols, stride, off, out16 and not (swiglu or tiled), resid, parts, swiglu, tiled, qg,
@@ -62,12 +64,12 @@ def main():
     nab = cbytes * (stride // CK) if bfp else 0
     abf = os.path.join(work, "ab.bin")
     cmd = [B.GPURUN, "npu-unpack", "--", B.HALRUN, model, hal, str(tokens * cols * (TN // 8) // G.WG), str(G.WG),
-           ",".join(str(v) for v in [c.nbytes] + ([obytes] if resid else []) + ([m_in.nbytes] if rem else []) + [obytes]
+           ",".join(str(v) for v in [cb.nbytes] + ([obytes] if resid else []) + ([m_in.nbytes] if rem else []) + [obytes]
                     + ([nab] if bfp else [])), f"f:{cf}"]
     gfo = os.path.join(work, "gate_out.f32")
     cmd += ([f"f:{rf}"] if resid else []) + ([f"f:{mf}"] if rem else []) + [f"io:{sf}:{of}"] + ([f"o:{nab}:{abf}"] if bfp else []) + ([f"io:{sf}:{gfo}"] if qg else [])
     if qg:
-        cmd[cmd.index(f"{c.nbytes},{obytes}")] = f"{c.nbytes},{obytes},{obytes}"
+        cmd[cmd.index(f"{cb.nbytes},{obytes}")] = f"{cb.nbytes},{obytes},{obytes}"
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=dict(os.environ, HAL_RUN_ITERS="4"))
     if "hal_run: ok" not in r.stdout:
         sys.exit(f"hal_run failed\n{r.stdout[-2000:]}{r.stderr[-2000:]}")

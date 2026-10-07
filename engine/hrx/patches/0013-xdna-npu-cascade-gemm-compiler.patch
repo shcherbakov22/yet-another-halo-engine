@@ -691,7 +691,7 @@ index 8c18bbb83..3f35d2cd5 100644
      const loom_module_t* module, const loom_value_fact_table_t* facts,
      const loom_xdna_array_family_t* family, loom_type_t source_type,
 diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
-index 81fad606b..74f0d8b8b 100644
+index 81fad606b..970d4fa5e 100644
 --- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
 +++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
 @@ -6,6 +6,7 @@
@@ -702,13 +702,13 @@ index 81fad606b..74f0d8b8b 100644
  #include <string.h>
  
  static void loom_aie2p_array_channel_resources_initialize_probe(
-@@ -22,13 +23,60 @@ static loom_aie2p_array_channel_resource_failure_t
+@@ -22,13 +23,62 @@ static loom_aie2p_array_channel_resource_failure_t
  loom_aie2p_array_channel_resources_propose_ring_from_probe(
      loom_aie2p_array_tile_resources_t* probe,
      loom_xdna_tile_coordinate_t coordinate, uint32_t load_address_base,
 -    uint8_t record_count, uint32_t record_byte_length,
 +    uint8_t record_count, uint32_t record_byte_length, bool contiguous,
-+    uint32_t bank_stride,
++    uint32_t bank_stride, uint32_t slot_pitch,
      loom_aie2p_array_ring_resource_proposal_t* out_proposal) {
    loom_aie2p_array_ring_resource_proposal_t proposal = {
        .coordinate = coordinate,
@@ -745,10 +745,12 @@ index 81fad606b..74f0d8b8b 100644
 +    }
 +  }
 +  if (contiguous && record_count != 0) {   // plain contiguous (or banked fallback)
++    // slot_pitch (>= record_byte_length): slots that far apart, each sending its leading record bytes
++    const uint32_t pitch = slot_pitch ? slot_pitch : record_byte_length;
 +    loom_aie2p_array_local_memory_proposal_t storage_proposal;
 +    if (!loom_aie2p_array_local_memory_propose_channel(
 +            probe->facts, probe->bank_cursors, probe->next_bank,
-+            (uint64_t)record_count * record_byte_length,
++            (uint64_t)record_count * pitch,
 +            LOOM_AIE2P_ARRAY_CHANNEL_STORAGE_ALIGNMENT, &storage_proposal)) {
 +      return LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_RING_STORAGE;
 +    }
@@ -757,19 +759,19 @@ index 81fad606b..74f0d8b8b 100644
 +                                         &probe->next_bank);
 +    for (uint16_t record = 0; record < record_count; ++record) {
 +      proposal.owner_offsets[record] =
-+          storage_proposal.owner_offset + record * record_byte_length;
++          storage_proposal.owner_offset + record * pitch;
 +    }
 +    record_count = 0;
 +  }
    for (uint16_t record = 0; record < record_count; ++record) {
      loom_aie2p_array_local_memory_proposal_t storage_proposal;
      if (!loom_aie2p_array_local_memory_propose_channel(
-@@ -67,7 +115,21 @@ loom_aie2p_array_channel_resources_propose_neighbor(
+@@ -67,7 +117,37 @@ loom_aie2p_array_channel_resources_propose_neighbor(
        resources, probe_bank_cursors, &probe);
    return loom_aie2p_array_channel_resources_propose_ring_from_probe(
        &probe, coordinate, load_address_base, record_count, record_byte_length,
 -      out_proposal);
-+      /*contiguous=*/false, /*bank_stride=*/0, out_proposal);
++      /*contiguous=*/false, /*bank_stride=*/0, /*slot_pitch=*/0, out_proposal);
 +}
 +
 +// Experimental LOOM_EXP_LS_BANK_STRIDE: banked layout for leaf-synchronized
@@ -784,10 +786,26 @@ index 81fad606b..74f0d8b8b 100644
 +  }
 +  const char* value = getenv("LOOM_EXP_LS_BANK_STRIDE");
 +  return value != NULL && atoi(value) > 0 ? (uint32_t)atoi(value) : 0;
++}
++
++// Experimental LOOM_EXP_LS_SEND_PITCH=<n>: a leaf-synchronized send ring's slots are n records apart; each slot sends
++// its leading record (a leaf that keeps wider data per slot, e.g. f32 accumulators, sends a packed copy of it).
++static uint32_t loom_aie2p_array_channel_resources_leaf_send_pitch(
++    const loom_aie2p_array_compute_endpoint_request_t* request) {
++  if (!iree_any_bit_set(
++          request->flags,
++          LOOM_AIE2P_ARRAY_COMPUTE_ENDPOINT_REQUEST_FLAG_CONTIGUOUS_RING) ||
++      request->direction != LOOM_AIE2P_ARRAY_DMA_DIRECTION_MEMORY_TO_STREAM) {
++    return 0;
++  }
++  const char* value = getenv("LOOM_EXP_LS_SEND_PITCH");
++  return value != NULL && atoi(value) > 1
++             ? (uint32_t)atoi(value) * request->record_byte_length
++             : 0;
  }
  
  loom_aie2p_array_channel_resource_failure_t
-@@ -124,7 +186,12 @@ loom_aie2p_array_channel_resources_propose_compute(
+@@ -124,7 +204,13 @@ loom_aie2p_array_channel_resources_propose_compute(
    const loom_aie2p_array_channel_resource_failure_t failure =
        loom_aie2p_array_channel_resources_propose_ring_from_probe(
            &probe, request->coordinate, request->load_address_base,
@@ -797,6 +815,7 @@ index 81fad606b..74f0d8b8b 100644
 +              request->flags,
 +              LOOM_AIE2P_ARRAY_COMPUTE_ENDPOINT_REQUEST_FLAG_CONTIGUOUS_RING),
 +          loom_aie2p_array_channel_resources_leaf_bank_stride(request),
++          loom_aie2p_array_channel_resources_leaf_send_pitch(request),
 +          &proposal.ring);
    if (failure != LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_NONE) {
      return failure;
