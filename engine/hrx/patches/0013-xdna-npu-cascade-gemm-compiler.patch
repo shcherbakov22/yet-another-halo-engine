@@ -3,9 +3,10 @@ shared panels, cascade link timing, worker.accumulate, leaf-synchronized channel
 replay rings for the control-only continuation, LOOM_EXP_* placement and packing knobs. NPU-only code paths.
 Grouped / streamed shared panels (LOOM_EXP_PANEL_GROUPS, LOOM_EXP_PANEL_STREAM): a panel slice
 replays in groups of records, counting locks let a group refill with the next invocation's data while the other group
-replays, the control program becomes [even push | waits | odd push] (parity shim descriptor sets, paced fills retired by
-their completion tokens) and the product publishes four invocations (setup + even push + waits, even push, odd push,
-waits); unstreamed products are unchanged.
+replays, the control program becomes [even push | waits | odd push | lead push] (parity shim descriptor sets, paced fills retired by
+their completion tokens) and the product publishes five invocations (setup + even push + waits, even push, odd push,
+waits, and a lead push: the even push with every fill in one wave, for the first call of a run); unstreamed
+products are unchanged.
 
 diff --git a/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors.py b/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors.py
 index 20e594748..8dd6a1292 100644
@@ -2250,7 +2251,7 @@ index 5487a7507..5481ab582 100644
  
  // Extracts and plans one verified amd.xdna.aie2p.array Low function.
 diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
-index 859aa1d4c..0266a78f2 100644
+index 859aa1d4c..eb64a609c 100644
 --- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
 +++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
 @@ -6,6 +6,8 @@
@@ -2689,7 +2690,7 @@ index 859aa1d4c..0266a78f2 100644
    queue_value |= loom_xdna_register_field_encode_admitted(
        loom_aie2p_program_shim_dma_queue_repeat_field(dma->direction),
        binding_plan->task_repeat_count - 1u);
-@@ -904,6 +1238,208 @@ static void loom_aie2p_program_build_shim_dma_queue(
+@@ -904,6 +1238,215 @@ static void loom_aie2p_program_build_shim_dma_queue(
                                               queue_value);
  }
  
@@ -2760,8 +2761,10 @@ index 859aa1d4c..0266a78f2 100644
 +// group by group, stream_pace[group] owners at a time, each wave retired by
 +// its completion tokens before the next (the fills then share DRAM with the
 +// activation streams instead of starving them).
++// |unpaced| (the lead push) fills every owner in one wave.
 +static iree_status_t loom_aie2p_program_build_stream_push(
-+    loom_aie2p_array_program_builder_t* builder, uint32_t parity) {
++    loom_aie2p_array_program_builder_t* builder, uint32_t parity,
++    bool unpaced) {
 +  const loom_aie2p_array_plan_t* plan = builder->plan;
 +  for (iree_host_size_t i = 0; i < plan->dma_channel_count; ++i) {
 +    const loom_aie2p_array_dma_plan_t* dma = &plan->dma_channels[i];
@@ -2816,7 +2819,7 @@ index 859aa1d4c..0266a78f2 100644
 +                                               descriptor, NULL);
 +  }
 +  for (uint32_t g = 0; g < group_count; ++g) {
-+    const uint32_t pace = plan->stream_pace[g < 4 ? g : 3];
++    const uint32_t pace = unpaced ? 8u : plan->stream_pace[g < 4 ? g : 3];
 +    iree_host_size_t wave_start = 0;
 +    while (wave_start < plan->binding_plan_count) {
 +      iree_host_size_t wave[8];
@@ -2887,18 +2890,23 @@ index 859aa1d4c..0266a78f2 100644
 +// Streamed control: [even push | egress waits | odd push].
 +static iree_status_t loom_aie2p_program_build_stream_control(
 +    loom_aie2p_array_program_builder_t* builder,
-+    iree_host_size_t* out_push_end, iree_host_size_t* out_wait_end) {
-+  IREE_RETURN_IF_ERROR(loom_aie2p_program_build_stream_push(builder, 0));
++    iree_host_size_t* out_push_end, iree_host_size_t* out_wait_end,
++    iree_host_size_t* out_odd_end) {
++  IREE_RETURN_IF_ERROR(
++      loom_aie2p_program_build_stream_push(builder, 0, /*unpaced=*/false));
 +  *out_push_end = builder->control.record_count;
 +  loom_aie2p_program_append_egress_waits(builder);
 +  *out_wait_end = builder->control.record_count;
-+  return loom_aie2p_program_build_stream_push(builder, 1);
++  IREE_RETURN_IF_ERROR(
++      loom_aie2p_program_build_stream_push(builder, 1, /*unpaced=*/false));
++  *out_odd_end = builder->control.record_count;
++  return loom_aie2p_program_build_stream_push(builder, 0, /*unpaced=*/true);
 +}
 +
  static void loom_aie2p_program_build_control(
      loom_aie2p_array_program_builder_t* builder) {
    for (iree_host_size_t i = 0; i < builder->plan->binding_plan_count; ++i) {
-@@ -971,8 +1507,17 @@ static iree_status_t loom_aie2p_program_count_storage(
+@@ -971,8 +1514,17 @@ static iree_status_t loom_aie2p_program_count_storage(
    iree_host_size_t compute_buffer_descriptor_count = 0;
    iree_host_size_t compute_dma_lifecycle_record_count = 0;
    iree_host_size_t dma_service_tile_count = 0;
@@ -2916,7 +2924,7 @@ index 859aa1d4c..0266a78f2 100644
      if (!iree_any_bit_set(dma->flags, LOOM_AIE2P_ARRAY_DMA_FLAG_SHIM)) {
        IREE_RETURN_IF_ERROR(
            loom_aie2p_program_add_capacity(1, &compute_dma_count));
-@@ -1017,20 +1562,45 @@ static iree_status_t loom_aie2p_program_count_storage(
+@@ -1017,20 +1569,45 @@ static iree_status_t loom_aie2p_program_count_storage(
        compute_buffer_descriptor_count, &array_record_capacity));
    IREE_RETURN_IF_ERROR(loom_aie2p_program_add_capacity(compute_dma_count,
                                                         &array_record_capacity));
@@ -2947,23 +2955,23 @@ index 859aa1d4c..0266a78f2 100644
 +  IREE_RETURN_IF_ERROR(loom_aie2p_program_add_scaled_capacity(
 +      memory_tile_buffer_descriptor_count, 3, &control_record_capacity));
 +  if (plan->stream_panels) {
-+    // Two pushes (each a descriptor, controller, queue and wait per binding
++    // Three pushes (each a descriptor, controller, queue and wait per binding
 +    // group part, and every drain group) plus the waits.
 +    IREE_RETURN_IF_ERROR(loom_aie2p_program_add_scaled_capacity(
-+        plan->binding_plan_count, 2 * 4 * 4, &control_record_capacity));
++        plan->binding_plan_count, 3 * 4 * 4, &control_record_capacity));
 +    IREE_RETURN_IF_ERROR(loom_aie2p_program_add_scaled_capacity(
-+        memory_tile_buffer_descriptor_count, 2, &control_record_capacity));
++        memory_tile_buffer_descriptor_count, 3, &control_record_capacity));
 +  }
    iree_host_size_t control_word_capacity = 0;
    IREE_RETURN_IF_ERROR(loom_aie2p_program_add_scaled_capacity(
        plan->binding_plan_count,
 -      LOOM_AIE2P_SHIM_DMA_BUFFER_DESCRIPTOR_WORD_COUNT,
 +      LOOM_AIE2P_SHIM_DMA_BUFFER_DESCRIPTOR_WORD_COUNT *
-+          (plan->stream_panels ? 2 * 4 : 1),
++          (plan->stream_panels ? 3 * 4 : 1),
        &control_word_capacity));
    iree_host_size_t route_update_capacity = 0;
    IREE_RETURN_IF_ERROR(loom_aie2p_program_add_scaled_capacity(
-@@ -1054,14 +1624,22 @@ static iree_status_t loom_aie2p_program_build_array(
+@@ -1054,14 +1631,22 @@ static iree_status_t loom_aie2p_program_build_array(
        loom_aie2p_program_append_dma_service_core_resets(builder));
    IREE_RETURN_IF_ERROR(loom_aie2p_program_append_owned_compute_dma_resets(
        builder, LOOM_AIE2P_COMPUTE_DMA_RESET_ASSERTED));
@@ -2988,7 +2996,7 @@ index 859aa1d4c..0266a78f2 100644
        loom_aie2p_program_build_compute_dma_descriptors(builder, dma);
      }
    }
-@@ -1070,9 +1648,14 @@ static iree_status_t loom_aie2p_program_build_array(
+@@ -1070,9 +1655,14 @@ static iree_status_t loom_aie2p_program_build_array(
    }
    IREE_RETURN_IF_ERROR(loom_aie2p_program_append_owned_compute_dma_resets(
        builder, LOOM_AIE2P_COMPUTE_DMA_RESET_RELEASED));
@@ -3004,57 +3012,62 @@ index 859aa1d4c..0266a78f2 100644
        IREE_RETURN_IF_ERROR(loom_aie2p_program_start_compute_dma(builder, dma));
      }
    }
-@@ -1124,7 +1707,8 @@ iree_status_t loom_aie2p_array_program_build(
+@@ -1124,7 +1714,8 @@ iree_status_t loom_aie2p_array_program_build(
    builder.array.word_capacity = array_word_capacity;
    builder.control.record_capacity = control_record_capacity;
    builder.control.word_capacity = control_word_capacity;
 -  builder.relocation_capacity = plan->binding_plan_count;
 +  builder.relocation_capacity =
-+      plan->binding_plan_count * (plan->stream_panels ? 2 * 4 : 1);
++      plan->binding_plan_count * (plan->stream_panels ? 3 * 4 : 1);
    builder.route_update_capacity = route_update_capacity;
    IREE_RETURN_IF_ERROR(loom_aie2p_program_allocate_array(
        arena, builder.array.record_capacity, sizeof(*builder.array.records),
-@@ -1146,7 +1730,14 @@ iree_status_t loom_aie2p_array_program_build(
+@@ -1146,7 +1737,15 @@ iree_status_t loom_aie2p_array_program_build(
        (void**)&builder.route_updates));
  
    IREE_RETURN_IF_ERROR(loom_aie2p_program_build_array(&builder));
 -  loom_aie2p_program_build_control(&builder);
 +  iree_host_size_t stream_push_end = 0;
 +  iree_host_size_t stream_wait_end = 0;
++  iree_host_size_t stream_odd_end = 0;
 +  if (plan->stream_panels) {
 +    IREE_RETURN_IF_ERROR(loom_aie2p_program_build_stream_control(
-+        &builder, &stream_push_end, &stream_wait_end));
++        &builder, &stream_push_end, &stream_wait_end, &stream_odd_end));
 +  } else {
 +    loom_aie2p_program_build_control(&builder);
 +  }
    *out_program = (loom_aie2p_array_program_t){
        .array_records = builder.array.records,
        .array_record_count = builder.array.record_count,
-@@ -1155,6 +1746,8 @@ iree_status_t loom_aie2p_array_program_build(
+@@ -1155,6 +1754,9 @@ iree_status_t loom_aie2p_array_program_build(
        .relocations = builder.relocations,
        .relocation_count = builder.relocation_count,
        .tile_program_count = (uint32_t)plan->worker_plan_count,
 +      .stream_push_end = stream_push_end,
 +      .stream_wait_end = stream_wait_end,
++      .stream_odd_end = stream_odd_end,
    };
    return iree_ok_status();
  }
 diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.h
-index 5ef817ca9..4abd1de52 100644
+index 5ef817ca9..ef1783faf 100644
 --- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.h
 +++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.h
-@@ -126,6 +126,14 @@ typedef struct loom_aie2p_array_program_t {
+@@ -126,6 +126,17 @@ typedef struct loom_aie2p_array_program_t {
    iree_host_size_t relocation_count;
    // Number of linked workers referenced by the array program.
    uint32_t tile_program_count;
 +  // Streamed panels (plan stream_panels): the control records are [even push |
-+  // completion waits | odd push]; stream_push_end ends the even push and
-+  // stream_wait_end the waits. A push queues one invocation's work (shim
++  // completion waits | odd push | lead push]; stream_push_end ends the even
++  // push, stream_wait_end the waits and stream_odd_end the odd push. A push queues one invocation's work (shim
 +  // tasks on the parity's descriptors, paced panel fills, replay drains); the
 +  // waits retire the oldest invocation's egress tasks, so invocations overlap.
 +  // Zero when not streamed.
 +  iree_host_size_t stream_push_end;
 +  iree_host_size_t stream_wait_end;
++  // The lead push is the even push with every panel fill in one wave, for the
++  // first invocation of a run: nothing computes yet that pacing would protect.
++  iree_host_size_t stream_odd_end;
  } loom_aie2p_array_program_t;
  
  // Materializes executable AIE2P array and invocation-control operations.
@@ -3706,7 +3719,7 @@ index b7b5920ab..16ff987cc 100644
        .schedule_strategy = LOOM_LOW_SCHEDULE_STRATEGY_RESOURCE_STALL,
        .schedule_flags = LOOM_LOW_SCHEDULE_FLAG_RETAIN_DEPENDENCY_INDEX,
 diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
-index bd92b3382..d3d2562d5 100644
+index bd92b3382..49a75cb5d 100644
 --- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
 +++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
 @@ -245,6 +245,17 @@ typedef struct loom_aie2p_xdna_entry_layout_t {
@@ -3717,17 +3730,17 @@ index bd92b3382..d3d2562d5 100644
 +  // the array program and its range; the others are a header and their range
 +  // at region_offset. Not streamed: two invocations over every record.
 +  uint32_t invocation_count;
-+  uint32_t range_begin[4];
-+  uint32_t range_end[4];
-+  uint32_t region_offset[4];
-+  uint32_t region_bytes[4];
++  uint32_t range_begin[5];
++  uint32_t range_end[5];
++  uint32_t region_offset[5];
++  uint32_t region_bytes[5];
 +  // Dynamic relocations over all invocations (one per patch per range holding
 +  // its record).
 +  uint32_t relocation_count;
  } loom_aie2p_xdna_entry_layout_t;
  
  // Final product section indices for one linked tile's assembly sections.
-@@ -386,14 +397,71 @@ static iree_status_t loom_aie2p_xdna_measure_entry(
+@@ -386,14 +397,72 @@ static iree_status_t loom_aie2p_xdna_measure_entry(
        ++array_operation_count;
      }
    }
@@ -3751,13 +3764,14 @@ index bd92b3382..d3d2562d5 100644
 +    layout->control_record_offsets[control_count] = (uint32_t)control_bytes;
 +  }
 +  if (program->stream_push_end != 0) {
-+    // [even push | waits | odd push]: array + even push + waits, even push,
-+    // odd push, waits.
++    // [even push | waits | odd push | lead push]: array + even push + waits,
++    // even push, odd push, waits, lead push (the even push, fills unpaced).
 +    const uint32_t push = (uint32_t)program->stream_push_end;
 +    const uint32_t wait = (uint32_t)program->stream_wait_end;
-+    const uint32_t begins[4] = {0, 0, wait, push};
-+    const uint32_t ends[4] = {wait, push, control_count, wait};
-+    layout->invocation_count = 4;
++    const uint32_t odd = (uint32_t)program->stream_odd_end;
++    const uint32_t begins[5] = {0, 0, wait, push, odd};
++    const uint32_t ends[5] = {wait, push, odd, wait, control_count};
++    layout->invocation_count = 5;
 +    memcpy(layout->range_begin, begins, sizeof(begins));
 +    memcpy(layout->range_end, ends, sizeof(ends));
 +  } else {
@@ -3765,7 +3779,7 @@ index bd92b3382..d3d2562d5 100644
 +    layout->range_begin[0] = layout->range_begin[1] = 0;
 +    layout->range_end[0] = layout->range_end[1] = control_count;
 +  }
-+  uint64_t range_bytes[4] = {0};
++  uint64_t range_bytes[5] = {0};
 +  for (uint32_t k = 0; k < layout->invocation_count; ++k) {
 +    range_bytes[k] =
 +        control_count == 0
@@ -3802,7 +3816,7 @@ index bd92b3382..d3d2562d5 100644
    if (repeat_offset + repeat_bytes > UINT32_MAX ||
        array_operation_count + program->control_record_count > UINT32_MAX) {
      return iree_make_status(
-@@ -406,14 +474,13 @@ static iree_status_t loom_aie2p_xdna_measure_entry(
+@@ -406,14 +475,13 @@ static iree_status_t loom_aie2p_xdna_measure_entry(
    layout->initial_byte_length = (uint32_t)initial_bytes;
    layout->repeat_offset = (uint32_t)repeat_offset;
    layout->repeat_byte_length = (uint32_t)repeat_bytes;
@@ -3823,7 +3837,7 @@ index bd92b3382..d3d2562d5 100644
    return iree_ok_status();
  }
  
-@@ -458,7 +525,8 @@ static void loom_aie2p_xdna_emit_entry(
+@@ -458,7 +526,8 @@ static void loom_aie2p_xdna_emit_entry(
    uint8_t* source = layout->source.data;
    loom_aie2p_xdna_native_header(
        profile, family, columns, memory_rows,
@@ -3833,7 +3847,7 @@ index bd92b3382..d3d2562d5 100644
        layout->initial_byte_length, source);
    uint32_t source_offset = LOOM_AIE2P_NATIVE_HEADER_SIZE;
    uint32_t fragment_start = 0;
-@@ -537,39 +605,76 @@ static void loom_aie2p_xdna_emit_entry(
+@@ -537,39 +606,76 @@ static void loom_aie2p_xdna_emit_entry(
      destination += size;
    }
    IREE_ASSERT_EQ(destination, layout->control_destination_offset);
@@ -3940,7 +3954,7 @@ index bd92b3382..d3d2562d5 100644
    }
  }
  
-@@ -609,6 +714,7 @@ iree_status_t loom_aie2p_xdna_product_write(
+@@ -609,6 +715,7 @@ iree_status_t loom_aie2p_xdna_product_write(
    uint64_t loadable_section_count = 0;
    uint64_t binding_count = 0;
    uint64_t relocation_count = 0;
@@ -3948,7 +3962,7 @@ index bd92b3382..d3d2562d5 100644
    uint64_t name_length = 0;
    uint16_t columns = 0;
    for (iree_host_size_t i = 0; i < product->entry_count; ++i) {
-@@ -620,7 +726,6 @@ iree_status_t loom_aie2p_xdna_product_write(
+@@ -620,7 +727,6 @@ iree_status_t loom_aie2p_xdna_product_write(
      };
      tile_count += entry->tile_count;
      binding_count += entry->array_plan->binding_slot_count;
@@ -3956,7 +3970,7 @@ index bd92b3382..d3d2562d5 100644
      name_length += entry->name.size;
      for (iree_host_size_t j = 0; j < entry->tile_count; ++j) {
        const loom_native_section_contribution_assembly_t* assembly =
-@@ -644,6 +749,8 @@ iree_status_t loom_aie2p_xdna_product_write(
+@@ -644,6 +750,8 @@ iree_status_t loom_aie2p_xdna_product_write(
      IREE_RETURN_IF_ERROR(loom_aie2p_xdna_measure_entry(
          entry, profile->limits.instruction_address_alignment, scratch_arena,
          &layouts[i]));
@@ -3965,7 +3979,7 @@ index bd92b3382..d3d2562d5 100644
    }
    IREE_RETURN_IF_ERROR(loom_xdna_device_profile_validate_partition(
        profile, profile->physical_column_origin, columns));
-@@ -703,9 +810,9 @@ iree_status_t loom_aie2p_xdna_product_write(
+@@ -703,9 +811,9 @@ iree_status_t loom_aie2p_xdna_product_write(
    }
    const uint64_t section_capacity = 3 + unique_section_count +
                                      loadable_section_count +
@@ -3977,7 +3991,7 @@ index bd92b3382..d3d2562d5 100644
    if (section_capacity + 2 > IREE_XDNA_ELF_MAX_SECTION_HEADER_COUNT ||
        segment_capacity > IREE_XDNA_ELF_MAX_PROGRAM_HEADER_COUNT) {
      return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
-@@ -735,7 +842,7 @@ iree_status_t loom_aie2p_xdna_product_write(
+@@ -735,7 +843,7 @@ iree_status_t loom_aie2p_xdna_product_write(
        (uint32_t)relocation_count * IREE_XDNA_ELF_RELOCATION_RECORD_SIZE;
    const uint32_t string_offset =
        invocation_offset +
@@ -3986,7 +4000,7 @@ index bd92b3382..d3d2562d5 100644
    if (string_offset + name_length > IREE_XDNA_ELF_MAX_METADATA_TABLE_SIZE) {
      return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
                              "XDNA metadata exceeds its byte limit");
-@@ -758,7 +865,7 @@ iree_status_t loom_aie2p_xdna_product_write(
+@@ -758,7 +866,7 @@ iree_status_t loom_aie2p_xdna_product_write(
        .entry_count = entry_count,
        .binding_count = (uint32_t)binding_count,
        .relocation_count = (uint32_t)relocation_count,
@@ -3995,7 +4009,7 @@ index bd92b3382..d3d2562d5 100644
        .string_byte_length = (uint32_t)name_length,
    };
    iree_xdna_elf_encode_header(&header, metadata.data);
-@@ -778,6 +885,7 @@ iree_status_t loom_aie2p_xdna_product_write(
+@@ -778,6 +886,7 @@ iree_status_t loom_aie2p_xdna_product_write(
        .alignment = 1,
    };
    uint32_t name_offset = 0;
@@ -4003,7 +4017,7 @@ index bd92b3382..d3d2562d5 100644
    for (uint32_t i = 0; i < entry_count; ++i) {
      const loom_aie2p_xdna_entry_t* entry = &product->entries[i];
      loom_aie2p_xdna_entry_layout_t* layout = &layouts[i];
-@@ -789,7 +897,8 @@ iree_status_t loom_aie2p_xdna_product_write(
+@@ -789,7 +898,8 @@ iree_status_t loom_aie2p_xdna_product_write(
      const iree_xdna_elf_allocation_record_t allocation = {
          .domain = IREE_XDNA_ELF_ALLOCATION_DOMAIN_COMMAND,
          .byte_length =
@@ -4013,7 +4027,7 @@ index bd92b3382..d3d2562d5 100644
          .alignment = profile->limits.instruction_address_alignment,
          .first_load = first_load,
          .load_count = segment_count - first_load,
-@@ -808,10 +917,9 @@ iree_status_t loom_aie2p_xdna_product_write(
+@@ -808,10 +918,9 @@ iree_status_t loom_aie2p_xdna_product_write(
          .binding_count = entry->array_plan->binding_slot_count,
          .first_static_relocation = layout->first_relocation,
          .first_dynamic_relocation = layout->first_relocation,
@@ -4027,7 +4041,7 @@ index bd92b3382..d3d2562d5 100644
      };
      iree_xdna_elf_encode_entry(
          &entry_record,
-@@ -831,46 +939,54 @@ iree_status_t loom_aie2p_xdna_product_write(
+@@ -831,46 +940,54 @@ iree_status_t loom_aie2p_xdna_product_write(
            metadata.data + binding_offset +
                (layout->first_binding + j) * IREE_XDNA_ELF_BINDING_RECORD_SIZE);
      }

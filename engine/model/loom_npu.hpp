@@ -70,10 +70,11 @@ class LoomNpu {
   struct Kernel {
     const void* image_key = nullptr;
     amdf_xdna_kernel_command_t first{}, repeat{};
-    // A streamed image (gen_npu_gemm groups: four invocations) queues a call with push[parity] and retires the
-    // oldest queued call with wait; first sets the array up and runs one whole call.
+    // A streamed image (gen_npu_gemm groups: five invocations) queues a call with push[parity] and retires the
+    // oldest queued call with wait; lead is the even push with its weight fills unpaced, for the first call of a run
+    // (nothing computes yet that pacing would protect); first sets the array up and runs one whole call.
     bool stream = false;
-    amdf_xdna_kernel_command_t push[2]{}, wait{};
+    amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{};
     std::vector<iree_hal_amd_xdna_executable_storage_t> storage;
     std::vector<amdf_host_mapping_t*> storage_maps;
     std::vector<amdf_memory_t*> imports;
@@ -267,11 +268,12 @@ class LoomNpu {
     NpuCheck(iree_hal_amd_xdna_executable_query_continuation(image, entry_ordinal, n, k->storage.data(), true,
                                                              &k->repeat),
              "query_continuation");
-    if (rec.invocation_count == 4) {
+    if (rec.invocation_count == 5) {
       k->stream = true;
-      for (uint32_t i = 0; i < 3; ++i)
+      amdf_xdna_kernel_command_t* const out[] = {&k->push[0], &k->push[1], &k->wait, &k->lead};
+      for (uint32_t i = 0; i < 4; ++i)
         NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(image, entry_ordinal, n, k->storage.data(), i + 1,
-                                                                       i < 2 ? &k->push[i] : &k->wait),
+                                                                       out[i]),
                  "query_invocation_ordinal");
     }
     kernels_.push_back(std::move(k));
@@ -324,7 +326,7 @@ class LoomNpu {
   }
 
  private:
-  // A streamed run of calls as one command: [push c0][push c1][wait][push c2][wait] ... [wait][wait] (pushes on
+  // A streamed run of calls as one command: [lead c0][push c1][wait][push c2][wait] ... [wait][wait] (pushes on
   // alternating descriptor sets, at most two calls queued), the bodies of the calls' own relocated commands under one
   // native transaction header (format 0.1: operation count at byte 8, byte length at 12). Built once per call list
   // into command arenas (allocating per command cost ~1 ms on the relay thread).
@@ -354,7 +356,7 @@ class LoomNpu {
     };
     int queued = 0;
     for (std::size_t i = 0; i < calls.size(); ++i) {
-      append(*calls[i], calls[i]->push[i & 1]);
+      append(*calls[i], i == 0 ? calls[i]->lead : calls[i]->push[i & 1]);
       if (++queued == 2) append(*calls[i], calls[i]->wait), --queued;
     }
     for (; queued > 0; --queued) append(*calls.back(), calls.back()->wait);

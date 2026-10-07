@@ -19,9 +19,9 @@ leaf-synchronized segments, acquired on a segment's first pass and released afte
 A 5-pass call replays its passes in groups (gen_bfp16_encode.GROUPS: every M block over passes 0-1, then over 2-4), each
 group a C partial ([col][group][M block]..., summed by the GPU unpack): a group's memory-tile slots refill with the next
 call's weights while the other group computes, so calls stream back to back (Loom LOOM_EXP_PANEL_GROUPS /
-LOOM_EXP_PANEL_STREAM: counting locks, a looping fill, invocations [setup | even push | odd push | waits] and fills
-paced a few columns at a time so they do not starve the activation streams of DRAM; LoomNpu submits the pushes one call
-ahead of the waits).
+LOOM_EXP_PANEL_STREAM: counting locks, a looping fill, invocations [setup | even push | odd push | waits | lead push]
+and fills paced a few columns at a time so they do not starve the activation streams of DRAM; the lead push, a job's
+first call, fills unpaced; LoomNpu submits the pushes one call ahead of the waits).
 Needs HRX patch 0013; compile with LOOM_ENV.
 """
 import dataclasses
