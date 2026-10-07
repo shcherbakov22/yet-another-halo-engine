@@ -804,6 +804,15 @@ def npu_split(rows, combos, B, outdir):
                                         k_src=K if 1024 * passes != K else None))
             E.emit(src, ["nop=0"], name, outdir)   # emit_hal.py wants a config; the encoder has none
             out.append((name, B // 8 * (passes * sum(NPU_KS)) // GE.WG, GE.WG, 0))
+    # the norms that feed K = 5120 sites also write the NPU's BFP16 input (gen_half_norm.gen_split bfp): "<norm>_bfp.hal"
+    if {"qkv", "q", "ffn"} & set(NPU_SPLIT):
+        for tiled, name in ((False, "norm_bfp.hal"), (True, "norm_t_bfp.hal"), ("both", "norm_rt_bfp.hal")):
+            src = os.path.join(tmp, name[:-4] + ".loom")
+            open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=tiled,
+                                                         bfp=(B, list(NPU_KS), NPU_PASSES)))
+            E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                         "yah_half_norm.fused=0"], name, outdir)
+        out.append(("npunormbfp", 1, 0, 0))
     # unpacks
     for site, n in sorted(NPU_SPLIT.items()):
         skind, mt, kb = NPU_SITES[site]

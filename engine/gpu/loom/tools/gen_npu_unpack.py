@@ -223,60 +223,68 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     return "\n".join(L) + "\n"
 
 
-def emit_bfp(e, hs, tokens, bfp):
-    """The item's 8 f16 values (column %jo.. of token %tok) as one bfp16ebs8 row block of the next GEMM's stream
-    (gen_bfp16_encode.emit_encode's arithmetic on one row)."""
+def emit_bfp(e, hs, tokens, bfp, p="bu_", jo="%jo", tok="%tok", c8="%c8"):
+    """The item's 8 f16 values (column jo.. of token tok) as one bfp16ebs8 row block of the next GEMM's stream
+    (gen_bfp16_encode.emit_encode's arithmetic on one row); p prefixes the names, c8 is an index constant 8."""
     bks, bpasses, bck, bnck = bfp
     bcb = GE.layout_bytes("act", tokens, bks, bpasses)
     for nm, v in (("ck", bck), ("nck", bnck), ("cb", bcb), ("c9", 9), ("c2", 2), ("c144", 144), ("c72", 72), ("csub", 4),
                   ("cpk", sum(bks)), ("cpass", bpasses)):
-        e(f"  %bu_{nm} = index.constant {v} : index")
-    e("  %bu_ci = index.div %jo, %bu_ck : index")
-    e("  %bu_live = index.cmp ult, %bu_ci, %bu_nck : index")
-    e("  scf.if %bu_live {")
-    e("    %bu_kcol = index.rem %jo, %bu_ck : index")
-    e("    %bu_kbi = index.div %bu_kcol, %c8 : index")
-    e("    %bu_g8 = index.div %tok, %c8 : index")
-    e("    %bu_rr = index.rem %tok, %c8 : index")
-    frag = GE.emit_offset(e, "act", tokens, list(bks), bpasses, 64, True, "%bu_g8", "%bu_kbi", p="bu_", ind="    ")
-    e("    %bu_ro = index.mul %bu_rr, %bu_c9 : index")
-    e("    %bu_co = index.mul %bu_ci, %bu_cb : index")
-    e(f"    %bu_rq = index.add {frag}, %bu_ro : index")
-    e("    %bu_rb = index.add %bu_rq, %bu_co : index")
+        e(f"  %{p}{nm} = index.constant {v} : index")
+    e(f"  %{p}ci = index.div {jo}, %{p}ck : index")
+    e(f"  %{p}live = index.cmp ult, %{p}ci, %{p}nck : index")
+    e(f"  scf.if %{p}live {{")
+    e(f"    %{p}kcol = index.rem {jo}, %{p}ck : index")
+    e(f"    %{p}kbi = index.div %{p}kcol, {c8} : index")
+    e(f"    %{p}g8 = index.div {tok}, {c8} : index")
+    e(f"    %{p}rr = index.rem {tok}, {c8} : index")
+    frag = GE.emit_offset(e, "act", tokens, list(bks), bpasses, 64, True, f"%{p}g8", f"%{p}kbi", p=p, ind="    ")
+    e(f"    %{p}ro = index.mul %{p}rr, %{p}c9 : index")
+    e(f"    %{p}co = index.mul %{p}ci, %{p}cb : index")
+    e(f"    %{p}rq = index.add {frag}, %{p}ro : index")
+    e(f"    %{p}rb = index.add %{p}rq, %{p}co : index")
+    def store(x, v):   # x = 0: the exponent at rb, else mantissa x - 1 at rb + x
+        if x:
+            e(f"    %{p}o{x - 1} = index.constant {x} : index")
+            e(f"    %{p}a{x - 1}o = index.add %{p}rb, %{p}o{x - 1} : index")
+        e(f"    view.store {v}, %abv[{f'%{p}a{x - 1}o' if x else f'%{p}rb'}] : i8, view<[%nab]xi8>")
+    bfp_block(e, hs, p, store)
+    e("  }")
+
+def bfp_block(e, hs, p, store):
+    """One bfp16ebs8 row block of 8 f16 values hs (gen_bfp16_encode.emit_encode's arithmetic): store(0, exponent byte),
+    then store(x + 1, mantissa byte x), each right after its value."""
     for nm, v in (("i23", 23), ("i255", 255), ("i260", 260), ("i0", 0)):
-        e(f"    %bu_{nm} = scalar.constant {v} : i32")
+        e(f"    %{p}{nm} = scalar.constant {v} : i32")
     for nm, v in (("zero", "0.0"), ("fmin", "-128.0"), ("fmax", "127.0")):
-        e(f"    %bu_{nm} = scalar.constant {v} : f32")
+        e(f"    %{p}{nm} = scalar.constant {v} : f32")
     cur = None
     for x, h in enumerate(hs):
-        e(f"    %bu_v{x} = scalar.extf {h} : f16 to f32")
-        e(f"    %bu_a{x} = scalar.absf %bu_v{x} : f32")
+        e(f"    %{p}v{x} = scalar.extf {h} : f16 to f32")
+        e(f"    %{p}a{x} = scalar.absf %{p}v{x} : f32")
         if cur is None:
-            cur = f"%bu_a{x}"
+            cur = f"%{p}a{x}"
         else:
-            e(f"    %bu_mx{x} = scalar.maxnumf {cur}, %bu_a{x} : f32")
-            cur = f"%bu_mx{x}"
-    e(f"    %bu_mb = scalar.bitcast {cur} : f32 to i32")
-    e("    %bu_ms = scalar.shrui %bu_mb, %bu_i23 : i32")
-    e("    %bu_E = scalar.andi %bu_ms, %bu_i255 : i32")
-    e("    %bu_ie = scalar.subi %bu_i260, %bu_E : i32")
-    e("    %bu_ib = scalar.shli %bu_ie, %bu_i23 : i32")
-    e("    %bu_iq0 = scalar.bitcast %bu_ib : i32 to f32")
-    e("    %bu_z = scalar.cmpi eq, %bu_E, %bu_i0 : i32")
-    e("    %bu_iq = scf.select %bu_z, %bu_zero, %bu_iq0 : f32")
-    e("    %bu_eb = scalar.trunci %bu_E : i32 to i8")
-    e("    view.store %bu_eb, %abv[%bu_rb] : i8, view<[%nab]xi8>")
+            e(f"    %{p}mx{x} = scalar.maxnumf {cur}, %{p}a{x} : f32")
+            cur = f"%{p}mx{x}"
+    e(f"    %{p}mb = scalar.bitcast {cur} : f32 to i32")
+    e(f"    %{p}ms = scalar.shrui %{p}mb, %{p}i23 : i32")
+    e(f"    %{p}E = scalar.andi %{p}ms, %{p}i255 : i32")
+    e(f"    %{p}ie = scalar.subi %{p}i260, %{p}E : i32")
+    e(f"    %{p}ib = scalar.shli %{p}ie, %{p}i23 : i32")
+    e(f"    %{p}iq0 = scalar.bitcast %{p}ib : i32 to f32")
+    e(f"    %{p}z = scalar.cmpi eq, %{p}E, %{p}i0 : i32")
+    e(f"    %{p}iq = scf.select %{p}z, %{p}zero, %{p}iq0 : f32")
+    e(f"    %{p}eb = scalar.trunci %{p}E : i32 to i8")
+    store(0, f"%{p}eb")
     for x in range(8):
-        e(f"    %bu_s{x} = scalar.mulf %bu_v{x}, %bu_iq : f32")
-        e(f"    %bu_n{x} = scalar.roundevenf %bu_s{x} : f32")
-        e(f"    %bu_c0{x} = scalar.maxnumf %bu_n{x}, %bu_fmin : f32")
-        e(f"    %bu_cl{x} = scalar.minnumf %bu_c0{x}, %bu_fmax : f32")
-        e(f"    %bu_t{x} = scalar.fptosi %bu_cl{x} : f32 to i32")
-        e(f"    %bu_m{x} = scalar.trunci %bu_t{x} : i32 to i8")
-        e(f"    %bu_o{x} = index.constant {x + 1} : index")
-        e(f"    %bu_a{x}o = index.add %bu_rb, %bu_o{x} : index")
-        e(f"    view.store %bu_m{x}, %abv[%bu_a{x}o] : i8, view<[%nab]xi8>")
-    e("  }")
+        e(f"    %{p}s{x} = scalar.mulf %{p}v{x}, %{p}iq : f32")
+        e(f"    %{p}n{x} = scalar.roundevenf %{p}s{x} : f32")
+        e(f"    %{p}c0{x} = scalar.maxnumf %{p}n{x}, %{p}fmin : f32")
+        e(f"    %{p}cl{x} = scalar.minnumf %{p}c0{x}, %{p}fmax : f32")
+        e(f"    %{p}t{x} = scalar.fptosi %{p}cl{x} : f32 to i32")
+        e(f"    %{p}m{x} = scalar.trunci %{p}t{x} : i32 to i8")
+        store(x + 1, f"%{p}m{x}")
 
 
 if __name__ == "__main__":

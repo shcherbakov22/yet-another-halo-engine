@@ -171,8 +171,10 @@ def gen(dim=5120, wpr=1, tiled=False, resadd=False, keep=None, wlds=False):
     return "\n".join(L) + "\n"
 
 
-def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True):
+def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True, bfp=None):
     """The same norm with each row split over `split` waves (part p holds k in [p n/S, (p+1) n/S), all in registers).
+    bfp = (tokens, ks, passes): also the NPU's BFP16 activation stream of the output (gen_bfp16_encode "act", binding ab after
+    the outputs), encoded from the f16 values; see split_bfp_out.
     Lane l's sum of squares stays one chain in k order: part p continues it from part p-1's partial (LDS, barrier
     between steps), so the bits are those of gen(). Branch-free: at step p every wave runs its chain from its
     predecessor's partial, only part p's result is used. Fewer values per wave: more waves and loads in flight."""
@@ -199,7 +201,7 @@ def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True):
     e("  %wgs = index.div %rows, %cwpr : index")
     e("  kernel.launch.config workgroups(%wgs, %unit, %unit) workgroup_size(%cwgs, %unit, %unit) : index")
     e("} launch(%x: buffer, %residual: buffer, %weight: buffer, %sum_out: buffer, %out: buffer"
-      + (", %out_t: buffer" if both else "") + ") {")
+      + (", %out_t: buffer" if both else "") + (", %ab: buffer" if bfp else "") + ") {")
     e("  %base = index.constant 0 : offset")
     e("  %zero = scalar.constant 0.0 : f32")
     e("  %one = scalar.constant 1.0 : f32")
@@ -305,6 +307,9 @@ def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True):
     e("  %ivr0 = index.mul %rwg, %csplit : index")
     e("  %ivr = index.add %ivr0, %lastp : index")
     e(f"  %inv = view.load %iv_view[%ivr] : view<{wpr * split}xf32> -> f32")
+    if bfp:
+        split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp)
+        return split_finish(L, split)
     if tiled:
         e("  %c16t = index.constant 16 : index")
         e("  %c256t = index.constant 256 : index")
@@ -347,6 +352,128 @@ def gen_split(dim=5120, wpr=4, split=2, tiled=False, wlds=True):
     return text.replace("  %unit = index.constant 1 : index\n  %rows = config.get @yah_half_norm.rows : index\n  %cwpr",
                         "  %unit = index.constant 1 : index\n  %rows = config.get @yah_half_norm.rows : index\n  %cwpr", 1) \
                .replace("  %base = index.constant 0 : offset\n", "  %base = index.constant 0 : offset\n" + consts, 1)
+
+
+def split_bfp_out(e, dim, wpr, split, tiled, wlds, bfp):
+    """gen_split's output pass with 8 consecutive columns per lane: thread t = part * 32 + lane of a row takes columns
+    8 (t + 32 split j), re-reads their x (cached), applies the same per-element ops (same f16 bits) and stores 16 bytes
+    per layout.
+    The 8 halves are one bfp16ebs8 row block (gen_npu_unpack.bfp_block), staged in LDS as [k-block][row][9 bytes]:
+    a k-block's 4 rows are 36 contiguous stream bytes (half a fragment), copied out as dwords after a barrier."""
+    import gen_bfp16_encode as GE
+    import gen_npu_unpack as GU
+    tokens, ks, passes = bfp
+    both = tiled == "both"
+    assert wpr == 4, "4 rows per workgroup: half a fragment per k-block"
+    nkb, nth = dim // 8, 32 * wpr * split
+    nab = GE.layout_bytes("act", tokens, ks, passes)
+    e(f"  %nab4 = index.constant {nab // 4} : index")
+    e("  %abv = buffer.view %ab[%base] : buffer -> view<[%nab4]xi32>")
+    e(f"  %bs_bytes = index.constant {nkb * wpr * 9} : offset")
+    e("  %bs_buf = buffer.alloca<workgroup> align(16) %bs_bytes : buffer")
+    e(f"  %bs_view = buffer.view %bs_buf[%base] : buffer -> view<{nkb * wpr * 9}xi8>")
+    e(f"  %bs_view4 = buffer.view %bs_buf[%base] : buffer -> view<{nkb * wpr * 9 // 4}xi32>")
+    e("  %c8 = index.constant 8 : index")
+    e("  %c9 = index.constant 9 : index")
+    e(f"  %cwpr4 = index.constant {wpr} : index")
+    e("  %bt0 = index.mul %part, %c32w : index")
+    e("  %bt = index.add %bt0, %lane : index")
+    if tiled:
+        e("  %c16t = index.constant 16 : index")
+        e("  %c256t = index.constant 256 : index")
+        e(f"  %ctiles = index.constant {dim // 16} : index")
+        e("  %trow = index.div %row, %c16t : index")
+        e("  %trr = index.rem %row, %c16t : index")
+        e("  %tt0 = index.mul %trow, %ctiles : index")
+        e("  %tt3 = index.mul %trr, %c16t : index")
+        e(f"  %tlast = index.constant {tokens * dim - 8} : index")
+    for j in range(nkb // (32 * split)):
+        e(f"  %bgo{j} = index.constant {32 * split * j} : index")
+        e(f"  %bg{j} = index.add %bt, %bgo{j} : index")
+        e(f"  %bc{j} = index.mul %bg{j}, %c8 : index")
+        e(f"  %bxa{j} = index.add %row_base, %bc{j} : index")
+        e(f"  %bx{j} = vector.load %x_view[%bxa{j}] : view<[%total_elems]xf32> -> vector<8xf32>")
+        if wlds:
+            e(f"  %bw{j} = vector.load %wl_view[%bc{j}] : view<{dim}xf32> -> vector<8xf32>")
+        else:
+            e(f"  %bw{j} = vector.load %weight_view[%bc{j}] : view<[%dim]xf32> -> vector<8xf32>")
+        hs = []
+        for x in range(8):
+            e(f"  %bxs{j}_{x} = vector.extract %bx{j}[{x}] : vector<8xf32> -> f32")
+            e(f"  %bws{j}_{x} = vector.extract %bw{j}[{x}] : vector<8xf32> -> f32")
+            e(f"  %bnm{j}_{x} = scalar.mulf %bxs{j}_{x}, %inv : f32")
+            e(f"  %bwt{j}_{x} = scalar.mulf %bnm{j}_{x}, %bws{j}_{x} : f32")
+            e(f"  %bh{j}_{x} = scalar.fptrunc %bwt{j}_{x} : f32 to f16")
+            hs.append(f"%bh{j}_{x}")
+        e(f"  %bvh{j} = vector.from_elements {', '.join(hs)} : vector<8xf16>")
+        if not tiled or both:
+            e(f"  vector.store %bvh{j}, %out_view[%bxa{j}] : vector<8xf16>, view<[%total_elems]xf16>")
+        if tiled:   # 8 columns of one 16-column tile: (row / 16, col / 16) x 256 + (row % 16) x 16 + col % 16
+            e(f"  %btc{j} = index.div %bc{j}, %c16t : index")
+            e(f"  %btr{j} = index.rem %bc{j}, %c16t : index")
+            e(f"  %bt1{j} = index.add %tt0, %btc{j} : index")
+            e(f"  %bt2{j} = index.mul %bt1{j}, %c256t : index")
+            e(f"  %bt4{j} = index.add %bt2{j}, %tt3 : index")
+            e(f"  %bta0{j} = index.add %bt4{j}, %btr{j} : index")
+            e(f"  %bta{j} = index.min %bta0{j}, %tlast : index")   # always in range; for the bound proof
+            e(f"  vector.store %bvh{j}, %{'out_t_view' if both else 'out_view'}[%bta{j}] : vector<8xf16>, view<[%total_elems]xf16>")
+        # LDS byte (k-block * 4 + row of the workgroup) * 9 + i
+        e(f"  %bl0{j} = index.mul %bg{j}, %cwpr4 : index")
+        e(f"  %bl1{j} = index.add %bl0{j}, %rwg : index")
+        e(f"  %bl{j} = index.mul %bl1{j}, %c9 : index")
+
+        def store(x, v, j=j):
+            a = f"%bl{j}"
+            if x:
+                e(f"    %bn{j}_so{x} = index.constant {x} : index")
+                e(f"    %bn{j}_sa{x} = index.add %bl{j}, %bn{j}_so{x} : index")
+                a = f"%bn{j}_sa{x}"
+            e(f"    view.store {v}, %bs_view[{a}] : i8, view<{nkb * wpr * 9}xi8>")
+        GU.bfp_block(e, hs, f"bn{j}_", store)
+    e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+    # copy-out: dword d = k-block d / 9, word d % 9 of the workgroup's 36 bytes at stream fragment (row0 / 8, k-block) +
+    # 36 * (row0 / 4 % 2)
+    e("  %row0 = index.mul %wg, %cwprb : index")
+    e("  %bo_g8 = index.div %row0, %c8 : index")
+    e("  %bo_h0 = index.div %row0, %cwpr4 : index")
+    e("  %c2o = index.constant 2 : index")
+    e("  %bo_h = index.rem %bo_h0, %c2o : index")
+    e("  %c36o = index.constant 36 : index")
+    e("  %bo_ho = index.mul %bo_h, %c36o : index")
+    e("  %c4o = index.constant 4 : index")
+    nd = nkb * wpr * 9 // 4
+    for i in range((nd + nth - 1) // nth):
+        q = f"bo{i}_"
+        e(f"  %{q}d0 = index.constant {nth * i} : index")
+        e(f"  %{q}d = index.add %tid, %{q}d0 : index")
+        guard = nth * (i + 1) > nd
+        ind = "  "
+        if guard:
+            e(f"  %{q}nd = index.constant {nd} : index")
+            e(f"  %{q}live = index.cmp ult, %{q}d, %{q}nd : index")
+            e(f"  scf.if %{q}live {{")
+            ind = "    "
+        for nm, v in (("c2", 2), ("c144", 144), ("c72", 72), ("csub", 4), ("cpk", sum(ks)), ("cpass", passes)):
+            e(f"{ind}%{q}{nm} = index.constant {v} : index")
+        e(f"{ind}%{q}kb = index.div %{q}d, %c9 : index")
+        e(f"{ind}%{q}w = index.rem %{q}d, %c9 : index")
+        frag = GE.emit_offset(e, "act", tokens, list(ks), passes, 64, True, "%bo_g8", f"%{q}kb", p=q, ind=ind)
+        e(f"{ind}%{q}b0 = index.add {frag}, %bo_ho : index")
+        e(f"{ind}%{q}b1 = index.mul %{q}w, %c4o : index")
+        e(f"{ind}%{q}b2 = index.add %{q}b0, %{q}b1 : index")
+        e(f"{ind}%{q}gw = index.div %{q}b2, %c4o : index")
+        e(f"{ind}%{q}v = view.load %bs_view4[%{q}d] : view<{nd}xi32> -> i32")
+        e(f"{ind}view.store %{q}v, %abv[%{q}gw] : i32, view<[%nab4]xi32>")
+        if guard:
+            e("  }")
+
+def split_finish(L, split):
+    """gen_split's closing lines and its per-part index constants."""
+    L.append("  kernel.return")
+    L.append("}")
+    text = "\n".join(L) + "\n"
+    consts = "".join(f"  %c{p}i = index.constant {p} : index\n" for p in range(split))
+    return text.replace("  %base = index.constant 0 : offset\n", "  %base = index.constant 0 : offset\n" + consts, 1)
 
 
 def main():
