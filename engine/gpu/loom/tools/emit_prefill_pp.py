@@ -704,8 +704,8 @@ def npu_split(rows, combos, B, outdir):
 
     def dqbfp(fmt, mt, kb, nn, ci=None, chunk=None):
         """The NPU's rows (the last nn of mt * 16) decoded to its weight stream; chunk ci: (k offset, passes) of a K chunk."""
-        dt = dataclasses.replace(TG.default_tile(fmt, "kstore", kb), bm=64, wm=2, wn=4, decahead=False, ksub=64,
-                                 dbuf=False)
+        dt = dataclasses.replace(TG.default_tile(fmt, "kstore", kb), bm=64, wm=2, wn=4, decahead=False,
+                                 ksub=TG.DQ_BFP_KSUB, dbuf=False)
         name = "dqbfp_%s_%d_%d%s.hal" % (fmt, mt, kb, "" if chunk is None else "_c%d" % ci)
         if chunk is None:
             TG.DQ_BFP, kbc, kfull = (NPU_KS, kb * qk_of(fmt) // 1024), kb, 0

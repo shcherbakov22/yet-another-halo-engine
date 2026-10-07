@@ -255,6 +255,10 @@ OSTRIDE = 0
 # DQ_BFP = (ks, passes, kb_start, kb_total): a K chunk, k_blocks (config) 256-wide blocks from kb_start of kb_total-block rows.
 # Its grid is dq_wgs(): one workgroup per item.
 DQ_BFP = None
+# DQ_BFP's phase width: 128 (2 phases per 256-wide block, every lane decodes) reads each weight row in half as many
+# pieces, so the output stream evicts fewer of a row's lines between its phases (IQ3_S ffn_gate 7680 rows: L2 misses
+# 0.70 -> 0.51 M, 0.384 -> 0.355 ms standalone).
+DQ_BFP_KSUB = 128
 # KWIN = (kb_start, kb_total): a K window of an afrag tiled kstore, k_blocks (config) 256-wide blocks from kb_start of
 # kb_total-block weight rows and kb_total * 256-column activations (the NPU split's K remainder, emit_prefill_pp).
 KWIN = None

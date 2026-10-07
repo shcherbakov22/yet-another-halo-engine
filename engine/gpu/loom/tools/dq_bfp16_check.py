@@ -112,7 +112,7 @@ def main():
     # fused: dequant straight into the stream
     TG.DQ_BFP = (tuple(ks), passes) + ((k_off // 256, K // 256) if chunk else ())
     try:
-        text = TG.gen(fmt, "dequant", dt)
+        text = TG.gen(fmt, "dequant", dataclasses.replace(dt, ksub=TG.DQ_BFP_KSUB))
     finally:
         TG.DQ_BFP = None
     fsym = sym + "_bfp16"
