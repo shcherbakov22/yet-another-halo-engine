@@ -628,6 +628,10 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
             e("  %dq_bcols = index.div %m_rows, %dq_ctn : index")
             e("  %dq_tot = index.mul %dq_bcols, %dq_bpanel : index")
             e("  %dq_out = buffer.view %output_na[%base] : buffer -> view<[%dq_tot]xi8>")
+            # the phase's fragments in stream order (72 bytes each), assembled by all lanes and copied out 8 bytes at a time
+            e(f"  %bfs_bytes = index.constant {nfrag * 72} : offset")
+            e("  %bfs = buffer.alloca<workgroup> align(16) %bfs_bytes : buffer")
+            e(f"  %bfs_view = buffer.view %bfs[%base] : buffer -> view<{nfrag * 72}xi8>")
         else:
             e("  %dq_tot = index.mul %m_rows, %ktot : index")
             e("  %dq_out = buffer.view %output_na[%base] : buffer -> view<[%dq_tot]xf16>")
@@ -677,36 +681,83 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         wn = G.pack_vals(e, dq_loads("dqn_", "%dq_kn"), "dqn")
         e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
         if DQ_BFP:
-            # encode the BM x KSUB tile's 8 x 8 fragments into the NPU weight stream, one lane per fragment
-            e(f"  %bf_nfrag = index.constant {nfrag} : index")
-            e("  %bf_live = index.cmp ult, %tid, %bf_nfrag : index")
-            e("  scf.if %bf_live {")
-            for nm, v in (("c2", 2), ("c144", 144), ("c72", 72), ("csub", GN.NP), ("cpk", sum(bks)), ("cpass", bpasses),
-                          ("c8", 8), ("ckq", ksub // 8)):
-                e(f"    %bf_{nm} = index.constant {v} : index")
-            # a lane pair takes rows 0-7 and 8-15 of one k-block: its 144 contiguous stream bytes (whole lines per wave)
-            e("    %bf_half = index.rem %tid, %bf_c2 : index")
-            e("    %bf_pair = index.div %tid, %bf_c2 : index")
-            e("    %bf_r16 = index.div %bf_pair, %bf_ckq : index")
-            e("    %bf_kk = index.rem %bf_pair, %bf_ckq : index")
-            e("    %bf_r16x2 = index.mul %bf_r16, %bf_c2 : index")
-            e("    %bf_rr = index.add %bf_r16x2, %bf_half : index")
-            e("    %bf_r0 = index.mul %bf_rr, %bf_c8 : index")
-            e("    %bf_gr = index.add %wg_row, %bf_r0 : index")
-            e("    %bf_g8 = index.div %bf_gr, %bf_c8 : index")
-            e("    %bf_kb0 = index.mul %dq_kp, %bf_ckq : index")
-            e("    %bf_kbi = index.add %bf_kb0, %bf_kk : index")
-            frag = GE.emit_offset(e, "wgt", 0, bks, bpasses, GN.TN, True, "%bf_g8", "%bf_kbi", p="bf_")
-            e("    %bf_kc = index.mul %bf_kk, %bf_c8 : index")
+            # encode the BM x KSUB tile into the NPU weight stream. Fragment f (8 rows x 8 k, 72 bytes) is the one the lane
+            # pair (f / 2, half f % 2) took before: k-block kk = (f / 2) % ckq of the 16 rows r16 = (f / 2) / ckq. Every
+            # lane encodes row blocks (8 k of one row, its own exponent) into the staged fragments, then the fragments go
+            # out as aligned 8-byte stores.
+            import gen_npu_unpack as GU
+            nrec, nwd = nfrag * 8, nfrag * 9
+            cst = (("c2", 2), ("c144", 144), ("c72", 72), ("csub", GN.NP), ("cpk", sum(bks)), ("cpass", bpasses),
+                   ("c8", 8), ("c9", 9), ("ckq", ksub // 8))
 
-            def bf_load(r):
-                e(f"    %bf_ro{r} = index.constant {r} : index")
-                e(f"    %bf_lr{r} = index.add %bf_r0, %bf_ro{r} : index")
-                e(f"    %bf_xh{r} = vector.load %wl_dq[%bf_lr{r}, %bf_kc] : view<{BM}x{G.ROWP}xf16> -> vector<8xf16>")
-                return f"%bf_xh{r}"
+            def frag_of(q, f, ind):   # (row in the tile of the fragment's first row, k-block in the item) of fragment f
+                e(f"{ind}%{q}half = index.rem {f}, %{q}c2 : index")
+                e(f"{ind}%{q}pair = index.div {f}, %{q}c2 : index")
+                e(f"{ind}%{q}r16 = index.div %{q}pair, %{q}ckq : index")
+                e(f"{ind}%{q}kk = index.rem %{q}pair, %{q}ckq : index")
+                e(f"{ind}%{q}r16x2 = index.mul %{q}r16, %{q}c2 : index")
+                e(f"{ind}%{q}rr = index.add %{q}r16x2, %{q}half : index")
+                e(f"{ind}%{q}r0 = index.mul %{q}rr, %{q}c8 : index")
 
-            GE.emit_encode(e, bf_load, frag, "%dq_out", "%dq_tot", p="bf_")
-            e("  }")
+            def rounds(n, body):
+                for i in range(-(-n // LANES)):
+                    q = f"bf{body.__name__[0]}{i}_"
+                    for nm, v in cst + (("ci", LANES * i),):
+                        e(f"  %{q}{nm} = index.constant {v} : index")
+                    e(f"  %{q}id = index.add %tid, %{q}ci : index")
+                    ind = "  "
+                    if LANES * (i + 1) > n:
+                        e(f"  %{q}n = index.constant {n} : index")
+                        e(f"  %{q}live = index.cmp ult, %{q}id, %{q}n : index")
+                        e(f"  scf.if %{q}live {{")
+                        ind = "    "
+                    body(q, ind)
+                    if ind != "  ":
+                        e("  }")
+
+            def assemble(q, ind):   # row block id: fragment id / 8, row id % 8
+                e(f"{ind}%{q}f = index.div %{q}id, %{q}c8 : index")
+                e(f"{ind}%{q}r = index.rem %{q}id, %{q}c8 : index")
+                frag_of(q, f"%{q}f", ind)
+                e(f"{ind}%{q}lr = index.add %{q}r0, %{q}r : index")
+                e(f"{ind}%{q}kc = index.mul %{q}kk, %{q}c8 : index")
+                e(f"{ind}%{q}xh = vector.load %wl_dq[%{q}lr, %{q}kc] : view<{BM}x{G.ROWP}xf16> -> vector<8xf16>")
+                hs = []
+                for x in range(8):
+                    e(f"{ind}%{q}h{x} = vector.extract %{q}xh[{x}] : vector<8xf16> -> f16")
+                    hs.append(f"%{q}h{x}")
+                e(f"{ind}%{q}fb = index.mul %{q}f, %{q}c72 : index")
+                e(f"{ind}%{q}ro = index.mul %{q}r, %{q}c9 : index")
+                e(f"{ind}%{q}sb = index.add %{q}fb, %{q}ro : index")
+
+                def store(x, v):
+                    a = f"%{q}sb"
+                    if x:
+                        e(f"    %{q}so{x} = index.constant {x} : index")
+                        e(f"    %{q}sa{x} = index.add %{q}sb, %{q}so{x} : index")
+                        a = f"%{q}sa{x}"
+                    e(f"    view.store {v}, %bfs_view[{a}] : i8, view<{nfrag * 72}xi8>")
+                GU.bfp_block(e, hs, q, store)
+
+            def copy(q, ind):   # 8-byte word id: fragment id / 9, word id % 9
+                e(f"{ind}%{q}f = index.div %{q}id, %{q}c9 : index")
+                e(f"{ind}%{q}w = index.rem %{q}id, %{q}c9 : index")
+                frag_of(q, f"%{q}f", ind)
+                e(f"{ind}%{q}gr = index.add %wg_row, %{q}r0 : index")
+                e(f"{ind}%{q}g8 = index.div %{q}gr, %{q}c8 : index")
+                e(f"{ind}%{q}kb0 = index.mul %dq_kp, %{q}ckq : index")
+                e(f"{ind}%{q}kbi = index.add %{q}kb0, %{q}kk : index")
+                frag = GE.emit_offset(e, "wgt", 0, bks, bpasses, GN.TN, True, f"%{q}g8", f"%{q}kbi", p=q, ind=ind)
+                e(f"{ind}%{q}wo = index.mul %{q}w, %{q}c8 : index")
+                e(f"{ind}%{q}ga = index.add {frag}, %{q}wo : index")
+                e(f"{ind}%{q}fb = index.mul %{q}f, %{q}c72 : index")
+                e(f"{ind}%{q}la = index.add %{q}fb, %{q}wo : index")
+                e(f"{ind}%{q}v = vector.load %bfs_view[%{q}la] : view<{nfrag * 72}xi8> -> vector<8xi8>")
+                e(f"{ind}vector.store %{q}v, %dq_out[%{q}ga] : vector<8xi8>, view<[%dq_tot]xi8>")
+
+            rounds(nrec, assemble)
+            e("  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
+            rounds(nwd, copy)
             e("  scf.yield " + ", ".join(nm for nm, _ in wn) + f" : {ctys}")
             e("  }")
             e("  }")
