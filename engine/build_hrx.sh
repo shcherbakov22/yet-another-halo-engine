@@ -32,7 +32,8 @@ cmake --build "$root/engine/build" -j"$(nproc)" >/dev/null
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$inc" "$root/engine/run/hal_bench.cc" \
     -o "$root/engine/build/hal_bench" "$root/engine/build/libyah_core.a" \
     -L"$libhrx" -lhrx -licuuc -lpthread
-# NPU (libamdf + the xdna loader, static from the HRX build): the prefill driver's NPU split (YAH_NPU) and its harness.
+# NPU (libamdf + the xdna loader, static from the HRX build): the prefill driver's NPU split (YAH_NPU), its harness and
+# yah_server --npu.
 npu_inc=(-I"$YAH_HRX" -I"$YAH_HRX/runtime/src" -I"$H/runtime/src" -I"$YAH_HRX/libamdf/include" -I"$H"
          -isystem "$H/_deps/linux_uapi/include")
 npu_libs=()
@@ -73,11 +74,11 @@ npu_flags=("${npu_inc[@]}" -DIREE_ALLOCATOR_SYSTEM_CTL=iree_allocator_libc_ctl)
     "$root/engine/run/npu_split_run.cc" -o "$root/engine/build/npu_split_run" "$root/engine/build/libyah_core.a" \
     -Wl,--start-group "${npu_libs[@]}" -Wl,--end-group -L"$libhrx" -lhrx -licuuc -lpthread -lm -ldl
 # The Responses API server (engine/serve).
-"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" -I"$inc" "$root/engine/serve/yah_server.cc" \
-    "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
+"$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" -I"$inc" "${npu_flags[@]}" \
+    "$root/engine/serve/yah_server.cc" "$root/engine/serve/chat_template.cpp" "$root/engine/serve/responses.cpp" \
     "$root/engine/third_party/httplib/httplib.cpp" \
     -o "$root/engine/build/yah_server" "$root/engine/build/libyah_core.a" \
-    -L"$libhrx" -lhrx -licuuc -lpthread
+    -Wl,--start-group "${npu_libs[@]}" -Wl,--end-group -L"$libhrx" -lhrx -licuuc -lpthread -lm -ldl
 # Terminal chat client for yah_server.
 "$CXX" "${cxxflags[@]}" -I"$root/engine" -I"$root/engine/third_party" "$root/engine/serve/yah_chat.cc" \
     "$root/engine/third_party/httplib/httplib.cpp" -o "$root/engine/build/yah_chat" -lpthread

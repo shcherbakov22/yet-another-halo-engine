@@ -24,6 +24,7 @@
 #include "core/tokenizer.hpp"
 #include "model/generator.hpp"
 #include "model/loom_decoder.hpp"
+#include "model/loom_npu.hpp"
 #include "model/loom_prefill.hpp"
 #include "model/loom_runtime.hpp"
 
@@ -35,6 +36,7 @@ class Engine : public TextGenerator {
     std::string model;        // GGUF path
     std::string prefill_hal;  // emit_prefill_pp.py set (chunked, paged)
     std::string decode_hal;   // emit_decode.py set with the prefill's context and YAH_KV
+    bool npu = false;         // the NPU computes the trailing rows of the prefill set's split GEMMs (YAH_NPU_SPLIT)
   };
   // How the tokens after the last whole chunk are run.
   enum class Tail { kAuto, kChunk, kDecode };
@@ -53,6 +55,12 @@ class Engine : public TextGenerator {
     if (decoder_.kv_bits() != prefill_.kv_bits())
       throw LoomError("engine: the decode set's KV format differs from the prefill's (emit with the same YAH_KV)");
     gpu_.SetSleepSync(200);
+    if (o.npu) {
+      const NpuPlan plan = prefill_.npu_plan();
+      if (plan.a_bytes == 0) throw LoomError("engine: --npu needs a prefill set emitted with YAH_NPU_SPLIT");
+      npu_ = std::make_unique<LoomNpuSplit>(gpu_, plan);
+      prefill_.EnableNpu(npu_.get());
+    }
     // Prefill calibration while serving (model/prefill_calib.hpp) is shelved: it converged too slowly to pay off yet.
     // To resume: prefill_.EnableCalibration(CalibrationPath(o.prefill_hal)) and emit sets with the calibration menu.
     logits_ = gpu_.Allocate(std::size_t{LoomPrefill::kVocab} * 4);
@@ -90,15 +98,18 @@ class Engine : public TextGenerator {
     const bool tail_chunk =
         tail && (tail_ == Tail::kChunk || (tail_ == Tail::kAuto && tail * step_ms_ > chunk_ms_ * ChunkShare(tail)));
     const std::uint32_t chunks = full / B + (tail_chunk ? 1 : 0);
+    // The host queues every chunk without waiting: one chunk costs the whole prefill's time over its chunks' shares.
+    const auto tp = std::chrono::steady_clock::now();
+    double shares = 0.0;
     for (std::uint32_t c = 0; c < chunks; ++c) {
-      const auto tc = std::chrono::steady_clock::now();
       const std::uint32_t valid = std::min(B, n - c * B);
+      shares += ChunkShare(valid);
       prefill_.Embed(prompt.data() + std::size_t{c} * B, valid);
       LoomPrefill::KvHook hook;
       if (valid % 16 && decoder_.kv_bits().second != 16) {
         // Quantized V and the prompt ends mid-tile: seed the decoder's open tile with that tile's real V rows.
         const std::int32_t rc[2] = {static_cast<std::int32_t>(valid - valid % 16), static_cast<std::int32_t>(valid % 16)};
-        gpu_.H2D(seed_, rc, 8);
+        gpu_.Update(seed_, rc, 8);
         hook = [&](std::uint32_t ai, std::uint32_t, std::size_t, std::size_t voff) {
           prefill_.SeedOpenTile(voff, Ref(seed_), decoder_.OpenTile(ai));
         };
@@ -107,8 +118,10 @@ class Engine : public TextGenerator {
       const bool head = c + 1 == chunks && (tail_chunk || tail == 0);
       prefill_.RunLayers(c, hook, head ? std::int64_t{valid} - 1 : LoomPrefill::kNoRows);
       if (c + 1 == chunks && (tail_chunk || tail == 0)) prefill_.Head(valid - 1, Ref(logits_));
-      if (c + 1 == chunks) gpu_.Synchronize();
-      Track(chunk_ms_, (std::chrono::steady_clock::now() - tc) / ChunkShare(valid), c + 1 == chunks);
+      if (c + 1 == chunks) {
+        gpu_.Synchronize();
+        Track(chunk_ms_, (std::chrono::steady_clock::now() - tp) / shares, true);
+      }
     }
     prefill_.Collect();
     // Every token, greedy or sampled (LoomDecoder::SetSampling), is picked on the GPU into the decoder's token stream,
@@ -214,6 +227,7 @@ class Engine : public TextGenerator {
   LoomWeights weights_;
   LoomPrefill prefill_;
   LoomDecoder decoder_;
+  std::unique_ptr<LoomNpuSplit> npu_;  // Options::npu; the prefill keeps a pointer
   LoomBuffer logits_, seed_;
   LoomBuffer tokens_mirror_;                    // host-local copy of the decoder's token stream (MarkToken)
   const std::uint32_t* tokens_host_ = nullptr;  // its mapping

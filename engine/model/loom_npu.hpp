@@ -711,6 +711,9 @@ class LoomNpuSplit : public NpuSplit {
         flags_(npu_.CreateShared(65536, true)),
         plan_(plan) {
     if (!plan.gate_calls) throw LoomError("npu: the set has no gate protocol (dispatch.txt npugate; re-emit it)");
+    if (!GpuPinnedHigh())
+      throw LoomError("npu: pin the GPU performance level first (echo high > /sys/class/drm/card*/device/"
+                      "power_dpm_force_performance_level): fabric / memory clock switches corrupt NPU outputs");
     if (kSignal + 2 * plan.gate_record > kGateSlot) throw LoomError("npu: the gate records do not fit a gate slot");
   }
   const LoomBuffer& A() const override { return a_.gpu; }
@@ -802,6 +805,15 @@ class LoomNpuSplit : public NpuSplit {
   }
 
  private:
+  // The amdgpu card's DPM performance level is "high" (results.md: deferred data-fabric errors otherwise).
+  static bool GpuPinnedHigh() {
+    for (int card = 0; card < 8; ++card) {
+      std::ifstream f("/sys/class/drm/card" + std::to_string(card) + "/device/power_dpm_force_performance_level");
+      std::string level;
+      if (f >> level) return level == "high";
+    }
+    return false;
+  }
   // Gate slots, one per bound call from byte kGateBase of the flag words (below it: kFlagStatus), every view 64-byte
   // aligned: flag record (+0: ready), tick scratch (+kTick), signal (+kSignal: go, then done one record later).
   static constexpr std::size_t kGateBase = 256, kGateSlot = 192, kTick = 64, kSignal = 128;
