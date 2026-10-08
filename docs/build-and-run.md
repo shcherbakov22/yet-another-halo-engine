@@ -12,7 +12,7 @@ How to build the drivers, emit HAL sets, run prefill and decode, check correctne
 
 ### HRX patches
 
-Each patch says at its top what it is for. They apply idempotently, so one that upstream takes is skipped automatically, and one that no longer fits the pin stops the bootstrap. Raise the pin deliberately: bootstrap, rebuild, then check the emits and the GPU references.
+Each patch says at its top what it is for. Patches stack (a later one may edit an earlier one's lines): the bootstrap builds the pin with every patch applied in order and brings the checkout's patched files to it, and `--check` compares them; a patch that no longer fits the pin stops it. Raise the pin deliberately: bootstrap, rebuild, then check the emits and the GPU references.
 
 | patch | effect |
 |---|---|
@@ -28,6 +28,7 @@ Each patch says at its top what it is for. They apply idempotently, so one that 
 | `0013-xdna-npu-cascade-gemm-compiler` | Loom AIE2P / XDNA pieces of the NPU cascade GEMM: memory-tile staging, replay and multicast, shared panels, cascade link timing, `worker.accumulate`, leaf-synchronized channels (`constrain.leaf_sync`), replay rings re-armed by the control program, `LOOM_EXP_*` placement and packing knobs (`LOOM_EXP_LS_SEND_PITCH`: leaf-synchronized send-ring slots n records apart, each sending its leading record); NPU-only code paths (GPU emits byte-identical) |
 | `0014-xdna-continuation-invocation` | `iree_hal_amd_xdna_executable_query_continuation`: the control-only repeat invocation (no tile setup), ~545 -> ~150 us fixed cost per NPU call |
 | `0015-graph-atomic-store-node` | `hrx_graph_add_atomic_store_node`: a 4 / 8-byte store recorded in a graph's command buffer (no partition break); with release + system scope the command processor makes every earlier write visible to the host and other devices first. The NPU prefill's "inputs ready" flags (one graph per chunk) |
+| `0016-loom-xdna-npu-side-gate` | Loom AIE2P: an NPU job waits for a flag in memory itself (no host relay): core stream channels (`constrain.core_stream`, the core's own stream port), request-driven polls through a shim lock (`constrain.request`), a gate the control program waits for before moving any data and a done record queued after the outputs (`constrain.gate`, `constrain.signal`; streamed plans get `[gate \| done]` invocations), worker storage zeroed at setup; router fix: through a memory tile a route keeps its channel. Ungated images byte-identical |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 
@@ -60,7 +61,7 @@ Emitters run on the CPU and take a few minutes. Paths below are relative to `eng
 | prefill, one pass of B tokens | `python3 tools/emit_prefill_pp.py <gguf> <dir> 2048` (B must be a multiple of 256) |
 | prefill, chunked, context T | `YAH_CTX=32768 python3 tools/emit_prefill_pp.py <gguf> <dir> 2048` (chunk 2048, pools for 32768 tokens; T a multiple of B) |
 | prefill with kv8a16 / kv4a16 | add `YAH_KV=kv8` or `YAH_KV=kv4` (or mixed `k8v4`, `k4v8`; `k8` / `v4` alone quantize one side, prefill only) |
-| prefill with the NPU column split | add `YAH_NPU_SPLIT=qkv=4480,gate=2560,q=5120,out=2560,down=2560,ffn=7680` (NPU rows per site, multiples of 640, q of 2560; any subset; see `emit_prefill_pp.npu_split`); run `loom_forward_pp` with `YAH_NPU=1` (full 2048-token chunks; AC power and `power_dpm_force_performance_level=high`, see results.md) |
+| prefill with the NPU column split | add `YAH_NPU_SPLIT=qkv=4480,gate=2560,q=5120,out=2560,down=2560,ffn=7680` (NPU rows per site, multiples of 640, q of 2560; any subset; see `emit_prefill_pp.npu_split`) and `YAH_NPU_GATE=1024` (the NPU waits for its inputs itself, no host relay; omit for the relay); run `loom_forward_pp` with `YAH_NPU=1` (full 2048-token chunks; AC power and `power_dpm_force_performance_level=high`, see results.md) |
 | decode | `python3 tools/emit_decode.py <gguf> <dir> <max_context>` (multiple of 256, default 4096) |
 | decode after a prefill | same, with `max_context` = the prefill set's context and the same `YAH_KV` |
 
@@ -208,6 +209,7 @@ Rules:
 5. Never bind a buffer smaller than the kernel's declared footprint. The prefill emitter runs `tools/footprint_gate.py`; `hal_run` checks declared sizes; `tools/safe_bench.py` and `tools/loom_preflight.py` check the compile report's footprint against the bindings.
 6. Rebuild drivers with `engine/build_hrx.sh` after every source change, and do not edit `engine/run/*.cc` during a measuring round (`gpu_run.sh` will then refuse the remaining runs).
 7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/yah-scratch/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
+8. A launched chunk graph waits on NPU done words (~2 s bound each). Never leave it waiting on jobs that will not run: when queueing them fails, release the waits (`NpuSplit::Release`). A graph of ~250 unreleased waits spun for minutes, starved the display ring and needed a reset. Test new NPU host paths CPU-driven first (no GPU kernels), then end to end.
 
 After a hang and reboot, read the previous boot's kernel log:
 

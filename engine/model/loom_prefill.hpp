@@ -96,6 +96,7 @@ class LoomPrefill {
       p.a_bytes = std::max(p.a_bytes, q.a_bytes), p.w_bytes = std::max(p.w_bytes, q.w_bytes),
       p.c_bytes = std::max(p.c_bytes, q.c_bytes);
     p.w_bytes *= 2;   // two slots: a job's weights are decoded while the previous job runs (NpuDecode)
+    if (const auto it = geom_.find("npugate"); it != geom_.end()) p.gate = it->second.tokens;
     return p;
   }
   // Split the set's NPU sites of full chunks with the NPU from now on: it computes their trailing npusplit rows.
@@ -203,7 +204,18 @@ class LoomPrefill {
     // every graph of the session, to match them in order (one graph per chunk; NPU chunks are not matched)
     if (gpu_.profiling() && flagged_.empty()) session_chunks_.push_back(nodes_);
     chunk_graph_->Launch();
-    for (const Flagged& j : flagged_) npu_->EnqueueFlagged(j.calls, j.tag, j.ready, j.ready + 1, epoch_);
+    for (std::size_t i = 0; i < flagged_.size(); ++i) {
+      const Flagged& j = flagged_[i];
+      try {
+        npu_->EnqueueFlagged(j.calls, j.tag, j.ready, j.done, j.gated ? j.seq : epoch_);
+      } catch (...) {
+        // the graph runs: release its waits for this and every later job, which will never run
+        for (std::size_t k = i; k < flagged_.size(); ++k)
+          npu_->Release(flagged_[k].done, flagged_[k].gated ? flagged_[k].seq : epoch_);
+        flagged_.clear();
+        throw;
+      }
+    }
     flagged_.clear();
   }
 
@@ -1213,10 +1225,14 @@ class LoomPrefill {
   // (release, system scope: A and W reach memory first); the relay then runs the job and stores the epoch to the done
   // word. NpuJoin: yah_npu_flag_wait polls the done word; it stands for the NPU's reads of A / W and writes of C, so the
   // unpacks and the next job's encoders and decoders order after it.
+  // A gated image (NpuSplit::Gated) needs no relay: the graph stores the job's gate value (NpuSplit::NextGate) to its
+  // first call's ready word, the NPU's gate waits for it and writes it to the last call's done word, and the wait ends
+  // once done reaches it.
   struct Flagged {
     std::vector<std::uint32_t> calls;
     std::string tag;
-    std::uint32_t ready, job;
+    std::uint32_t ready, job, done = 0, seq = 0;
+    bool gated = false;
   };
   // A weight decode of the planning pass (EnableNpu), dispatched early in one-graph mode.
   struct PlannedDecode {
@@ -1241,12 +1257,22 @@ class LoomPrefill {
   hrx_buffer_ref_t FlagWord(std::uint32_t w) const { return {npu_->Flags()->handle, std::size_t{w} * 4, 4}; }
   // The job's calls; tag names it in the NPU stats.
   void NpuEnqueue(std::vector<std::uint32_t> calls, std::string tag) {
-    const std::uint32_t job = npu_job_++, ready = NpuSplit::kFlagFirstJob + 2 * job;
+    const std::uint32_t job = npu_job_++;
+    if (npu_->Gated()) {
+      if (npu_planning_) return;
+      const auto [ready, done] = npu_->GateWords(calls);
+      const std::uint32_t seq = npu_->NextGate(calls);
+      graph_->AtomicStore(FlagWord(ready), seq, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE,
+                          {Ref(npu_->A()), WSlot(job)}, {Ref(npu_->C())});
+      flagged_.push_back({std::move(calls), std::move(tag), ready, job, done, seq, true});
+      return;
+    }
+    const std::uint32_t ready = NpuSplit::kFlagFirstJob + 2 * job;
     if (ready + 1 >= npu_->FlagWords()) throw LoomError("prefill: more NPU jobs per chunk than flag words");
     if (npu_planning_) return;
     graph_->AtomicStore(FlagWord(ready), epoch_, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE,
                         {Ref(npu_->A()), WSlot(job)}, {Ref(npu_->C())});
-    flagged_.push_back({std::move(calls), std::move(tag), ready, job});
+    flagged_.push_back({std::move(calls), std::move(tag), ready, job, ready + 1});
   }
   // Queue the GPU work that runs beside the last enqueued job before this.
   void NpuJoin() {
@@ -1258,10 +1284,10 @@ class LoomPrefill {
         Dispatch(Exe(d.hal), d.name.c_str(), d.gx, 1, 1, d.wg, 1, 1, d.b, std::uint64_t{1} << (d.b.size() - 1));
         predecoded_.push_back(d);
       }
-    const std::uint32_t ready = flagged_.back().ready;
-    const std::vector<hrx_buffer_ref_t> npu_side{Ref(npu_->A()), WSlot(flagged_.back().job), Ref(npu_->C())};
+    const Flagged& j = flagged_.back();
+    const std::vector<hrx_buffer_ref_t> npu_side{Ref(npu_->A()), WSlot(j.job), Ref(npu_->C())};
     Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1,
-             {FlagWord(ready + 1), FlagWord(ready), FlagWord(NpuSplit::kFlagStatus)}, 4, &npu_side);
+             {FlagWord(j.done), FlagWord(j.ready), FlagWord(NpuSplit::kFlagStatus)}, 4, &npu_side);
   }
 
   // af: the afrag form, input normt_ (fragment-major)

@@ -140,3 +140,14 @@ Measured on low-asm leaves compiled by `loom-compile` (static bundle counts of s
 - `vst.push.bfp16ebs8.from.fp32` converts 64 f32 lanes like the GEMM encoder (E = exponent of the block max) except that E goes up by one only when a rounded mantissa leaves int8 (-128 stays), and subnormal inputs flush to 0.
 - Budgets: 24 vec256 units, 5 accumulators of 2048 bits, 8 pointer registers. Pointer adds take immediates in multiples of 64 (others through a modifier register), scalar loads / stores -32..28 bytes, 512-bit loads -512..448. A `concat` of separately loaded halves often costs register moves.
 - `vshuffle` modes 0-55 are permutations (56 and up are not); among them byte, 16-bit and 32-bit (de)interleaves and transposes, e.g. mode 35 is an 8 x 8 byte transpose. There is no data-dependent lane permute; `vldb.4x{16,32,64}` gathers four 64-bit windows from four pointers held in a vector.
+
+## NPU data movement (AIE2P) (2026-10-08)
+
+Measured with small Loom array programs on the NPU (yah-scratch/npu/waitp):
+
+- A memory tile connects a north or south stream input only to the north or south output of the same channel (the AIE-ML switch rule); a mismatch (south 2 -> north 5) lost one word per DMA transfer, or stalled the flow under a lock. Loom's router keeps the channel through a memory tile (patch 0016).
+- NPU DMA does not snoop CPU caches: CPU stores to registered host pages reach the NPU only after `clflush`. GPU stores with system scope (and GPU fills plus a release copy) reach it.
+- A shim MM2S runs ahead of a slow consumer: ~10 transfers (22 of 16 bytes) sit in flight, so a polled value is that many polls old. A shim lock acquired by the reading BD and released by a tick's BD makes each read wait for a request: one fresh read per poll, a host write seen within one record.
+- A queued shim task repeats its descriptor (or chain) at most 256 times; the BD iteration dimension adds an address offset per execution and does not multiply the count. A chain of identical BDs repeated 256 times gives chain x 256 transfers per task.
+- Core stream reads (`mov.ss`) and writes (`mov.ms`) work in locked leaves. Do not use `mov.ss.nb` with `mov.ss.status`: a count of status-3 reads went wrong and the job hung (TDR).
+- Private storage of a core is not cleared between images: a new image starts on the old image's tile memory.

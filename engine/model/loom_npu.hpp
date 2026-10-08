@@ -76,6 +76,10 @@ class LoomNpu {
     // (nothing computes yet that pacing would protect); first sets the array up and runs one whole call.
     bool stream = false;
     amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{};
+    // A gated image (gen_npu_gemm GATE, seven invocations): gate opens a job once its ready word reaches the job's
+    // sequence, done writes the done word after the job's last C.
+    bool gated = false;
+    amdf_xdna_kernel_command_t gate{}, done{};
     std::vector<iree_hal_amd_xdna_executable_storage_t> storage;
     std::vector<amdf_host_mapping_t*> storage_maps;
     std::vector<amdf_memory_t*> imports;
@@ -108,6 +112,7 @@ class LoomNpu {
     fence_host_.size = 64;
     fence_dev_ = gpu_.Allocate(64);
     relay_ = std::thread([this] { Relay(); });
+    reaper_ = std::thread([this] { Reaper(); });
   }
   LoomNpu(const LoomNpu&) = delete;
   LoomNpu& operator=(const LoomNpu&) = delete;
@@ -118,6 +123,8 @@ class LoomNpu {
     }
     cv_.notify_all();
     if (relay_.joinable()) relay_.join();
+    reap_cv_.notify_all();
+    if (reaper_.joinable()) reaper_.join();
     for (auto& a : arenas_) {
       api_->host_mapping_destroy(a.map);
       api_->memory_destroy(a.storage.memory);
@@ -269,10 +276,11 @@ class LoomNpu {
     NpuCheck(iree_hal_amd_xdna_executable_query_continuation(image, entry_ordinal, n, k->storage.data(), true,
                                                              &k->repeat),
              "query_continuation");
-    if (rec.invocation_count == 5) {
+    if (rec.invocation_count == 5 || rec.invocation_count == 7) {
       k->stream = true;
-      amdf_xdna_kernel_command_t* const out[] = {&k->push[0], &k->push[1], &k->wait, &k->lead};
-      for (uint32_t i = 0; i < 4; ++i)
+      k->gated = rec.invocation_count == 7;
+      amdf_xdna_kernel_command_t* const out[] = {&k->push[0], &k->push[1], &k->wait, &k->lead, &k->gate, &k->done};
+      for (uint32_t i = 0; i < (k->gated ? 6u : 4u); ++i)
         NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(image, entry_ordinal, n, k->storage.data(), i + 1,
                                                                        out[i]),
                  "query_invocation_ordinal");
@@ -301,6 +309,15 @@ class LoomNpu {
     std::lock_guard<std::mutex> lock(mu_);
     Job job{{}, std::move(kernels), ++issued_, std::move(tag)};
     job.ready = ready, job.done = done, job.epoch = epoch;
+    jobs_.push_back(std::move(job));
+    cv_.notify_one();
+  }
+  // A gated image's job: queued at once, the NPU waits for its ready word itself and writes its done word (the gate
+  // value). After a failure the relay stores it with bit 31 to *done, so the GPU's wait ends and reports it.
+  void EnqueueGated(std::vector<Kernel*> kernels, std::string tag, volatile std::uint32_t* done, std::uint32_t seq) {
+    std::lock_guard<std::mutex> lock(mu_);
+    Job job{{}, std::move(kernels), ++issued_, std::move(tag)};
+    job.done = done, job.epoch = seq, job.gated = true;
     jobs_.push_back(std::move(job));
     cv_.notify_one();
   }
@@ -335,8 +352,9 @@ class LoomNpu {
  private:
   // A streamed run of calls as one command: [lead c0][push c1][wait][push c2][wait] ... [wait][wait] (pushes on
   // alternating descriptor sets, at most two calls queued), the bodies of the calls' own relocated commands under one
-  // native transaction header (format 0.1: operation count at byte 8, byte length at 12). Built once per call list
-  // into command arenas (allocating per command cost ~1 ms on the relay thread).
+  // native transaction header (format 0.1: operation count at byte 8, byte length at 12); a gated image's job adds
+  // [gate c0] in front and [done cN] behind. Built once per call list into command arenas (allocating per command cost
+  // ~1 ms on the relay thread).
   struct Arena {
     iree_hal_amd_xdna_executable_storage_t storage{};
     amdf_host_mapping_t* map = nullptr;
@@ -362,11 +380,13 @@ class LoomNpu {
       ops += n;
     };
     int queued = 0;
+    if (calls[0]->gated) append(*calls[0], calls[0]->gate);
     for (std::size_t i = 0; i < calls.size(); ++i) {
       append(*calls[i], i == 0 ? calls[i]->lead : calls[i]->push[i & 1]);
       if (++queued == 2) append(*calls[i], calls[i]->wait), --queued;
     }
     for (; queued > 0; --queued) append(*calls.back(), calls.back()->wait);
+    if (calls.back()->gated) append(*calls.back(), calls.back()->done);
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
     if (size > kArenaBytes) throw LoomError("npu: fused command exceeds its arena");
@@ -401,6 +421,7 @@ class LoomNpu {
     volatile std::uint32_t* ready = nullptr;  // EnqueueFlagged
     volatile std::uint32_t* done = nullptr;
     std::uint32_t epoch = 0;
+    bool gated = false;  // EnqueueGated: epoch is the job's sequence; the NPU writes *done
   };
   // Spins briefly, then polls every ~20 us (timer slack set in Relay): the GPU usually stores the word within a few ms.
   static void WaitWord(volatile std::uint32_t* word, std::uint32_t value) {
@@ -432,14 +453,14 @@ class LoomNpu {
         failed = !failure_.empty();
       }
       if (failed && job.done) {
-        __atomic_store_n(job.done, job.epoch, __ATOMIC_RELEASE);
+        __atomic_store_n(job.done, job.gated ? job.epoch | 0x80000000u : job.epoch, __ATOMIC_RELEASE);
         hrx_status_ignore(hrx_semaphore_signal(done_, job.signal));
         continue;
       }
       try {
         if (job.ready)
           WaitWord(job.ready, job.epoch);
-        else
+        else if (!job.gated)
           LoomCheck(hrx_semaphore_wait(job.after.semaphore, job.after.value, UINT64_MAX), "relay: GPU wait");
         const auto t0 = std::chrono::steady_clock::now();
         std::uint64_t submission = 0;
@@ -454,6 +475,24 @@ class LoomNpu {
         // A run of streamed calls goes out as one fused command (FusedCommand): calls overlap inside it, and no
         // command boundary falls while a call's DMA work is in flight (separate commands at that point hung the NPU
         // firmware under DRAM contention).
+        if (job.gated) {
+          // The image's setup runs once, as its own command: one ungated call (any data), after which the gate
+          // waits for sequence 1. A gated job is then one command, queued at once (the reaper retires it): its gate
+          // holds the NPU until the GPU is ready.
+          Kernel* k = job.kernels[0];
+          if (resident_ != k->image_key) {
+            submit(&k->first);
+            YAH_AMDF(api_->kernel_queue_wait(queue_, submission, AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
+            resident_ = k->image_key;
+          }
+          submit(&FusedCommand(job.kernels));
+          {
+            std::lock_guard<std::mutex> lock(mu_);
+            pending_.push_back({submission, std::move(job), t0});
+          }
+          reap_cv_.notify_one();
+          continue;
+        }
         std::size_t i = 0;
         while (i < job.kernels.size()) {
           Kernel* k = job.kernels[i];
@@ -482,9 +521,54 @@ class LoomNpu {
         std::lock_guard<std::mutex> lock(mu_);
         if (failure_.empty()) failure_ = e.what();
         resident_ = nullptr;
+        if (job.gated && job.done) __atomic_store_n(job.done, job.epoch | 0x80000000u, __ATOMIC_RELEASE);
       }
-      if (job.done) __atomic_store_n(job.done, job.epoch, __ATOMIC_RELEASE);
+      if (job.done && !job.gated) __atomic_store_n(job.done, job.epoch, __ATOMIC_RELEASE);
       hrx_status_ignore(hrx_semaphore_signal(done_, job.signal));
+    }
+  }
+
+  // Retires gated jobs in order (EnqueueGated): stats, the stream semaphore, and on a failure the done words of this
+  // and every later queued job (seq with bit 31), so no GPU wait is left spinning.
+  struct Pending {
+    std::uint64_t submission;
+    Job job;
+    std::chrono::steady_clock::time_point t0;
+  };
+  std::deque<Pending> pending_;
+  std::condition_variable reap_cv_;
+  std::thread reaper_;
+  void Reaper() {
+    for (;;) {
+      Pending p;
+      {
+        std::unique_lock<std::mutex> lock(mu_);
+        reap_cv_.wait(lock, [this] { return stop_ || !pending_.empty(); });
+        if (pending_.empty()) return;
+        p = std::move(pending_.front());
+        pending_.pop_front();
+      }
+      bool ok = true;
+      try {
+        YAH_AMDF(api_->kernel_queue_wait(queue_, p.submission, AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(gated)");
+      } catch (const LoomError& e) {
+        ok = false;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (failure_.empty()) failure_ = e.what();
+        resident_ = nullptr;
+      }
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p.t0).count();
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!failure_.empty()) ok = false;
+        if (ok) {
+          auto& st = stats_[p.job.tag];
+          st.jobs += 1, st.calls += p.job.kernels.size(), st.busy_ms += ms;
+          last_job_ms_ = ms;
+        }
+      }
+      if (!ok && p.job.done) __atomic_store_n(p.job.done, p.job.epoch | 0x80000000u, __ATOMIC_RELEASE);
+      hrx_status_ignore(hrx_semaphore_signal(done_, p.job.signal));
     }
   }
 
@@ -726,16 +810,51 @@ class LoomNpuSplit : public NpuSplit {
         a_(npu_.CreateShared(plan.a_bytes)),
         w_(npu_.CreateShared(plan.w_bytes)),
         c_(npu_.CreateShared(plan.c_bytes, true)),  // the NPU writes C (see CreateShared)
-        flags_(npu_.CreateShared(4096, true)) {}
+        flags_(npu_.CreateShared(plan.gate ? 65536 : 4096, true)),
+        gated_(plan.gate != 0) {}
   const LoomBuffer& A() const override { return a_.gpu; }
   const LoomBuffer& W() const override { return w_.gpu; }
   const LoomBuffer& C() const override { return c_.gpu; }
   std::uint32_t Bind(const std::string& image, NpuView a, NpuView w, NpuView c) override {
     const auto key = std::make_tuple(image, a.offset, a.length, w.offset, w.length, c.offset, c.length);
     if (const auto it = ids_.find(key); it != ids_.end()) return it->second;
-    kernels_.push_back(&npu_.Load(image, "npu_gemm",
-                                  {{&a_, a.offset, a.length}, {&w_, w.offset, w.length}, {&c_, c.offset, c.length}}));
+    std::vector<LoomNpu::View> views = {{&a_, a.offset, a.length}, {&w_, w.offset, w.length}, {&c_, c.offset, c.length}};
+    if (gated_) {   // the call's gate slot: flag record, tick scratch, signal (go, done)
+      const std::size_t slot = kGateBase + kGateSlot * kernels_.size();
+      if (slot + kGateSlot > flags_.bytes) throw LoomError("npu: more gated NPU calls than flag slots");
+      views.push_back({&flags_, slot, 16});
+      views.push_back({&flags_, slot + 64, 16});
+      views.push_back({&flags_, slot + 128, 32});
+    }
+    kernels_.push_back(&npu_.Load(image, "npu_gemm", views));
     return ids_[key] = static_cast<std::uint32_t>(kernels_.size() - 1);
+  }
+  // A flag word from / to the host, through memory (the NPU does not snoop CPU caches): tests and diagnostics.
+  void HostStore(std::uint32_t word, std::uint32_t value) {
+    auto* w = static_cast<volatile std::uint32_t*>(flags_.host) + word;
+    __atomic_store_n(w, value, __ATOMIC_RELEASE);
+    __builtin_ia32_clflush(const_cast<std::uint32_t*>(w));
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  }
+  std::uint32_t HostLoad(std::uint32_t word) {
+    auto* w = static_cast<volatile std::uint32_t*>(flags_.host) + word;
+    __builtin_ia32_clflush(const_cast<std::uint32_t*>(w));
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return __atomic_load_n(w, __ATOMIC_ACQUIRE);
+  }
+  void CheckHealthNow() { npu_.CheckHealth(); }
+  void Release(std::uint32_t done, std::uint32_t value) override {
+    HostStore(done, gated_ ? value | 0x80000000u : value);
+  }
+  [[nodiscard]] bool Gated() const override { return gated_; }
+  std::uint32_t NextGate(const std::vector<std::uint32_t>& calls) override {
+    if (calls.empty() || calls.size() >= 64) throw LoomError("npu: a gated job takes 1 to 63 calls");
+    return ++seq_ * 64u + static_cast<std::uint32_t>(calls.size());
+  }
+  [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> GateWords(
+      const std::vector<std::uint32_t>& calls) const override {
+    return {static_cast<std::uint32_t>((kGateBase + kGateSlot * calls.front()) / 4),
+            static_cast<std::uint32_t>((kGateBase + kGateSlot * calls.back() + 144) / 4)};
   }
   [[nodiscard]] const LoomBuffer* Flags() const override { return &flags_.gpu; }
   [[nodiscard]] std::uint32_t FlagWords() const override { return static_cast<std::uint32_t>(flags_.bytes / 4); }
@@ -749,19 +868,29 @@ class LoomNpuSplit : public NpuSplit {
     std::vector<LoomNpu::Kernel*> k;
     for (const std::uint32_t id : calls) k.push_back(kernels_.at(id));
     auto* w = static_cast<volatile std::uint32_t*>(flags_.host);
-    npu_.EnqueueFlagged(std::move(k), tag, w + ready, w + done, epoch);
+    if (!gated_) {
+      npu_.EnqueueFlagged(std::move(k), tag, w + ready, w + done, epoch);
+      return;
+    }
+    if (epoch % 64 != calls.size()) throw LoomError("npu: a gated job's gate value does not match its calls");
+    npu_.EnqueueGated(std::move(k), tag, w + done, epoch);
   }
-  // One line per job tag: jobs, calls, NPU busy time.
+  // One line per job tag: jobs, calls, NPU busy time (gated: queue to retirement, the wait for the GPU included).
   void Report(std::FILE* f) {
     if (Word(kFlagStatus)) std::fprintf(f, "npu: ERROR a GPU wait for the NPU timed out\n");
     for (const auto& [tag, st] : npu_.Stats())
-      std::fprintf(f, "npu: %-5s %4zu jobs %5zu calls, NPU busy %7.1f ms\n", tag.c_str(), st.jobs, st.calls,
-                   st.busy_ms);
+      std::fprintf(f, "npu: %-5s %4zu jobs %5zu calls, NPU %s %7.1f ms\n", tag.c_str(), st.jobs, st.calls,
+                   gated_ ? "queued" : "busy", st.busy_ms);
   }
 
  private:
+  // Gate slots (gated image), one per bound call from byte kGateBase of the flag words, every view 64-byte aligned:
+  // flag record (+0: ready), tick scratch (+64), signal (+128: go, +144: done).
+  static constexpr std::size_t kGateBase = 256, kGateSlot = 192;
   LoomNpu npu_;
   LoomNpu::Shared &a_, &w_, &c_, &flags_;
+  bool gated_ = false;
+  std::uint32_t seq_ = 0;
   std::vector<LoomNpu::Kernel*> kernels_;
   std::map<std::tuple<std::string, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>,
            std::uint32_t>

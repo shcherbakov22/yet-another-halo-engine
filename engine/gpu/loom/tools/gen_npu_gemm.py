@@ -22,7 +22,7 @@ call's weights while the other group computes, so calls stream back to back (Loo
 LOOM_EXP_PANEL_STREAM: counting locks, a looping fill, invocations [setup | even push | odd push | waits | lead push]
 and fills paced a few columns at a time so they do not starve the activation streams of DRAM; the lead push, a job's
 first call, fills unpaced; LoomNpu submits the pushes one call ahead of the waits).
-Needs HRX patch 0013; compile with LOOM_ENV.
+Needs HRX patch 0013; compile with LOOM_ENV. Config.gate > 0 adds the NPU-side gate (GATE below; HRX patch 0016).
 """
 import dataclasses
 import sys
@@ -51,6 +51,22 @@ class Config:
     acap: int = 2       # activation ring slabs, head and mids
     acap_t: int = 2     # activation ring slabs, tail (its memory also holds C)
     entry: str = "npu_gemm"
+    gate: int = 0       # NPU-side gate: poll supply per job (0: ungated); see GATE below
+
+
+# NPU-side gate (cfg.gate = supply): column 0's head waits for each job's ready word itself and its neighbor mid relays.
+# Extra bindings: 3 flag (read; 16-byte record, word 0 ready = job sequence * 64 + its calls), 4 tick (write; scratch),
+# 5 signal (write; go at byte 0, done at byte 16). After its last firing of a job the head polls request-driven
+# (constrain.request: one fresh flag read per tick) until ready >= (its job count + 1) * 64 (jobs count from 1 after the
+# setup call; jobs sharing a ready word store theirs in order, after the GPU joined the earlier ones), backing off (pace =
+# GP0 + GPS * max(0, polls - 64) delay iterations; a supply of 1024 polls lasts ~100 ms). It hands [seq, status, polls,
+# ncalls] to the mid over a leaf-synchronized neighbor channel and ticks / reads out the rest of the supply GB records per
+# firing of the next job. The mid emits go and done (constrain.signal + constrain.gate): the control program's gate
+# invocation waits for go before any data moves; its done invocation queues done after the job's egress, so done lands
+# after C. done = the job's ready value, with bit 31 set if the head gave up (status 2). Job state (firings done, firings per job, leftover
+# supply, pending reads, sequence) lives in private storage, which the array setup of a core stream plan zeroes; a job of
+# N calls is N * nb * passes firings, and before the first gated job (state zero) it is one call: the setup call's.
+GP0, GPS, GB = 650, 26, 8
 
 
 def groups(cfg):
@@ -103,7 +119,8 @@ def array_program(L, cfg):
     for c in range(cols):
         for r, role in enumerate(roles):
             e(f"  %lane{c}_{r} = constant.u32 {c * rows + r} : reg<aie2p.array.scalar : index>")
-            e(f"  %k{c}_{r} = worker %workers, %lane{c}_{r}, @{role}")
+            grole = role + "_g" if cfg.gate and c == 0 and r < 2 else role
+            e(f"  %k{c}_{r} = worker %workers, %lane{c}_{r}, @{grole}")
             e(f"  constrain.location %k{c}_{r}, %n{c}, %n{2 + rows - 1 - r}")
     # C first: rings are placed in channel order, so the tail's C claims whole banks before its input rings
     e(f"  %ncols = constant.u32 {cols} : reg<aie2p.array.scalar : index>")
@@ -143,19 +160,49 @@ def array_program(L, cfg):
             e(f"  %cha{c}_{r} = channel %a{r}, %ra{c}_{r}, %n{acap}, %arec{r} : reg<aie2p.array.channel : tile<{fa // 4}xi32>>")
             e(f"  constrain.leaf_sync %cha{c}_{r}")
             e(f"  constrain.stage %cha{c}_{r}, %n{(2 * r) % cols if cols > 1 else 2}")
+    if cfg.gate:
+        S = cfg.gate
+        e('  %fb = binding 3, "read"')
+        e('  %tb = binding 4, "write"')
+        e('  %sb = binding 5, "write"')
+        e(f"  %gsup = constant.u32 {S} : reg<aie2p.array.scalar : index>")
+        e(f"  %gf_all = sender %fb, 0 : reg<aie2p.array.sender : tile<1x{S}x1x4xi32, #encoding.layout.strided<strides=[4, 0, 0, 1]>>>")
+        e("  %gf = partition.sender %gf_all, %origin, %n0, %one : reg<aie2p.array.sender : tile<4xi32>>")
+        e("  %gpoll = receiver %k0_0, 2 : reg<aie2p.array.receiver : tile<4xi32>>")
+        e("  %chgp = channel %gf, %gpoll, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
+        e("  constrain.core_stream %chgp")
+        e(f"  %gt_all = receiver %tb, 0 : reg<aie2p.array.receiver : tile<1x{S}x1x4xi32, #encoding.layout.strided<strides=[4, 0, 0, 1]>>>")
+        e("  %gt = partition.receiver %gt_all, %origin, %n0, %one : reg<aie2p.array.receiver : tile<4xi32>>")
+        e("  %gtick = sender %k0_0, 3 : reg<aie2p.array.sender : tile<4xi32>>")
+        e("  %chgt = channel %gtick, %gt, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
+        e("  constrain.core_stream %chgt")
+        e("  constrain.request %chgp, %chgt")
+        e("  %gn1s = sender %k0_0, 4 : reg<aie2p.array.sender : tile<4xi32>>")
+        e("  %gn1r = receiver %k0_1, 2 : reg<aie2p.array.receiver : tile<4xi32>>")
+        e("  %chgn = channel %gn1s, %gn1r, %one, %one : reg<aie2p.array.channel : tile<4xi32>>")
+        e("  constrain.leaf_sync %chgn")
+        e("  %gs_all = receiver %sb, 0 : reg<aie2p.array.receiver : tile<1x2x4xi32>>")
+        e("  %gs = partition.receiver %gs_all, %origin, %n0, %one : reg<aie2p.array.receiver : tile<4xi32>>")
+        e("  %gsig = sender %k0_1, 3 : reg<aie2p.array.sender : tile<4xi32>>")
+        e("  %chgs = channel %gsig, %gs, %two, %two : reg<aie2p.array.channel : tile<4xi32>>")
+        e("  constrain.core_stream %chgs")
+        e("  constrain.gate %chgs")
+        e("  constrain.signal %chgs")
     e("  return\n}\n")
 
 
-def leaf(L, cfg, role, ks):
+def leaf(L, cfg, role, ks, gate=None):
     e = L.append
     tail = role == "tail"
     fa = slab(ks)
     acap = cfg.acap_t if tail else cfg.acap
     a_adv = acap == MP   # a ring of MP slabs is addressed like a whole record: the base advances per iteration
     assert MP % cfg.mu == 0 and (a_adv or cfg.mu % acap == 0), "ring slot of a row must be static per iteration"
-    e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{role}() asm {{")
+    e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{role}{'_g' if gate else ''}() asm {{")
     e("  %a = resource<native_pointer> {index = 0, source_type = buffer} : reg<aie2p.ep>")
     e("  %w = resource<native_pointer> {index = 1, source_type = buffer} : reg<aie2p.ep>")
+    if gate:   # the neighbor channel to / from the relay (leaf-synchronized)
+        e(f"  %gn1 = resource<native_pointer> {{index = {4 if gate == 'waiter' else 2}, source_type = buffer}} : reg<aie2p.ep>")
     if tail:
         e("  %o = resource<native_pointer> {index = 2, source_type = buffer} : reg<aie2p.ep>")
     if role != "head":
@@ -247,10 +294,176 @@ def leaf(L, cfg, role, ks):
             e("  %cwrap = lt %cn1, %npass")
             e("  %cnn = mul %cn1, %cwrap")
             e("  st %cnn, %cnp, 0")
-    body(L, cfg, role, ks, a_adv, acap)
+    if gate:   # job state: private storage, zeroed by the array setup of a core stream plan
+        e("  %gst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+        e("  %gsp = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
+    body(L, cfg, role, ks, a_adv, acap, gate)
 
 
-def body(L, cfg, role, ks, a_adv, acap):
+def gate_epilogue(L, cfg, gate):
+    """The gated leaves' end of firing (see GATE): job accounting, background supply drain, the wait, the relay."""
+    e = L.append
+    S, FPC = cfg.gate, cfg.nb * cfg.passes
+    e("  %g0 = mov.i32 0")
+    e("  %g1 = mov.i32 1")
+    e("  %g2 = mov.i32 2")
+    e("  %gm1 = mov.i32 -1")
+    e(f"  %gfpc = mov.i32 {FPC}")
+    e("  %gF = lda %gsp, 0")
+    e("  %gN = lda %gsp, 4")
+    if gate == "waiter":
+        e("  %gL = lda %gsp, 8")
+        e("  %gQ = lda %gsp, 12")
+        e("  %gseq = lda %gsp, 16")
+        # read back last firing's ticks, then tick up to GB more of the leftover supply
+        e("  low.br ^gq(%g0: reg<aie2p.er>)")
+        e("^gq(%gqi: reg<aie2p.er>):")
+        e("  %gqm = lt %gqi, %gQ")
+        e("  low.cond_br %gqm, ^gq1, ^gqd : reg<aie2p.er>")
+        e("^gq1:")
+        for i in range(4):
+            e(f"  %gqx{i} = mov.ss")
+        e("  %gqn = add.rr %gqi, %g1")
+        e("  low.br ^gq(%gqn: reg<aie2p.er>)")
+        e("^gqd:")
+        e(f"  %ggb = mov.i32 {GB}")
+        e("  %gls = lt %gL, %ggb")          # L < GB: send L, else GB
+        e("  %glsn = sub %g1, %gls")
+        e("  %gb1 = mul %gL, %gls")
+        e("  %gb2 = mul %ggb, %glsn")
+        e("  %gbt = add.rr %gb1, %gb2")
+        e("  low.br ^gt(%g0: reg<aie2p.er>)")
+        e("^gt(%gti: reg<aie2p.er>):")
+        e("  %gtm = lt %gti, %gbt")
+        e("  low.cond_br %gtm, ^gt1, ^gtd : reg<aie2p.er>")
+        e("^gt1:")
+        for i in range(4):
+            e("  mov.ms %g0")
+        e("  %gtn = add.rr %gti, %g1")
+        e("  low.br ^gt(%gtn: reg<aie2p.er>)")
+        e("^gtd:")
+        e("  %gL2 = sub %gL, %gbt")
+    # this firing ends the job?
+    e("  %gF1 = add.rr %gF, %g1")
+    e("  %gnz = lt %gN, %g1")
+    e("  %gdef = mul %gnz, %gfpc")
+    e("  %glim = add.rr %gN, %gdef")
+    e("  %gcont = lt %gF1, %glim")
+    e("  low.cond_br %gcont, ^gmid, ^gend : reg<aie2p.er>")
+    e("^gmid:")
+    e("  st %gF1, %gsp, 0")
+    if gate == "waiter":
+        e("  st %gL2, %gsp, 8")
+        e("  st %gbt, %gsp, 12")
+    e("  return")
+    e("^gend:")
+    if gate == "waiter":
+        # finish the leftover: the pending reads, then one tick + read per remaining record
+        e("  low.br ^gr(%g0: reg<aie2p.er>)")
+        e("^gr(%gri: reg<aie2p.er>):")
+        e("  %grm = lt %gri, %gbt")
+        e("  low.cond_br %grm, ^gr1, ^grd : reg<aie2p.er>")
+        e("^gr1:")
+        for i in range(4):
+            e(f"  %grx{i} = mov.ss")
+        e("  %grn = add.rr %gri, %g1")
+        e("  low.br ^gr(%grn: reg<aie2p.er>)")
+        e("^grd:")
+        e("  low.br ^gl(%g0: reg<aie2p.er>)")
+        e("^gl(%gli: reg<aie2p.er>):")
+        e("  %glm = lt %gli, %gL2")
+        e("  low.cond_br %glm, ^gl1, ^gld : reg<aie2p.er>")
+        e("^gl1:")
+        for i in range(4):
+            e("  mov.ms %g0")
+        for i in range(4):
+            e(f"  %glx{i} = mov.ss")
+        e("  %gln = add.rr %gli, %g1")
+        e("  low.br ^gl(%gln: reg<aie2p.er>)")
+        e("^gld:")
+        # the wait for ready >= seq + 1
+        e("  %gnext = add.rr %gseq, %g1")
+        e("  %g64 = mov.i32 64")
+        e("  %gexp = mul %gnext, %g64")   # ready = sequence * 64 + calls
+        e(f"  %gsup = mov.i32 {S}")
+        e("  %gfast = mov.i32 64")
+        e(f"  %gp0 = mov.i32 {GP0}")
+        e(f"  %gps = mov.i32 {GPS}")
+        e("  low.br ^gp(%g0: reg<aie2p.er>, %g0: reg<aie2p.er>)")
+        e("^gp(%gpn: reg<aie2p.er>, %gnc0: reg<aie2p.er>):")
+        e("  %gpo = lt %gpn, %gsup")
+        e("  low.cond_br %gpo, ^gask, ^gquit : reg<aie2p.er>")
+        e("^gask:")
+        for i in range(4):
+            e("  mov.ms %g0")
+        e("  %grdy = mov.ss")
+        e("  %gy1 = mov.ss")
+        e("  %gy2 = mov.ss")
+        e("  %gy3 = mov.ss")
+        e("  %gnc = sub %grdy, %gexp")   # the job's calls (when ready holds exactly its sequence)
+        e("  %gpn1 = add.rr %gpn, %g1")
+        e("  %glate = lt %grdy, %gexp")
+        e("  low.cond_br %glate, ^gpace, ^gopen : reg<aie2p.er>")
+        e("^gpace:")
+        e("  %gslow = lt %gfast, %gpn1")
+        e("  %gover = sub %gpn1, %gfast")
+        e("  %govs = mul %gover, %gslow")
+        e("  %ggrow = mul %govs, %gps")
+        e("  %gpace = add.rr %gp0, %ggrow")
+        e("  low.br ^gw(%g0: reg<aie2p.er>, %gpace: reg<aie2p.er>, %gpn1: reg<aie2p.er>, %g0: reg<aie2p.er>)")
+        e("^gw(%gwi: reg<aie2p.er>, %gwl: reg<aie2p.er>, %gwp: reg<aie2p.er>, %gwc: reg<aie2p.er>):")
+        e("  %gwm = lt %gwi, %gwl")
+        e("  low.cond_br %gwm, ^gw1, ^gwd : reg<aie2p.er>")
+        e("^gw1:")
+        e("  %gwn = add.rr %gwi, %g1")
+        e("  low.br ^gw(%gwn: reg<aie2p.er>, %gwl: reg<aie2p.er>, %gwp: reg<aie2p.er>, %gwc: reg<aie2p.er>)")
+        e("^gwd:")
+        e("  low.br ^gp(%gwp: reg<aie2p.er>, %gwc: reg<aie2p.er>)")
+        e("^gopen:")
+        e("  low.br ^ghand(%gpn1: reg<aie2p.er>, %gnc: reg<aie2p.er>, %g1: reg<aie2p.er>, %grdy: reg<aie2p.er>)")
+        e("^gquit:")
+        e("  low.br ^ghand(%gpn: reg<aie2p.er>, %gnc0: reg<aie2p.er>, %g2: reg<aie2p.er>, %gexp: reg<aie2p.er>)")
+        e("^ghand(%ghp: reg<aie2p.er>, %ghc: reg<aie2p.er>, %ghs: reg<aie2p.er>, %ghv: reg<aie2p.er>):")
+        e("  acq %gm1, 4")
+        e("  st %ghv, %gn1, 0")
+        e("  st %ghs, %gn1, 4")
+        e("  st %ghp, %gn1, 8")
+        e("  st %ghc, %gn1, 12")
+        e("  rel %g1, 4")
+        e("  %gNn = mul %ghc, %gfpc")
+        e("  %gLn = sub %gsup, %ghp")
+        e("  st %g0, %gsp, 0")
+        e("  st %gNn, %gsp, 4")
+        e("  st %gLn, %gsp, 8")
+        e("  st %g0, %gsp, 12")
+        e("  st %gnext, %gsp, 16")
+        e("  return")
+    else:
+        e("  acq %gm1, 2")
+        e("  %gexp = lda %gn1, 0")
+        e("  %gsts = lda %gn1, 4")
+        e("  %gpol = lda %gn1, 8")
+        e("  %gnc = lda %gn1, 12")
+        e("  rel %g1, 2")
+        e("  mov.ms %gexp")
+        e("  mov.ms %gsts")
+        e("  mov.ms %gpol")
+        e("  mov.ms %g0")
+        e("  %gbad = lt %g1, %gsts")
+        e("  %gfb = mov.i32 -2147483648")   # bit 31: the waiter gave up
+        e("  %gmark = mul %gbad, %gfb")
+        e("  %gdone = add.rr %gexp, %gmark")
+        e("  mov.ms %gdone")
+        e("  mov.ms %gsts")
+        e("  mov.ms %gpol")
+        e("  mov.ms %g0")
+        e("  %gNn = mul %gnc, %gfpc")
+        e("  st %g0, %gsp, 0")
+        e("  st %gNn, %gsp, 4")
+        e("  return")
+
+
+def body(L, cfg, role, ks, a_adv, acap, gate=None):
     """The locked stream: per sub-tile MMA + pop bundles, then the cascade boundary.
     head: chains start with mmul; after each sub-tile, 16 cascade writes (the next sub-tile's pops ride with them)
     mid:  mmul at k 0, then k 1-4 add the incoming partial quarter by quarter (fused cascade MMA); writes like the head
@@ -507,7 +720,11 @@ def body(L, cfg, role, ks, a_adv, acap):
     pln = ", %pln: reg<aie2p.ep>" if tail else ""
     e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: reg<aie2p.ep>, %pon: {pct}, {fifo['a']}: reg<aie2p.eldfiforeg>, {fifo['w']}: reg<aie2p.eldfiforeg>{pln})")
     e("^exit:")
-    e("  return\n}\n")
+    if gate:
+        gate_epilogue(L, cfg, gate)
+        e("}\n")
+    else:
+        e("  return\n}\n")
 
 
 def gen(cfg):
@@ -518,6 +735,9 @@ def gen(cfg):
     assert len(set(cfg.ks[1:-1])) == 1, "the mids share one leaf"
     leaf(L, cfg, "mid", cfg.ks[1])
     leaf(L, cfg, "tail", cfg.ks[-1])
+    if cfg.gate:
+        leaf(L, cfg, "head", cfg.ks[0], gate="waiter")
+        leaf(L, cfg, "mid", cfg.ks[1], gate="relay")
     return "\n".join(L)
 
 
@@ -525,7 +745,7 @@ def main():
     if len(sys.argv) < 5:
         sys.exit("usage: gen_npu_gemm.py <cols> <m_blocks> <ks,ks,ks,ks> <passes> [entry]")
     cfg = Config(int(sys.argv[1]), int(sys.argv[2]), tuple(int(v) for v in sys.argv[3].split(",")), int(sys.argv[4]),
-                 entry=sys.argv[5] if len(sys.argv) > 5 else "npu_gemm")
+                 entry=sys.argv[5] if len(sys.argv) > 5 else "npu_gemm", gate=int(sys.argv[6]) if len(sys.argv) > 6 else 0)
     sys.stdout.write(gen(cfg))
 
 

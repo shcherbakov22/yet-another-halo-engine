@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "model/loom_runtime.hpp"
@@ -15,6 +16,7 @@ namespace yah::model {
 // Sizes of the GPU buffers shared with the NPU (LoomPrefill::npu_plan).
 struct NpuPlan {
   std::size_t a_bytes = 0, w_bytes = 0, c_bytes = 0;  // encoded activations, encoded weight panels, f32 C panels
+  std::uint32_t gate = 0;  // polls per job of a gated image (dispatch.txt "npugate"; 0: the relay waits)
 };
 
 // A byte range of A, W or C.
@@ -40,6 +42,17 @@ class NpuSplit {
   // also when the NPU failed, so no GPU wait is left spinning. tag names the job in the stats.
   virtual void EnqueueFlagged(const std::vector<std::uint32_t>& calls, const std::string& tag, std::uint32_t ready,
                               std::uint32_t done, std::uint32_t epoch) = 0;
+  // A gated image (NpuPlan::gate) waits for its jobs itself: no relay between the GPU and the NPU. A job's ready word
+  // is its first call's, its done word its last call's (GateWords: {ready, done}); the graph stores the job's gate value
+  // (NextGate: sequence * 64 + calls, jobs counting from 1 in queue order) to ready, the NPU writes it to done (bit 31:
+  // the NPU gave up). EnqueueFlagged then takes the gate value as epoch and queues the job at once.
+  // Stores value to done word: ends the GPU's wait for a job that will never run (a gated value with bit 31, so the wait
+  // reports it). For a chunk graph already launched when queueing its jobs failed.
+  virtual void Release(std::uint32_t done, std::uint32_t value) = 0;
+  [[nodiscard]] virtual bool Gated() const = 0;
+  virtual std::uint32_t NextGate(const std::vector<std::uint32_t>& calls) = 0;
+  [[nodiscard]] virtual std::pair<std::uint32_t, std::uint32_t> GateWords(
+      const std::vector<std::uint32_t>& calls) const = 0;
 };
 
 }  // namespace yah::model
