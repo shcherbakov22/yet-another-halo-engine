@@ -3,10 +3,11 @@
 
 usage: npu_split_check.py <model.gguf> <workdir> <tensor> <npu_rows> <act.f16> [rounds]
 
-Emits the GPU kernels (activation encoder, the NPU's rows decoded to BFP16, the split kstore, the C unpack)
-and the NPU image, runs them on one stream with the NPU relay, and checks the output: the GPU's rows bit-identical to
-the full kstore GEMM, the NPU's rows against the float64 product of the bfp16 operands: C is one bf16 partial per replay
-group of passes (gen_npu_gemm.groups), summed by the unpack, so within half a bf16 ulp of each group's exact product.
+Emits the GPU kernels (activation encoder, the NPU's rows decoded to BFP16, the split kstore, the flag wait, the C
+unpack) and the gated NPU image, runs them as one graph per split like a prefill NPU job, and checks the output: the
+GPU's rows bit-identical to the full kstore GEMM, the NPU's rows against the float64 product of the bfp16 operands:
+C is one bf16 partial per replay group of passes (gen_npu_gemm.groups), summed by the unpack, so within half a bf16 ulp
+of each group's exact product.
 npu_rows is a multiple of 8 * gen_npu_gemm.TN (one NPU call per 640 output features). Needs PYTHONPATH with llama.cpp's gguf-py.
 """
 import os
@@ -67,6 +68,7 @@ def main():
     split = SC.emit(work, "split", fmt, "kstore", t, (N - nn) // 16, kb, tt, N)
     enc_act = emit_plain(work, "enc_act", GE.gen("act", tokens, list(KS), passes))
     unpack = emit_plain(work, "unpack", GU.gen(tokens, nn // GN.TN, N, N - nn))
+    flag_wait = emit_plain(work, "flag_wait", GU.gen_flag_wait())
     # the NPU's rows decoded straight into its BFP16 weight stream (gen_gemm_tile.DQ_BFP)
     dt = TG.dataclasses.replace(TG.default_tile(fmt, "kstore", kb), bm=64, wm=2, wn=4, decahead=False, ksub=64,
                                 dbuf=False)
@@ -83,7 +85,7 @@ def main():
         sys.exit(f"dequant emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
     dq = r.stdout.strip().splitlines()[0]
     # NPU image: one ROWS-wide panel (8 columns) per call
-    cfg = GN.Config(8, nb, KS, passes)
+    cfg = GN.Config(8, nb, KS, passes, gate=GN.GATE_SUPPLY)
     xsrc, ximg = os.path.join(work, "npu.loom"), os.path.join(work, "npu.xdna")
     open(xsrc, "w").write(GN.gen(cfg))
     env = hrx_paths.env()
@@ -101,7 +103,8 @@ def main():
             "enc_act_hal": enc_act, "enc_act_wgs": tokens // 8 * (K // 8) // GE.WG,
             "dq_hal": dq, "dq_wgs": TG.dq_wgs(nn // 16, kb, dt, fmt), "dq_wg": dt.lanes,
             "unpack_hal": unpack, "unpack_wgs": tokens * nn // 8 // GU.wg(nn // GN.TN), "unpack_wg": GU.wg(nn // GN.TN),
-            "npu_xdna": ximg, "npu_entry": cfg.entry, "npu_columns": 8, "tables": ",".join(tables), "iters": iters, "warmup_ms": 4000}
+            "npu_xdna": ximg, "flag_wait_hal": flag_wait, "gate_calls": GN.GATE_CALLS, "gate_record": GN.GATE_RECORD,
+            "tables": ",".join(tables), "iters": iters, "warmup_ms": 4000}
     pf = os.path.join(work, "plan.txt")
     open(pf, "w").write("".join(f"{k}={v}\n" for k, v in plan.items()))
     out = os.path.join(work, "y_npu.f32")

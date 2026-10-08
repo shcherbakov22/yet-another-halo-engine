@@ -205,7 +205,7 @@ class LoomPrefill {
     if (!jobs.empty()) npu_->Enqueue(jobs);   // on a failure it releases the graph's waits for the jobs left
   }
 
-  // The last RunLayers graph's dispatches in node order (= the command index of their dispatch timestamps).
+  // The last RunLayers graph's dispatches in node order (= the order of their dispatch timestamps' command indices).
   struct Node {
     std::array<std::uint32_t, 3> grid;
     std::string name;

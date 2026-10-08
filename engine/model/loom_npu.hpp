@@ -1,7 +1,7 @@
 // NPU (XDNA2) GEMMs beside the GPU: libamdf for the device, the HRX xdna loader for .xdna images.
 // Operands live in HRX device buffers (full GPU bandwidth), exported once as a DMA-BUF through HSA and imported per binding view into the NPU.
-// Enqueue / Join: a relay thread waits for a GPU timeline point, submits the NPU work and signals an HRX semaphore.
-// The GPU stream waits on it. EnqueueGated: a gated image's job, submitted at once; the NPU waits for its inputs.
+// Gated images only (gen_npu_gemm GATE): the host submits a chunk's jobs at once.
+// The NPU waits for each job's ready word itself, and a reaper thread retires the commands (NpuSplit: the protocol).
 // Needs HRX patches 0013 / 0014 (see engine/hrx/patches).
 #ifndef YAH_MODEL_LOOM_NPU_HPP_
 #define YAH_MODEL_LOOM_NPU_HPP_
@@ -71,16 +71,12 @@ class LoomNpu {
   // One loaded instance of an image with its bindings and native command storage.
   struct Kernel {
     const void* image_key = nullptr;
-    amdf_xdna_kernel_command_t first{}, repeat{};
-    // A streamed image (gen_npu_gemm groups: five invocations) queues a call with push[parity] and retires the
-    // oldest queued call with wait; lead is the even push with its weight fills unpaced, for the first call of a run
-    // (nothing computes yet that pacing would protect); first sets the array up and runs one whole call.
-    bool stream = false;
-    amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{};
-    // A gated image (gen_npu_gemm GATE, seven invocations): gate opens a job once its ready word reaches the job's
-    // sequence, done writes the done word after the job's last C.
-    bool gated = false;
-    amdf_xdna_kernel_command_t gate{}, done{};
+    amdf_xdna_kernel_command_t first{};
+    // Seven invocations (gen_npu_gemm GATE). first sets the array up and runs one whole call (any data). push[parity]
+    // queues a call and wait retires the oldest queued one; lead is the even push with its weight fills unpaced, for
+    // the first call of a job (nothing computes yet that pacing would protect). gate opens a job once its ready word
+    // reaches the job's gate value; done writes the done word after the job's last C.
+    amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{}, gate{}, done{};
     std::vector<iree_hal_amd_xdna_executable_storage_t> storage;
     std::vector<amdf_host_mapping_t*> storage_maps;
     std::vector<amdf_memory_t*> imports;
@@ -105,14 +101,6 @@ class LoomNpu {
     void* hsa = dlopen("libhsa-runtime64.so.1", RTLD_NOW | RTLD_NOLOAD);
     if (hsa) export_dmabuf_ = reinterpret_cast<ExportFn>(dlsym(hsa, "hsa_amd_portable_export_dmabuf"));
     if (!export_dmabuf_) throw LoomError("npu: hsa_amd_portable_export_dmabuf not found");
-    LoomCheck(hrx_semaphore_create(gpu_.device(), 0, &done_), "hrx_semaphore_create");
-    // Copies from / to a host-visible buffer carry system-scope acquire / release fences (HRX blits), the GPU cache
-    // maintenance around the NPU's accesses that a graph segment boundary does not give.
-    LoomCheck(hrx_buffer_allocate(gpu_.stream(), 64, HRX_MEMORY_TYPE_HOST_LOCAL, HRX_BUFFER_USAGE_TRANSFER, &fence_host_.handle),
-              "hrx_buffer_allocate(fence host)");
-    fence_host_.size = 64;
-    fence_dev_ = gpu_.Allocate(64);
-    relay_ = std::thread([this] { Relay(); });
     reaper_ = std::thread([this] { Reaper(); });
   }
   LoomNpu(const LoomNpu&) = delete;
@@ -122,8 +110,6 @@ class LoomNpu {
       std::lock_guard<std::mutex> lock(mu_);
       stop_ = true;
     }
-    cv_.notify_all();
-    if (relay_.joinable()) relay_.join();
     reap_cv_.notify_all();
     if (reaper_.joinable()) reaper_.join();
     for (auto& a : arenas_) {
@@ -151,7 +137,6 @@ class LoomNpu {
     if (device_) api_->device_destroy(device_);
     if (endpoint_) api_->endpoint_close(endpoint_);
     if (instance_) api_->instance_destroy(instance_);
-    if (done_) hrx_semaphore_release(done_);
   }
 
   // A zeroed GPU buffer the NPU can bind views of.
@@ -274,35 +259,16 @@ class LoomNpu {
     NpuCheck(iree_hal_amd_xdna_executable_query_continuation(image, entry_ordinal, n, k->storage.data(), false,
                                                              &k->first),
              "query_invocation");
-    NpuCheck(iree_hal_amd_xdna_executable_query_continuation(image, entry_ordinal, n, k->storage.data(), true,
-                                                             &k->repeat),
-             "query_continuation");
-    if (rec.invocation_count == 5 || rec.invocation_count == 7) {
-      k->stream = true;
-      k->gated = rec.invocation_count == 7;
-      amdf_xdna_kernel_command_t* const out[] = {&k->push[0], &k->push[1], &k->wait, &k->lead, &k->gate, &k->done};
-      for (uint32_t i = 0; i < (k->gated ? 6u : 4u); ++i)
-        NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(image, entry_ordinal, n, k->storage.data(), i + 1,
-                                                                       out[i]),
-                 "query_invocation_ordinal");
-    }
+    if (rec.invocation_count != 7) throw LoomError("npu: " + path + " has no gate (re-emit it)");
+    amdf_xdna_kernel_command_t* const out[] = {&k->push[0], &k->push[1], &k->wait, &k->lead, &k->gate, &k->done};
+    for (uint32_t i = 0; i < 6; ++i)
+      NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(image, entry_ordinal, n, k->storage.data(), i + 1,
+                                                                     out[i]),
+               "query_invocation_ordinal");
     kernels_.push_back(std::move(k));
     return *kernels_.back();
   }
 
-  // Queue NPU work behind the GPU stream's current position; the relay runs the kernels in order after it.
-  // Pass the returned value to Join before the stream reads the results.
-  std::uint64_t Enqueue(std::vector<Kernel*> kernels, std::string tag = {}) {
-    // system-scope release: the GPU's writes to A / W reach memory before the NPU reads them
-    LoomCheck(hrx_stream_copy_buffer(gpu_.stream(), fence_dev_.handle, 0, fence_host_.handle, 0, 64), "fence release");
-    LoomCheck(hrx_stream_flush(gpu_.stream()), "hrx_stream_flush");
-    hrx_timeline_point_t after{};
-    LoomCheck(hrx_stream_get_timeline_position(gpu_.stream(), &after), "hrx_stream_get_timeline_position");
-    std::lock_guard<std::mutex> lock(mu_);
-    jobs_.push_back({after, std::move(kernels), ++issued_, std::move(tag)});
-    cv_.notify_one();
-    return issued_;
-  }
   // A gated image's job (NpuSplit::Enqueue): its calls, done word and gate value; the NPU waits for its ready word
   // itself and writes the gate value to *done.
   struct GatedJob {
@@ -311,36 +277,48 @@ class LoomNpu {
     std::uint32_t gate = 0;
     std::string tag;
   };
-  // Gated jobs as one command, queued at once (no host between the jobs). After a failure the relay or the reaper
-  // stores gate | kGateFailed to each job's done word, so the GPU's waits end and report it.
-  void EnqueueGated(std::vector<GatedJob> gated) {
-    std::lock_guard<std::mutex> lock(mu_);
-    Job job{{}, {}, ++issued_, {}};
-    job.gated = std::move(gated);
-    jobs_.push_back(std::move(job));
-    cv_.notify_one();
+  // Gated jobs as one command, submitted now (no host between the jobs). The first job of an image first runs its setup
+  // as its own command (one ungated call, any data; the host waits for it once), after which the gate waits for job 1.
+  // After a failure the reaper stores gate | kGateFailed to the done words of this and every later command's jobs, so
+  // the GPU's waits end and report it.
+  void EnqueueGated(std::vector<GatedJob> jobs) {
+    CheckHealth();
+    const auto t0 = std::chrono::steady_clock::now();
+    Kernel* k = jobs[0].kernels[0];
+    bool resident = false;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      resident = resident_ == k->image_key;
+    }
+    if (!resident) {
+      YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k->first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
+      std::lock_guard<std::mutex> lock(mu_);
+      resident_ = k->image_key;
+    }
+    std::vector<std::vector<Kernel*>> runs;
+    for (const GatedJob& g : jobs) runs.push_back(g.kernels);
+    const std::uint64_t submission = Submit(FusedCommand(runs));
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      pending_.push_back({submission, std::move(jobs), t0});
+      ++submitted_;
+    }
+    reap_cv_.notify_one();
   }
-  // Orders the stream after the NPU work Enqueue returned value for; queue the GPU work that runs beside the NPU first.
-  // The host waits for the NPU here, so the stream wait sees a signaled semaphore.
-  // A stream wait on a semaphore the host signals later is resolved in software after the stream drains (~0.1-0.2 ms idle GPU).
-  void Join(std::uint64_t value) {
-    LoomCheck(hrx_stream_flush(gpu_.stream()), "hrx_stream_flush");
-    LoomCheck(hrx_semaphore_wait(done_, value, UINT64_MAX), "hrx_semaphore_wait(npu)");
-    LoomCheck(hrx_stream_wait_on(gpu_.stream(), {done_, value}), "hrx_stream_wait_on");
-    // system-scope acquire: no GPU cache keeps lines of C from an earlier read (the wait above, already signaled, is
-    // resolved in software without a fence)
-    LoomCheck(hrx_stream_copy_buffer(gpu_.stream(), fence_host_.handle, 0, fence_dev_.handle, 0, 64), "fence acquire");
+  // Waits until the reaper retired every submitted command (its stats and failures are in).
+  void Drain() {
+    std::unique_lock<std::mutex> lock(mu_);
+    retired_cv_.wait(lock, [this] { return retired_ == submitted_; });
   }
-  // Per job tag: jobs, calls, NPU time (host clock, first submission to completion; gated jobs: none, see Commands).
+  // Per job tag: jobs, calls.
   struct TagStats {
     std::size_t jobs = 0, calls = 0;
-    double busy_ms = 0;
   };
   std::map<std::string, TagStats> Stats() {
     std::lock_guard<std::mutex> lock(mu_);
     return stats_;
   }
-  // Gated commands: count, NPU time (each from the later of its submission and the previous command's completion, its
+  // Commands: count, NPU time (each from the later of its submission and the previous command's completion, its
   // waits for the GPU included) and the longest (the driver kills a command after amdxdna tdr_timeout_ms, 2000 ms).
   struct CommandStats {
     std::size_t commands = 0;
@@ -350,20 +328,21 @@ class LoomNpu {
     std::lock_guard<std::mutex> lock(mu_);
     return commands_;
   }
-  // Host time of the last finished job from its first submission to the NPU's completion.
-  [[nodiscard]] double LastJobMs() const { return last_job_ms_.load(); }
-  // Throws if the relay saw an NPU failure (the fence signals on errors too).
+  // NPU time of the last retired command (CommandStats).
+  [[nodiscard]] double LastCommandMs() const { return last_command_ms_.load(); }
+  // Throws if a command failed.
   void CheckHealth() {
     std::lock_guard<std::mutex> lock(mu_);
     if (!failure_.empty()) throw LoomError(failure_);
   }
 
  private:
-  // Streamed runs of calls as one command, each run [lead c0][push c1][wait][push c2][wait] ... [wait][wait] (pushes
-  // on alternating descriptor sets, at most two calls queued); a gated job's run adds [gate c0] in front and [done cN]
-  // behind. The bodies of the calls' own relocated commands go under one transaction header (libamdf's public format
-  // 0.1, AMDF_XDNA_TRANSACTION_FORMAT_VERSION_0_1: operation count at byte 8, byte length at 12). Built once per list
-  // of runs into command arenas (allocating per command cost ~1 ms on the relay thread).
+  // Gated jobs as one command, each [gate c0][lead c0][push c1][wait][push c2][wait] ... [wait][wait][done cN].
+  // Pushes alternate descriptor sets, at most two calls queued: calls overlap, and no command boundary falls while a
+  // call's DMA work is in flight (that hung the NPU firmware under DRAM contention). The bodies of the calls' own
+  // relocated commands go under one transaction header (libamdf's public format 0.1,
+  // AMDF_XDNA_TRANSACTION_FORMAT_VERSION_0_1: operation count at byte 8, byte length at 12).
+  // Built once per list of runs into command arenas (allocating per command cost ~1 ms).
   struct Arena {
     iree_hal_amd_xdna_executable_storage_t storage{};
     amdf_host_mapping_t* map = nullptr;
@@ -390,13 +369,13 @@ class LoomNpu {
     };
     for (const auto& calls : runs) {
       int queued = 0;
-      if (calls[0]->gated) append(*calls[0], calls[0]->gate);
+      append(*calls[0], calls[0]->gate);
       for (std::size_t i = 0; i < calls.size(); ++i) {
         append(*calls[i], i == 0 ? calls[i]->lead : calls[i]->push[i & 1]);
         if (++queued == 2) append(*calls[i], calls[i]->wait), --queued;
       }
       for (; queued > 0; --queued) append(*calls.back(), calls.back()->wait);
-      if (calls.back()->gated) append(*calls.back(), calls.back()->done);
+      append(*calls.back(), calls.back()->done);
     }
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
@@ -424,114 +403,27 @@ class LoomNpu {
   std::map<std::vector<std::vector<Kernel*>>, amdf_xdna_kernel_command_t> fused_;
   std::deque<Arena> arenas_;
 
-  struct Job {
-    hrx_timeline_point_t after;
-    std::vector<Kernel*> kernels;
-    std::uint64_t signal;
-    std::string tag;
-    std::vector<GatedJob> gated;  // EnqueueGated: one command, the reaper retires it
-  };
   static constexpr std::uint32_t kGateFailed = NpuSplit::kGateFailed;
-  static void Fail(const Job& job) {
-    for (const GatedJob& g : job.gated) __atomic_store_n(g.done, g.gate | kGateFailed, __ATOMIC_RELEASE);
+  static void Fail(const std::vector<GatedJob>& jobs) {
+    for (const GatedJob& g : jobs) __atomic_store_n(g.done, g.gate | kGateFailed, __ATOMIC_RELEASE);
+  }
+  std::uint64_t Submit(const amdf_xdna_kernel_command_t& command) {
+    amdf_xdna_kernel_queue_submission_info_t si{};
+    si.type = AMDF_STRUCTURE_TYPE_XDNA_KERNEL_QUEUE_SUBMISSION_INFO;
+    si.structure_size = sizeof(si);
+    si.command_count = 1;
+    si.commands = &command;
+    std::uint64_t submission = 0;
+    YAH_AMDF(xdna_->kernel_queue_submit(queue_, &si, &submission), "kernel_queue_submit");
+    return submission;
   }
 
-  void Relay() {
-    for (;;) {
-      Job job;
-      {
-        std::unique_lock<std::mutex> lock(mu_);
-        cv_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
-        if (jobs_.empty()) return;
-        job = std::move(jobs_.front());
-        jobs_.pop_front();
-      }
-      bool failed = false;
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        failed = !failure_.empty();
-      }
-      if (failed && !job.gated.empty()) {
-        Fail(job);
-        hrx_status_ignore(hrx_semaphore_signal(done_, job.signal));
-        continue;
-      }
-      try {
-        if (job.gated.empty())
-          LoomCheck(hrx_semaphore_wait(job.after.semaphore, job.after.value, UINT64_MAX), "relay: GPU wait");
-        const auto t0 = std::chrono::steady_clock::now();
-        std::uint64_t submission = 0;
-        auto submit = [&](const amdf_xdna_kernel_command_t* command) {
-          amdf_xdna_kernel_queue_submission_info_t si{};
-          si.type = AMDF_STRUCTURE_TYPE_XDNA_KERNEL_QUEUE_SUBMISSION_INFO;
-          si.structure_size = sizeof(si);
-          si.command_count = 1;
-          si.commands = command;
-          YAH_AMDF(xdna_->kernel_queue_submit(queue_, &si, &submission), "kernel_queue_submit");
-        };
-        // A run of streamed calls goes out as one fused command (FusedCommand): calls overlap inside it, and no
-        // command boundary falls while a call's DMA work is in flight (separate commands at that point hung the NPU
-        // firmware under DRAM contention).
-        if (!job.gated.empty()) {
-          // The image's setup runs once, as its own command: one ungated call (any data), after which the gate
-          // waits for sequence 1. Gated jobs then go out as one command, queued at once (the reaper retires it):
-          // each job's gate holds the NPU until the GPU is ready.
-          Kernel* k = job.gated[0].kernels[0];
-          if (resident_ != k->image_key) {
-            submit(&k->first);
-            YAH_AMDF(api_->kernel_queue_wait(queue_, submission, AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
-            resident_ = k->image_key;
-          }
-          std::vector<std::vector<Kernel*>> runs;
-          for (const GatedJob& g : job.gated) runs.push_back(g.kernels);
-          submit(&FusedCommand(runs));
-          {
-            std::lock_guard<std::mutex> lock(mu_);
-            pending_.push_back({submission, std::move(job), t0});
-          }
-          reap_cv_.notify_one();
-          continue;
-        }
-        std::size_t i = 0;
-        while (i < job.kernels.size()) {
-          Kernel* k = job.kernels[i];
-          // The control-only continuation needs the image's array state resident.
-          // The first run of an image, or a run after another image, sets it up.
-          const bool resident = resident_ == k->image_key;
-          if (!k->stream || !resident) {
-            submit(resident ? &k->repeat : &k->first);
-            resident_ = k->image_key;
-            ++i;
-            continue;
-          }
-          std::size_t j = i;
-          while (j < job.kernels.size() && job.kernels[j]->stream && job.kernels[j]->image_key == k->image_key) ++j;
-          submit(&FusedCommand({std::vector<Kernel*>(job.kernels.begin() + i, job.kernels.begin() + j)}));
-          i = j;
-        }
-        YAH_AMDF(api_->kernel_queue_wait(queue_, submission, AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait");
-        last_job_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        {
-          std::lock_guard<std::mutex> lock(mu_);
-          auto& st = stats_[job.tag];
-          st.jobs += 1, st.calls += job.kernels.size(), st.busy_ms += last_job_ms_.load();
-        }
-      } catch (const LoomError& e) {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (failure_.empty()) failure_ = e.what();
-        resident_ = nullptr;
-        Fail(job);
-      }
-      hrx_status_ignore(hrx_semaphore_signal(done_, job.signal));
-    }
-  }
-
-  // Retires gated commands in order (EnqueueGated): stats, the stream semaphore.
+  // Retires gated commands in order (EnqueueGated): stats.
   // On a failure it stores gate | kGateFailed to the done words of this and every later command's jobs, so no GPU wait
   // is left spinning.
   struct Pending {
     std::uint64_t submission;
-    Job job;
+    std::vector<GatedJob> jobs;
     std::chrono::steady_clock::time_point t0;
   };
   std::deque<Pending> pending_;
@@ -564,16 +456,20 @@ class LoomNpu {
         std::lock_guard<std::mutex> lock(mu_);
         if (!failure_.empty()) ok = false;
         if (ok) {
-          for (const GatedJob& g : p.job.gated) {
+          for (const GatedJob& g : p.jobs) {
             auto& st = stats_[g.tag];
             st.jobs += 1, st.calls += g.kernels.size();
           }
           commands_.commands += 1, commands_.busy_ms += ms, commands_.max_ms = std::max(commands_.max_ms, ms);
-          last_job_ms_ = ms;
+          last_command_ms_ = ms;
         }
       }
-      if (!ok) Fail(p.job);
-      hrx_status_ignore(hrx_semaphore_signal(done_, p.job.signal));
+      if (!ok) Fail(p.jobs);
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++retired_;
+      }
+      retired_cv_.notify_all();
     }
   }
 
@@ -793,19 +689,15 @@ class LoomNpu {
   std::map<std::string, iree_hal_amd_xdna_image_t*> images_;
   std::vector<std::unique_ptr<Shared>> shared_;
   std::vector<std::unique_ptr<Kernel>> kernels_;
-  hrx_semaphore_t done_ = nullptr;
-  LoomBuffer fence_host_, fence_dev_;  // Enqueue / Join cache fences
-  const void* resident_ = nullptr;  // relay thread only
-  std::atomic<double> last_job_ms_{0};
+  const void* resident_ = nullptr;  // the image whose array state is set up; under mu_
+  std::atomic<double> last_command_ms_{0};
   std::map<std::string, TagStats> stats_;  // under mu_
   CommandStats commands_;                  // under mu_
   std::mutex mu_;
-  std::condition_variable cv_;
-  std::deque<Job> jobs_;
-  std::uint64_t issued_ = 0;
+  std::uint64_t submitted_ = 0, retired_ = 0;  // commands; under mu_
+  std::condition_variable retired_cv_;
   bool stop_ = false;
   std::string failure_;
-  std::thread relay_;
 };
 
 // The NPU side of LoomPrefill's column split: the shared A / W / C buffers, the flag words and the calls bound on them.
@@ -830,15 +722,13 @@ class LoomNpuSplit : public NpuSplit {
     // the call's gate slot: flag record, tick scratch, signal (go, done)
     const std::size_t slot = kGateBase + kGateSlot * kernels_.size();
     if (slot + kGateSlot > flags_.bytes) throw LoomError("npu: more NPU calls than gate slots");
-    LoomNpu::Kernel& k = npu_.Load(image, "npu_gemm",
-                                   {{&a_, a.offset, a.length},
-                                    {&w_, w.offset, w.length},
-                                    {&c_, c.offset, c.length},
-                                    {&flags_, slot, plan_.gate_record},
-                                    {&flags_, slot + kTick, plan_.gate_record},
-                                    {&flags_, slot + kSignal, 2 * plan_.gate_record}});
-    if (!k.gated) throw LoomError("npu: " + image + " has no gate (re-emit the set)");
-    kernels_.push_back(&k);
+    kernels_.push_back(&npu_.Load(image, "npu_gemm",
+                                  {{&a_, a.offset, a.length},
+                                   {&w_, w.offset, w.length},
+                                   {&c_, c.offset, c.length},
+                                   {&flags_, slot, plan_.gate_record},
+                                   {&flags_, slot + kTick, plan_.gate_record},
+                                   {&flags_, slot + kSignal, 2 * plan_.gate_record}}));
     return ids_[key] = static_cast<std::uint32_t>(kernels_.size() - 1);
   }
   // A flag word from / to the host, through memory (the NPU does not snoop CPU caches).
@@ -855,6 +745,11 @@ class LoomNpuSplit : public NpuSplit {
     return __atomic_load_n(w, __ATOMIC_ACQUIRE);
   }
   void CheckHealthNow() { npu_.CheckHealth(); }
+  // NPU time of the last command, after every submitted one retired.
+  double LastCommandMs() {
+    npu_.Drain();
+    return npu_.LastCommandMs();
+  }
   [[nodiscard]] const LoomBuffer* Flags() const override { return &flags_.gpu; }
   [[nodiscard]] std::uint32_t Word(std::uint32_t word) const override {
     return __atomic_load_n(static_cast<const std::uint32_t*>(flags_.host) + word, __ATOMIC_ACQUIRE);
@@ -897,6 +792,7 @@ class LoomNpuSplit : public NpuSplit {
   }
   // One line per job tag (jobs, calls), then the commands (LoomNpu::CommandStats).
   void Report(std::FILE* f) {
+    npu_.Drain();
     if (Word(kFlagStatus)) std::fprintf(f, "npu: ERROR a GPU wait for the NPU failed\n");
     for (const auto& [tag, st] : npu_.Stats())
       std::fprintf(f, "npu: %-5s %4zu jobs %5zu calls\n", tag.c_str(), st.jobs, st.calls);

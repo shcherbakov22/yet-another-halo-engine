@@ -372,7 +372,8 @@ class LoomGraph {
   void ReadOnly(hrx_buffer_t buffer) { read_only_.insert(buffer); }
 
   // writes: bit i set if the dispatch may write binding i. A missing bit is a race; an extra one only costs overlap.
-  // Returns the node's index: dispatch timestamps of the launched graph carry it as their command index.
+  // Returns the node's index among the graph's dispatches (Grid). Not their timestamps' command index: that counts
+  // HRX's barriers and atomic stores too.
   // after: ranges this dispatch is ordered after as if it read them, though it does not (it gets the same barrier as a
   // dispatch that does, so the two can run together); not recorded as accesses.
   // also_writes: ranges recorded as written by this dispatch though it does not bind them (a wait that stands for
