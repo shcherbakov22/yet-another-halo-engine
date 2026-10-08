@@ -20,6 +20,7 @@ import gen_gdn_chunk  # noqa: E402
 import gen_conv_kq  # noqa: E402
 import gen_kres_persist  # noqa: E402
 import gen_half_norm  # noqa: E402
+import gen_decode_misc  # noqa: E402
 import gen_kvq  # noqa: E402
 import gen_npu_gemm as GN  # noqa: E402
 
@@ -1221,6 +1222,11 @@ def main():
     # Each row over NORM_SPLIT waves (gen_half_norm.gen_split: the same per-lane chain order, so the same bits):
     # 0.383 -> 0.299 ms per call at 2048 rows (latency-bound -> ~214 GB/s). The driver reads the split from dispatch.txt.
     geom.append(("norm_split", 0, NORM_SPLIT, 0))
+    # The chunk's token_embd rows from its token ids on the GPU (gen_decode_misc.gen_embed_iq4xs, one workgroup per row),
+    # so the host stages ids and never waits between chunks.
+    embed_src = os.path.join(tmp, "yah_embed.loom")
+    open(embed_src, "w").write(gen_decode_misc.gen_embed_iq4xs(rows=B))
+    geom.append(("embed.hal", 1, 5120 // 16, B))   # one token per workgroup
     with open(os.path.join(outdir, "dispatch.txt"), "w") as fh:
         for hal, tk, rg, tt in geom:
             fh.write("%s %d %d %d\n" % (hal, tk, rg, tt))
@@ -1252,6 +1258,7 @@ def main():
             return kt2(path)
         return deep(path) if c * B >= OCC3_FROM else path
     fixed = [
+        (embed_src, "embed.hal", ["nop=0"]),
         ("yah_residual_add_1d_f32.loom", "accum.hal",
          ["yah_residual_1d.dim=%d" % (5120 * B)]),
         (norm_src, "norm.hal",

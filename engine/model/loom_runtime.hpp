@@ -233,6 +233,10 @@ class LoomDevice {
   void Fill(const LoomBuffer& buffer, uint32_t pattern) {
     LoomCheck(hrx_stream_fill_buffer(stream_, buffer.handle, 0, buffer.size, &pattern, 4), "hrx_stream_fill_buffer");
   }
+  // Host data into the buffer in stream order (copied now; at most 64 KB).
+  void Update(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
+    LoomCheck(hrx_stream_update_buffer(stream_, host, bytes, buffer.handle, offset), "hrx_stream_update_buffer");
+  }
   void H2D(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
     LoomCheck(hrx_synchronous_h2d(device_, host, buffer.handle, offset, bytes), "hrx_synchronous_h2d");
   }

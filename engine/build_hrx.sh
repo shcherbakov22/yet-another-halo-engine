@@ -16,7 +16,7 @@ inc="$YAH_HRX/libhrx/include"
 "$root/engine/hrx/bootstrap.sh" --check >/dev/null || { "$root/engine/hrx/bootstrap.sh" --check; exit 1; }
 libhrx="$H/libhrx/src/libhrx"
 
-# Host code: clang, -O3 -march=native. -ffp-contract=off keeps float results (e.g. the host embedding dequant) the same as
+# Host code: clang, -O3 -march=native. -ffp-contract=off keeps host float results the same as
 # without FMA, so outputs stay bit-identical across compilers and flags.
 CXX="${CXX:-clang++}"
 cxxflags=(-std=c++20 -O3 -march=native -ffp-contract=off)

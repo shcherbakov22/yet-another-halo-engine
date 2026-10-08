@@ -133,28 +133,23 @@ class LoomPrefill {
     Zero(*state_);
   }
 
-  // Host-dequantize the token_embd rows of ids[0..n) into hidden() for the next RunLayers. n < B pads the chunk with
-  // the last token. The GEMMs (~92% of the time) run only the token tiles that hold real tokens; every other kernel runs
+  // Stage ids[0..n) for the next RunLayers, whose first kernel (yah_embed) writes their token_embd rows into hidden().
+  // n < B pads the chunk with the last token.
+  // The GEMMs (~92% of the time) run only the token tiles that hold real tokens; every other kernel runs
   // the whole chunk, so padding rows next to the real ones keep their padded-path values. Shrinking the norms as well
   // changed the last token's logits by ~1e-4 when it sat alone in its 16-token group (cause not found yet). Padding tokens leave the recurrent state
   // unchanged and attention is causal, so the real tokens' results and the state carried forward are exact.
-  // Waits for queued work that reads hidden().
+  // The ids and the token count go to the GPU in stream order (stream updates): the host never waits here.
   void Embed(const std::uint32_t* ids, std::uint32_t n) {
     if (n == 0 || n > B_) throw LoomError("prefill: chunk token count out of range");
-    gpu_.Synchronize();
-    const auto* emb = Find("token_embd.weight");
-    const std::uint8_t* data = gguf_.Data(*emb);
     for (std::uint32_t t = 0; t < B_; ++t) {
-      const std::uint32_t id = ids[std::min(t, n - 1)];
-      if (id >= kVocab) throw LoomError("token id " + std::to_string(id) + " is outside the vocabulary");
-      if (static_cast<std::uint32_t>(emb->type) == 23)
-        DequantIq4XsRow(data, id, host_hidden_.data() + std::size_t{t} * kHidden);
-      else
-        DequantQ4KRow(data, id, host_hidden_.data() + std::size_t{t} * kHidden);
+      host_ids_[t] = ids[std::min(t, n - 1)];
+      if (host_ids_[t] >= kVocab)
+        throw LoomError("token id " + std::to_string(host_ids_[t]) + " is outside the vocabulary");
     }
-    gpu_.H2D(*hidden_, host_hidden_.data(), host_hidden_.size() * 4);
+    gpu_.Update(*ids_, host_ids_.data(), host_ids_.size() * 4);
     const std::int32_t valid = static_cast<std::int32_t>(n);
-    gpu_.H2D(*valid_, &valid, 4);
+    gpu_.Update(*valid_, &valid, 4);
     n_ = n;
   }
 
@@ -220,6 +215,8 @@ class LoomPrefill {
 
   // The 64 layers of chunk ci, in dispatch order.
   void RecordLayers(std::uint32_t ci, const KvHook& hook) {
+    Dispatch(Exe("embed.hal"), "yah_embed", GeomOf("embed.hal").tt, 1, 1, kHidden / 16, 1, 1,
+             {TRef(*Find("token_embd.weight")), Ref(*ids_), Ref(*hidden_)}, 4);
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
       tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
@@ -438,59 +435,6 @@ class LoomPrefill {
     std::fclose(f);
     if (!ok) throw LoomError("short read: " + path);
   }
-  static float Half(const std::uint8_t* p) {
-    _Float16 h;
-    std::memcpy(&h, p, 2);
-    return static_cast<float>(h);
-  }
-  static void DequantQ4KRow(const std::uint8_t* base, std::uint64_t row, float* out) {
-    const std::uint32_t nb = kHidden / 256;
-    const std::uint8_t* p = base + row * static_cast<std::uint64_t>(nb) * 144;
-    for (std::uint32_t b = 0; b < nb; ++b) {
-      const std::uint8_t* blk = p + b * 144;
-      const float d = Half(blk), dmin = Half(blk + 2);
-      const std::uint8_t* sc = blk + 4;
-      const std::uint8_t* qs = blk + 16;
-      for (std::uint32_t i = 0; i < 256; ++i) {
-        const std::uint32_t gg = i / 64, wv = i % 64, lane = wv % 32;
-        const bool low = wv < 32;
-        const std::uint32_t qb = qs[gg * 32 + lane];
-        const std::uint32_t quant = low ? (qb & 15) : (qb >> 4);
-        const std::uint32_t j = 2 * gg + (low ? 0 : 1);
-        std::uint32_t s, m;
-        if (j < 4) {
-          s = sc[j] & 63;
-          m = sc[j + 4] & 63;
-        } else {
-          s = (sc[j + 4] & 15) | ((sc[j - 4] >> 6) << 4);
-          m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
-        }
-        out[b * 256 + i] = d * static_cast<float>(s) * static_cast<float>(quant) - dmin * static_cast<float>(m);
-      }
-    }
-  }
-  static void DequantIq4XsRow(const std::uint8_t* base, std::uint64_t row, float* out) {
-    static const float kValues[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
-    const std::uint32_t nb = kHidden / 256;
-    const std::uint8_t* p = base + row * static_cast<std::uint64_t>(nb) * 136;
-    for (std::uint32_t b = 0; b < nb; ++b) {
-      const std::uint8_t* blk = p + b * 136;
-      const float d = Half(blk);
-      const std::uint32_t sh = blk[2] | (blk[3] << 8);
-      const std::uint8_t* sl = blk + 4;
-      const std::uint8_t* qs = blk + 8;
-      for (std::uint32_t g = 0; g < 8; ++g) {
-        const std::uint32_t sc = ((sl[g / 2] >> (4 * (g % 2))) & 15) | (((sh >> (2 * g)) & 3) << 4);
-        const float dl = d * static_cast<float>(static_cast<int>(sc) - 32);
-        for (std::uint32_t w = 0; w < 32; ++w) {
-          const std::uint32_t qv = qs[g * 16 + (w & 15)];
-          const std::uint32_t nib = (w >= 16) ? (qv >> 4) : (qv & 15);
-          out[b * 256 + g * 32 + w] = dl * kValues[nib];
-        }
-      }
-    }
-  }
-
   static hrx_buffer_ref_t Ref(const LoomBuffer& b) { return {b.handle, 0, b.size}; }
   hrx_buffer_ref_t TRef(const core::TensorInfo& t) const {
     return {weights_, delta_ + static_cast<std::size_t>(t.offset), static_cast<std::size_t>(t.bytes)};
@@ -641,7 +585,8 @@ class LoomPrefill {
     hidden2_ = &Alloc(B * kHidden * 4);
     normed_ = &Alloc(std::size_t{kHidden} * 4);
     valid_ = &Alloc(4);
-    host_hidden_.resize(B * kHidden);
+    ids_ = &Alloc(B * 4);
+    host_ids_.resize(B);
     const float epsv = 1.0e-6f;
     gpu_.H2D(*eps_, &epsv, 4);
     Zero(*conv_state_);
@@ -718,8 +663,11 @@ class LoomPrefill {
     if (at->second.tt && (B_ + attn_tpw_ - 1) / attn_tpw_ != at->second.tt)
       throw LoomError("wmma.hal: grid x does not match the emitted token tiles");
     for (const char* hal : {"norm.hal", "convkq.hal", "prepab.hal", "rowsplit.hal", "postnorm.hal", "unpack.hal",
-                            "gemv.hal", "rmsnorm.hal", "argmax.hal", "accum.hal"})
+                            "gemv.hal", "rmsnorm.hal", "argmax.hal", "accum.hal", "embed.hal"})
       Exe(hal);
+    GeomOf("embed.hal");   // one token per workgroup: refuses a set emitted for another chunk size
+    if (static_cast<std::uint32_t>(Find("token_embd.weight")->type) != 23)
+      throw LoomError("prefill: token_embd: only IQ4_XS is wired (embed.hal)");
   }
 
   // Bindings shared by every GEMM: weights, then the IQ grid / sign tables the format needs.
@@ -1202,6 +1150,8 @@ class LoomPrefill {
              32, 1, 1, b, GemmWrites(b, f, {&out}));
   }
   // The chunk's graph: the whole chunk is one graph, the NPU handoffs included (NpuEnqueue / NpuJoin).
+  // Replacing a launched graph is safe: the queue retains its command buffers until they complete, and every buffer and
+  // executable they use is this object's.
   void NewGraph() {
     chunk_graph_ = std::make_unique<LoomGraph>(gpu_);
     LoomGraph& g = *chunk_graph_;
@@ -1686,7 +1636,7 @@ class LoomPrefill {
   std::size_t kv_cache_ = 0, kv16_layer_ = 0, vt_bytes_ = 0, ks_bytes_ = 0, kq_bytes_ = 0, vq_bytes_ = 0,
               vqs_bytes_ = 0, pool_bytes_ = 0;
   hrx_buffer_ref_t ptab_ref_{};
-  std::vector<float> host_hidden_;
+  std::vector<std::uint32_t> host_ids_;  // Embed's staging
   LoomBuffer *grid_iq3s_ = nullptr, *grid_iq3xxs_ = nullptr, *grid_iq2xxs_ = nullptr, *grid_iq2xs_ = nullptr,
              *ksigns_ = nullptr;
   LoomBuffer *hidden_ = nullptr, *reszero_ = nullptr, *sumout_ = nullptr, *scratch_ = nullptr, *qkv_ = nullptr,
@@ -1697,7 +1647,7 @@ class LoomPrefill {
              *wstage_ = nullptr, *ostage_ = nullptr, *partial_ = nullptr, *hidden2_ = nullptr, *normed_ = nullptr,
              *ptab_ = nullptr, *vt16_ = nullptr, *kq8buf_ = nullptr, *ksbuf_ = nullptr, *kmbuf_ = nullptr,
              *vqbuf_ = nullptr, *vqsbuf_ = nullptr, *kpool_ = nullptr, *vtpool_ = nullptr, *valid_ = nullptr, *qr16_ = nullptr,
-             *kdeq_ = nullptr, *vdeq_ = nullptr,
+             *kdeq_ = nullptr, *vdeq_ = nullptr, *ids_ = nullptr,
              *normt_ = nullptr;
   std::int64_t keep_rows_ = kAllRows, tail_ = kAllRows, trim_row_ = kAllRows;
 };
