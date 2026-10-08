@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -57,8 +58,10 @@ class Engine : public TextGenerator {
     // Prefill calibration while serving (model/prefill_calib.hpp) is shelved: it converged too slowly to pay off yet.
     // To resume: prefill_.EnableCalibration(CalibrationPath(o.prefill_hal)) and emit sets with the calibration menu.
     logits_ = gpu_.Allocate(std::size_t{LoomPrefill::kVocab} * 4);
-    token_ = gpu_.Allocate(4);
     seed_ = gpu_.Allocate(8);
+    const void* th = nullptr;
+    tokens_mirror_ = gpu_.AllocateHost((std::size_t{decoder_.context()} + 1) * 4, &th);
+    tokens_host_ = static_cast<const std::uint32_t*>(th);
     host_logits_.resize(LoomPrefill::kVocab);
     const core::MetadataValue* name = gguf_.Meta("general.name");
     name_ = name && !name->s.empty() ? name->s : "qwen3.8-27b";
@@ -111,23 +114,49 @@ class Engine : public TextGenerator {
       Track(chunk_ms_, (std::chrono::steady_clock::now() - tc) / ChunkShare(valid), c + 1 == chunks);
     }
     prefill_.Collect();
-    core::TokenId tok;
-    if (tail == 0 || tail_chunk) {
-      decoder_.ResumeAt(n);
-      tok = Pick(greedy, params.sampling, rng, /*from_decoder=*/false);
-    } else {
+    const bool tail_steps = tail && !tail_chunk;
+    const auto ts = std::chrono::steady_clock::now();
+    if (tail_steps) {
       decoder_.SetTokens(prompt.data() + full, tail, full);
-      const auto ts = std::chrono::steady_clock::now();
-      for (std::uint32_t pos = full; pos < n; ++pos) decoder_.Step(pos, n);
-      tok = Pick(greedy, params.sampling, rng, /*from_decoder=*/true, n);
-      Track(step_ms_, (std::chrono::steady_clock::now() - ts) / tail, true);
+      for (std::uint32_t pos = full; pos < n; ++pos) decoder_.Step(pos, n);   // the last argmax goes to token n
+    } else {
+      decoder_.ResumeAt(n);
     }
-    const auto t1 = std::chrono::steady_clock::now();
+    // Greedy: every argmax goes to the decoder's token stream, which the next step reads, so the steps run kAhead ahead
+    // of the token the host reads; made[i] marks the copy of the host's next token + i into tokens_host_. At most
+    // kAhead steps past a stop run for nothing.
+    std::deque<LoomEvent> made;
+    core::TokenId tok = 0;
+    if (greedy) {
+      if (!tail_steps) prefill_.Argmax(Ref(logits_), decoder_.TokenRef(n));
+      made.push_back(MarkToken(n));
+    } else {
+      tok = Pick(params.sampling, rng, tail_steps);
+      if (tail_steps) Track(step_ms_, (std::chrono::steady_clock::now() - ts) / tail, true);
+    }
+    auto t1 = std::chrono::steady_clock::now();
     r.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     // Decode: report each token, then run the step that consumes it.
     r.finish_reason = "length";
+    std::uint32_t queued = n;  // greedy: the next step to queue
     for (std::uint32_t pos = n;; ++pos) {
+      if (greedy) {
+        for (; queued < pos + kAhead && queued + 1 < n + params.max_tokens && queued < decoder_.context(); ++queued) {
+          decoder_.Step(queued, n);
+          made.push_back(MarkToken(queued + 1));
+        }
+        if (made.empty()) throw LoomError("decoder: position past the set's context");
+        gpu_.Wait(made.front());
+        made.pop_front();
+        tok = __atomic_load_n(&tokens_host_[pos], __ATOMIC_ACQUIRE);
+        if (tok >= LoomDecoder::kVocab) throw LoomError("decoder: token id out of range: " + std::to_string(tok));
+        if (pos == n) {   // the first token: the prompt's time ends here
+          if (tail_steps) Track(step_ms_, (std::chrono::steady_clock::now() - ts) / tail, true);
+          t1 = std::chrono::steady_clock::now();
+          r.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+      }
       if (std::find(params.stop_ids.begin(), params.stop_ids.end(), tok) != params.stop_ids.end()) {
         r.finish_reason = "stop";
         break;
@@ -138,9 +167,10 @@ class Engine : public TextGenerator {
         break;
       }
       if (r.generated_tokens >= params.max_tokens) break;
+      if (greedy) continue;
       decoder_.SetTokens(&tok, 1, pos);
       decoder_.Step(pos, pos);
-      tok = Pick(greedy, params.sampling, rng, /*from_decoder=*/true, pos + 1);
+      tok = Pick(params.sampling, rng, /*from_decoder=*/true);
     }
     r.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
     if (r.generated_tokens > 1) step_ms_ = 0.8 * step_ms_ + 0.2 * r.decode_ms / (r.generated_tokens - 1);
@@ -149,6 +179,13 @@ class Engine : public TextGenerator {
 
  private:
   static hrx_buffer_ref_t Ref(const LoomBuffer& b) { return {b.handle, 0, b.size}; }
+  // Greedy decode steps queued ahead of the token the host reads: the next step is queued while the current one runs.
+  static constexpr std::uint32_t kAhead = 2;
+  // Copies token pos of the decoder's stream to tokens_host_ and marks it.
+  LoomEvent MarkToken(std::uint32_t pos) {
+    gpu_.Copy(decoder_.TokenRef(pos), {tokens_mirror_.handle, std::size_t{pos} * 4, 4});
+    return gpu_.Mark();
+  }
   // A chunk of n real tokens costs about this share of a full one: the GEMMs (~92% of a full chunk) run whole 256-token
   // tiles, everything else runs the whole chunk.
   // The prefill calibration's state file: $XDG_CACHE_HOME/yah (else ~/.cache/yah), one per emitted set (its
@@ -182,21 +219,9 @@ class Engine : public TextGenerator {
     if (synced) est = 0.8 * est + 0.2 * std::chrono::duration<double, std::milli>(elapsed).count();
   }
 
-  // The next token: argmax on the GPU when greedy, else sampled on the host from the logits.
-  // from_decoder: the decoder's last step produced the logits (and wrote its argmax to token position at).
-  core::TokenId Pick(bool greedy, const SamplingParams& s, std::mt19937_64& rng, bool from_decoder,
-                     std::uint32_t at = 0) {
-    if (greedy) {
-      if (from_decoder) {
-        gpu_.Synchronize();
-        return decoder_.Tokens(at, at + 1)[0];
-      }
-      prefill_.Argmax(Ref(logits_), Ref(token_));
-      gpu_.Synchronize();
-      core::TokenId t = 0;
-      gpu_.D2H(token_, &t, 4);
-      return t;
-    }
+  // The next sampled token (not greedy: Generate runs greedy decode ahead on the GPU), from the logits on the host.
+  // from_decoder: the decoder's last step produced the logits, else the prefill's head.
+  core::TokenId Pick(const SamplingParams& s, std::mt19937_64& rng, bool from_decoder) {
     gpu_.Synchronize();
     if (from_decoder)
       decoder_.CopyLogits(host_logits_.data());
@@ -239,7 +264,9 @@ class Engine : public TextGenerator {
   LoomWeights weights_;
   LoomPrefill prefill_;
   LoomDecoder decoder_;
-  LoomBuffer logits_, token_, seed_;
+  LoomBuffer logits_, seed_;
+  LoomBuffer tokens_mirror_;                    // host-local copy of the decoder's token stream (MarkToken)
+  const std::uint32_t* tokens_host_ = nullptr;  // its mapping
   Tail tail_ = Tail::kAuto;
   double chunk_ms_ = 3100.0, step_ms_ = 62.0;  // prefill chunk and decode step costs (pp2048, short context)
   std::vector<float> host_logits_;

@@ -214,6 +214,26 @@ class LoomDevice {
     return buffer;
   }
 
+  // A host-local buffer, persistently mapped at *host: the host reads what the stream copied there once it completed
+  // (Mark / Wait), without a queue transfer (a synchronous D2H waits behind all queued work).
+  [[nodiscard]] LoomBuffer AllocateHost(size_t bytes, const void** host) {
+    LoomBuffer buffer;
+    buffer.size = bytes;
+    const hrx_buffer_usage_t usage =
+        HRX_BUFFER_USAGE_TRANSFER | HRX_BUFFER_USAGE_MAPPING_SCOPED | HRX_BUFFER_USAGE_MAPPING_PERSISTENT;
+    LoomCheck(hrx_buffer_allocate(stream_, bytes, HRX_MEMORY_TYPE_HOST_LOCAL | HRX_MEMORY_TYPE_HOST_COHERENT, usage,
+                                  &buffer.handle),
+              "hrx_buffer_allocate(host)");
+    Synchronize();
+    void* p = nullptr;
+    LoomCheck(hrx_buffer_map(buffer.handle, HRX_MAP_READ, 0, bytes, &p), "hrx_buffer_map");
+    *host = p;
+    return buffer;
+  }
+  void Copy(const hrx_buffer_ref_t& src, const hrx_buffer_ref_t& dst) {
+    LoomCheck(hrx_stream_copy_buffer(stream_, src.buffer, src.offset, dst.buffer, dst.offset, src.length),
+              "hrx_stream_copy_buffer");
+  }
   // Import an external host pointer (e.g. a GGUF mmap window) as an HRX buffer.
   // The caller must keep the mapping alive while the buffer is in use.
   [[nodiscard]] LoomBuffer Import(void* host_ptr, size_t bytes) {
@@ -233,6 +253,14 @@ class LoomDevice {
   void Fill(const LoomBuffer& buffer, uint32_t pattern) {
     LoomCheck(hrx_stream_fill_buffer(stream_, buffer.handle, 0, buffer.size, &pattern, 4), "hrx_stream_fill_buffer");
   }
+  // An event after the work queued so far (submitting it); Wait blocks until the GPU has run that work.
+  LoomEvent Mark() {
+    LoomEvent e;
+    LoomCheck(hrx_event_create(device_, HRX_EVENT_FLAG_DISABLE_TIMING, &e.handle), "hrx_event_create");
+    LoomCheck(hrx_event_record(e.handle, stream_), "hrx_event_record");
+    return e;
+  }
+  void Wait(const LoomEvent& e) { LoomCheck(hrx_event_synchronize(e.handle), "hrx_event_synchronize"); }
   // Host data into the buffer in stream order (copied now; at most 64 KB).
   void Update(const LoomBuffer& buffer, const void* host, size_t bytes, size_t offset = 0) {
     LoomCheck(hrx_stream_update_buffer(stream_, host, bytes, buffer.handle, offset), "hrx_stream_update_buffer");

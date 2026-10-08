@@ -205,6 +205,8 @@ class LoomDecoder {
       if (t >= kVocab) throw LoomError("decoder: token id out of range: " + std::to_string(t));
     return out;
   }
+  // Token position pos of the device token stream (a step's argmax target).
+  [[nodiscard]] hrx_buffer_ref_t TokenRef(std::uint32_t pos) const { return {toks_->handle, std::size_t{pos} * 4, 4}; }
   void CopyLogits(float* host) { gpu_.D2H(*logits_, host, std::size_t{kVocab} * 4); }
 
   // Queues the step at position pos. It reads toks[pos]; its argmax goes to toks[pos + 1] if pos + 1 >= keep_from.

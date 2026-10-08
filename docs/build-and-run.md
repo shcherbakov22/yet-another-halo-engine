@@ -114,7 +114,7 @@ engine/run/gpu_run.sh serve -- engine/build/yah_server --model <gguf> --prefill 
 engine/build/yah_server --model <gguf> --fake    # canned replies, CPU only: for clients and API tests
 ```
 
-A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is a partial one: its GEMMs run only the 256-token tiles that hold real tokens, so it costs about 0.25 s plus 0.36 s per 256 tokens (an 18-token prompt: 0.63 s to the first token). Tails of a few tokens go through decode steps instead (about 62 ms per token). `loom_forward_pp` takes any token count the same way.
+A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is a partial one: its GEMMs run only the 256-token tiles that hold real tokens, so it costs about 0.25 s plus 0.36 s per 256 tokens (an 18-token prompt: 0.63 s to the first token). Tails of a few tokens go through decode steps instead (about 62 ms per token). Greedy decode runs two steps ahead of the host: each argmax feeds the next step on the GPU, and the host only reads the tokens (a host-mapped copy) to stream them and stop. `loom_forward_pp` takes any token count the same way.
 
 For quick tests, `engine/build/yah_chat` is a terminal chat client: it streams the reply (reasoning dimmed), keeps the conversation, and prints token counts, time to first token and tok/s after each reply. Commands: `/reset`, `/effort E`, `/temp T`, `/max N`, `/system TEXT`, `/quit`; Ctrl-C stops a reply.
 
