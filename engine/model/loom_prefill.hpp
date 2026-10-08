@@ -205,18 +205,9 @@ class LoomPrefill {
     // every graph of the session, to match them in order (one graph per chunk; NPU chunks are not matched)
     if (gpu_.profiling() && flagged_.empty()) session_chunks_.push_back(nodes_);
     chunk_graph_->Launch();
-    for (std::size_t i = 0; i < flagged_.size(); ++i) {
-      const Flagged& j = flagged_[i];
-      try {
-        npu_->Enqueue(j.calls, j.tag, j.words);
-      } catch (...) {
-        // the graph runs: release its waits for this and every later job, which will never run
-        for (std::size_t k = i; k < flagged_.size(); ++k) npu_->Release(flagged_[k].words);
-        flagged_.clear();
-        throw;
-      }
-    }
-    flagged_.clear();
+    std::vector<NpuSplit::Queued> jobs;
+    jobs.swap(flagged_);
+    if (!jobs.empty()) npu_->Enqueue(jobs);   // on a failure it releases the graph's waits for the jobs left
   }
 
   // The last RunLayers graph's dispatches in node order (= the command index of their dispatch timestamps).
@@ -1225,12 +1216,6 @@ class LoomPrefill {
   // system scope: A and W reach memory first); the NPU waits for it itself. NpuJoin: yah_npu_flag_wait polls the done
   // word; it stands for the NPU's reads of A / W and writes of C, so the unpacks and the next job's encoders and
   // decoders order after it. The jobs are queued right after the chunk graph launches.
-  struct Flagged {
-    std::vector<std::uint32_t> calls;
-    std::string tag;
-    std::uint32_t job;   // index in the chunk (W slot = job % 2)
-    NpuSplit::Job words;
-  };
   // A weight decode of the planning pass (EnableNpu), dispatched early in one-graph mode.
   struct PlannedDecode {
     std::string hal, name;
@@ -1259,20 +1244,21 @@ class LoomPrefill {
     const NpuSplit::Job words = npu_->NewJob(calls);
     graph_->AtomicStore(FlagWord(words.ready), words.gate, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE,
                         {Ref(npu_->A()), WSlot(job)}, {Ref(npu_->C())});
-    flagged_.push_back({std::move(calls), std::move(tag), job, words});
+    flagged_.push_back({std::move(calls), std::move(tag), words});
   }
   // Queue the GPU work that runs beside the last enqueued job before this.
   void NpuJoin() {
     if (npu_planning_) return;
     // the next job's weight decodes run beside this job's GPU work
     predecoded_.clear();
-    if (flagged_.back().job + 1 < planned_dq_.size())
-      for (const PlannedDecode& d : planned_dq_[flagged_.back().job + 1]) {
+    const auto job = static_cast<std::uint32_t>(flagged_.size() - 1);   // this chunk's last job (NpuEnqueue)
+    if (job + 1 < planned_dq_.size())
+      for (const PlannedDecode& d : planned_dq_[job + 1]) {
         Dispatch(Exe(d.hal), d.name.c_str(), d.gx, 1, 1, d.wg, 1, 1, d.b, std::uint64_t{1} << (d.b.size() - 1));
         predecoded_.push_back(d);
       }
-    const Flagged& j = flagged_.back();
-    const std::vector<hrx_buffer_ref_t> npu_side{Ref(npu_->A()), WSlot(j.job), Ref(npu_->C())};
+    const NpuSplit::Queued& j = flagged_.back();
+    const std::vector<hrx_buffer_ref_t> npu_side{Ref(npu_->A()), WSlot(job), Ref(npu_->C())};
     Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1,
              {FlagWord(j.words.done), FlagWord(j.words.ready), FlagWord(NpuSplit::kFlagStatus)}, 4, &npu_side);
   }
@@ -1684,7 +1670,7 @@ class LoomPrefill {
   bool ffn_bfp_ = false;           // the last ffn unpack wrote down's BFP16 input for its columns (FfnUnpack)
   std::string norm_bfp_;           // the site whose NPU input the last norm wrote (RunNorm npu_site)
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
-  std::vector<Flagged> flagged_;   // this chunk's NPU jobs, queued after the launch
+  std::vector<NpuSplit::Queued> flagged_;  // this chunk's NPU jobs (index = job), queued after the launch
   std::vector<std::vector<PlannedDecode>> planned_dq_;  // per job: its weight decodes (planning pass)
   std::vector<PlannedDecode> predecoded_;               // the next job's, dispatched at the last Join
   std::map<std::string, std::uint32_t> npu_rows_;  // NPU rows per site (dispatch.txt "npusplit_<site>")

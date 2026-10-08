@@ -51,11 +51,16 @@ class NpuSplit {
   };
   // The next job, of these calls (jobs count from 1 in queue order; the NPU counts them too).
   virtual Job NewJob(const std::vector<std::uint32_t>& calls) = 0;
-  // Queues the job at once: the NPU waits for its ready word itself. tag names the job in the stats.
-  virtual void Enqueue(const std::vector<std::uint32_t>& calls, const std::string& tag, const Job& job) = 0;
-  // Ends the GPU's wait for a job that will never run (done = gate | kGateFailed).
-  // For a launched chunk graph whose jobs failed to queue.
-  virtual void Release(const Job& job) = 0;
+  // A job to queue: its calls, a tag naming it in the stats, its words.
+  struct Queued {
+    std::vector<std::uint32_t> calls;
+    std::string tag;
+    Job words;
+  };
+  // Queues the jobs at once, in NewJob order, several per NPU command: the NPU waits for each ready word itself.
+  // If it throws, it has stored gate | kGateFailed to the done words of the jobs it did not queue (a launched graph
+  // waits for them).
+  virtual void Enqueue(const std::vector<Queued>& jobs) = 0;
 };
 
 }  // namespace yah::model
