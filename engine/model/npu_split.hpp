@@ -30,10 +30,16 @@ class NpuSplit {
   [[nodiscard]] virtual const LoomBuffer& C() const = 0;
   // One call of the NPU GEMM image at path on these views (cold: loads and binds; the same arguments return the same id).
   virtual std::uint32_t Bind(const std::string& image, NpuView a, NpuView w, NpuView c) = 0;
-  // The calls in order behind the stream's current position; returns the value to Join on. tag names the job in Stats.
-  virtual std::uint64_t Enqueue(const std::vector<std::uint32_t>& calls, const std::string& tag) = 0;
-  // Orders the stream after that work (the host waits for it first).
-  virtual void Join(std::uint64_t value) = 0;
+  // The prefill graph and the relay hand jobs over through 32-bit words in host memory (one graph per chunk).
+  // Flags(): the GPU view of the words. Word kFlagStatus is set by a GPU wait that timed out.
+  static constexpr std::uint32_t kFlagStatus = 1, kFlagFirstJob = 2;
+  [[nodiscard]] virtual const LoomBuffer* Flags() const = 0;
+  [[nodiscard]] virtual std::uint32_t FlagWords() const = 0;
+  [[nodiscard]] virtual std::uint32_t Word(std::uint32_t word) const = 0;
+  // The calls in order once word ready holds epoch (the graph stores it); then the relay stores epoch to word done,
+  // also when the NPU failed, so no GPU wait is left spinning. tag names the job in the stats.
+  virtual void EnqueueFlagged(const std::vector<std::uint32_t>& calls, const std::string& tag, std::uint32_t ready,
+                              std::uint32_t done, std::uint32_t epoch) = 0;
 };
 
 }  // namespace yah::model

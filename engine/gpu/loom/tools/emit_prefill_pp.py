@@ -861,6 +861,11 @@ def npu_split(rows, combos, B, outdir):
             out.append(("convkq_g.hal", gen_conv_kq.tiles(N - n), 256, 0))
             out.append(("convkq_c.hal", n // gen_conv_kq.CW, gen_conv_kq.CW, B // gen_conv_kq.TC))
         out.append(("npusplit_" + site, n, 0, 0))
+    # one graph per chunk (YAH_NPU_ONEGRAPH): the GPU waits for each NPU job on a flag word (gen_npu_unpack.gen_flag_wait)
+    src = os.path.join(tmp, "npu_flag_wait.loom")
+    open(src, "w").write(GU.gen_flag_wait())
+    E.emit(src, ["nop=0"], "npu_flag_wait.hal", outdir)
+    out.append(("npu_flag_wait.hal", 1, 32, 0))
     # NPU images, one per pass count
     env = dict(hrx_paths.env(), **GN.LOOM_ENV)
     for passes in sorted({p for s in NPU_SPLIT for _, p in npu_chunks(s)}):

@@ -6,6 +6,8 @@
 #define YAH_MODEL_LOOM_NPU_HPP_
 
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -13,7 +15,6 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
-#include <sys/mman.h>
 #include <deque>
 #include <fstream>
 #include <map>
@@ -293,6 +294,16 @@ class LoomNpu {
     cv_.notify_one();
     return issued_;
   }
+  // The calls in order once *ready holds epoch (a GPU graph stores it), then epoch to *done: host-free handoffs inside
+  // one graph (NpuSplit::EnqueueFlagged). After a failure the relay only stores *done, so no GPU wait is left spinning.
+  void EnqueueFlagged(std::vector<Kernel*> kernels, std::string tag, volatile std::uint32_t* ready,
+                      volatile std::uint32_t* done, std::uint32_t epoch) {
+    std::lock_guard<std::mutex> lock(mu_);
+    Job job{{}, std::move(kernels), ++issued_, std::move(tag)};
+    job.ready = ready, job.done = done, job.epoch = epoch;
+    jobs_.push_back(std::move(job));
+    cv_.notify_one();
+  }
   // Orders the stream after the NPU work Enqueue returned value for; queue the GPU work that runs beside the NPU first.
   // The host waits for the NPU here, so the stream wait sees a signaled semaphore.
   // A stream wait on a semaphore the host signals later is resolved in software after the stream drains (~0.1-0.2 ms idle GPU).
@@ -307,15 +318,11 @@ class LoomNpu {
   // Per job tag: jobs, calls, NPU busy time (first submission to completion, host clock).
   struct TagStats {
     std::size_t jobs = 0, calls = 0;
-    double busy_ms = 0, join_ms = 0;
+    double busy_ms = 0;
   };
   std::map<std::string, TagStats> Stats() {
     std::lock_guard<std::mutex> lock(mu_);
     return stats_;
-  }
-  void AddJoinMs(const std::string& tag, double ms) {
-    std::lock_guard<std::mutex> lock(mu_);
-    stats_[tag].join_ms += ms;
   }
   // Host time of the last finished job from its first submission to the NPU's completion.
   [[nodiscard]] double LastJobMs() const { return last_job_ms_.load(); }
@@ -391,9 +398,25 @@ class LoomNpu {
     std::vector<Kernel*> kernels;
     std::uint64_t signal;
     std::string tag;
+    volatile std::uint32_t* ready = nullptr;  // EnqueueFlagged
+    volatile std::uint32_t* done = nullptr;
+    std::uint32_t epoch = 0;
   };
+  // Spins briefly, then polls every ~20 us (timer slack set in Relay): the GPU usually stores the word within a few ms.
+  static void WaitWord(volatile std::uint32_t* word, std::uint32_t value) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; *word != value; ++i) {
+      if (i < 2000) {
+        __builtin_ia32_pause();
+        continue;
+      }
+      if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10)) throw LoomError("relay: GPU flag timeout");
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+  }
 
   void Relay() {
+    prctl(PR_SET_TIMERSLACK, 1000UL);  // flag polling sleeps of ~20 us, not the default 50 us slack
     for (;;) {
       Job job;
       {
@@ -403,8 +426,21 @@ class LoomNpu {
         job = std::move(jobs_.front());
         jobs_.pop_front();
       }
+      bool failed = false;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        failed = !failure_.empty();
+      }
+      if (failed && job.done) {
+        __atomic_store_n(job.done, job.epoch, __ATOMIC_RELEASE);
+        hrx_status_ignore(hrx_semaphore_signal(done_, job.signal));
+        continue;
+      }
       try {
-        LoomCheck(hrx_semaphore_wait(job.after.semaphore, job.after.value, UINT64_MAX), "relay: GPU wait");
+        if (job.ready)
+          WaitWord(job.ready, job.epoch);
+        else
+          LoomCheck(hrx_semaphore_wait(job.after.semaphore, job.after.value, UINT64_MAX), "relay: GPU wait");
         const auto t0 = std::chrono::steady_clock::now();
         std::uint64_t submission = 0;
         auto submit = [&](const amdf_xdna_kernel_command_t* command) {
@@ -447,6 +483,7 @@ class LoomNpu {
         if (failure_.empty()) failure_ = e.what();
         resident_ = nullptr;
       }
+      if (job.done) __atomic_store_n(job.done, job.epoch, __ATOMIC_RELEASE);
       hrx_status_ignore(hrx_semaphore_signal(done_, job.signal));
     }
   }
@@ -688,7 +725,8 @@ class LoomNpuSplit : public NpuSplit {
       : npu_(gpu, 8),
         a_(npu_.CreateShared(plan.a_bytes)),
         w_(npu_.CreateShared(plan.w_bytes)),
-        c_(npu_.CreateShared(plan.c_bytes, true)) {}   // the NPU writes C (see CreateShared)
+        c_(npu_.CreateShared(plan.c_bytes, true)),  // the NPU writes C (see CreateShared)
+        flags_(npu_.CreateShared(4096, true)) {}
   const LoomBuffer& A() const override { return a_.gpu; }
   const LoomBuffer& W() const override { return w_.gpu; }
   const LoomBuffer& C() const override { return c_.gpu; }
@@ -699,31 +737,32 @@ class LoomNpuSplit : public NpuSplit {
                                   {{&a_, a.offset, a.length}, {&w_, w.offset, w.length}, {&c_, c.offset, c.length}}));
     return ids_[key] = static_cast<std::uint32_t>(kernels_.size() - 1);
   }
-  std::uint64_t Enqueue(const std::vector<std::uint32_t>& calls, const std::string& tag) override {
+  [[nodiscard]] const LoomBuffer* Flags() const override { return &flags_.gpu; }
+  [[nodiscard]] std::uint32_t FlagWords() const override { return static_cast<std::uint32_t>(flags_.bytes / 4); }
+  [[nodiscard]] std::uint32_t Word(std::uint32_t word) const override {
+    return __atomic_load_n(static_cast<const std::uint32_t*>(flags_.host) + word, __ATOMIC_ACQUIRE);
+  }
+  void EnqueueFlagged(const std::vector<std::uint32_t>& calls, const std::string& tag, std::uint32_t ready,
+                      std::uint32_t done, std::uint32_t epoch) override {
     npu_.CheckHealth();
+    if (Word(kFlagStatus)) throw LoomError("npu: a GPU wait for the NPU timed out");
     std::vector<LoomNpu::Kernel*> k;
     for (const std::uint32_t id : calls) k.push_back(kernels_.at(id));
-    last_tag_ = tag;
-    return npu_.Enqueue(std::move(k), tag);
+    auto* w = static_cast<volatile std::uint32_t*>(flags_.host);
+    npu_.EnqueueFlagged(std::move(k), tag, w + ready, w + done, epoch);
   }
-  void Join(std::uint64_t value) override {
-    const auto t0 = std::chrono::steady_clock::now();
-    npu_.Join(value);
-    npu_.AddJoinMs(last_tag_, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-    npu_.CheckHealth();
-  }
-  // One line per job tag: jobs, calls, NPU busy time, and host time spent waiting for the NPU in Join.
+  // One line per job tag: jobs, calls, NPU busy time.
   void Report(std::FILE* f) {
+    if (Word(kFlagStatus)) std::fprintf(f, "npu: ERROR a GPU wait for the NPU timed out\n");
     for (const auto& [tag, st] : npu_.Stats())
-      std::fprintf(f, "npu: %-5s %4zu jobs %5zu calls, NPU busy %7.1f ms, join wait %6.1f ms\n", tag.c_str(), st.jobs,
-                   st.calls, st.busy_ms, st.join_ms);
+      std::fprintf(f, "npu: %-5s %4zu jobs %5zu calls, NPU busy %7.1f ms\n", tag.c_str(), st.jobs, st.calls,
+                   st.busy_ms);
   }
 
  private:
   LoomNpu npu_;
-  LoomNpu::Shared &a_, &w_, &c_;
+  LoomNpu::Shared &a_, &w_, &c_, &flags_;
   std::vector<LoomNpu::Kernel*> kernels_;
-  std::string last_tag_;
   std::map<std::tuple<std::string, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>,
            std::uint32_t>
       ids_;

@@ -343,17 +343,21 @@ class LoomGraph {
   // Returns the node's index: dispatch timestamps of the launched graph carry it as their command index.
   // after: ranges this dispatch is ordered after as if it read them, though it does not (it gets the same barrier as a
   // dispatch that does, so the two can run together); not recorded as accesses.
+  // also_writes: ranges recorded as written by this dispatch though it does not bind them (a wait that stands for
+  // another engine's writes).
   size_t Dispatch(const LoomExecutable& executable, uint32_t ordinal, const hrx_dispatch_config_t& config,
-                const hrx_buffer_ref_t* bindings, size_t binding_count, uint64_t writes,
-                const std::vector<hrx_buffer_ref_t>* after = nullptr) {
+                  const hrx_buffer_ref_t* bindings, size_t binding_count, uint64_t writes,
+                  const std::vector<hrx_buffer_ref_t>* after = nullptr,
+                  const std::vector<hrx_buffer_ref_t>* also_writes = nullptr) {
     std::vector<hrx_graph_node_t> deps;
     for (size_t i = 0; i < binding_count; ++i)
       if (!read_only_.count(bindings[i].buffer)) Depend(bindings[i], (writes >> i) & 1, &deps);
     if (after)
       for (const hrx_buffer_ref_t& r : *after)
         if (!read_only_.count(r.buffer)) Depend(r, false, &deps);
-    std::sort(deps.begin(), deps.end());
-    deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
+    if (also_writes)
+      for (const hrx_buffer_ref_t& r : *also_writes) Depend(r, true, &deps);
+    Unique(&deps);
     // The graph keeps the binding pointer until it is instantiated.
     const auto& b = bindings_.emplace_back(bindings, bindings + binding_count);
     hrx_graph_kernel_node_attrs_t attrs{};
@@ -367,8 +371,29 @@ class LoomGraph {
     for (size_t i = 0; i < binding_count; ++i)
       if (!read_only_.count(bindings[i].buffer))
         accesses_[bindings[i].buffer].push_back({bindings[i].offset, bindings[i].length, ((writes >> i) & 1) != 0, node});
+    if (also_writes)
+      for (const hrx_buffer_ref_t& r : *also_writes) accesses_[r.buffer].push_back({r.offset, r.length, true, node});
     grids_.push_back({config.workgroup_count[0], config.workgroup_count[1], config.workgroup_count[2]});
     return grids_.size() - 1;
+  }
+  // Stores value to target (4 bytes) after everything that wrote reads (HRX patch 0015). With release + system scope the
+  // command processor makes every earlier write visible to the host and other devices first. writes: ranges recorded as
+  // written by the store (another engine writes them once it sees the value).
+  void AtomicStore(const hrx_buffer_ref_t& target, uint32_t value, uint32_t flags,
+                   const std::vector<hrx_buffer_ref_t>& reads, const std::vector<hrx_buffer_ref_t>& writes) {
+    std::vector<hrx_graph_node_t> deps;
+    Depend(target, true, &deps);
+    for (const hrx_buffer_ref_t& r : reads) Depend(r, false, &deps);
+    for (const hrx_buffer_ref_t& r : writes) Depend(r, true, &deps);
+    Unique(&deps);
+    hrx_graph_atomic_store_node_attrs_t attrs{};
+    attrs.target = target, attrs.value = value, attrs.flags = flags;
+    hrx_graph_node_t node = nullptr;
+    LoomCheck(hrx_graph_add_atomic_store_node(graph_, deps.data(), deps.size(), &attrs, &node),
+              "hrx_graph_add_atomic_store_node");
+    accesses_[target.buffer].push_back({target.offset, target.length, true, node});
+    for (const hrx_buffer_ref_t& r : reads) accesses_[r.buffer].push_back({r.offset, r.length, false, node});
+    for (const hrx_buffer_ref_t& r : writes) accesses_[r.buffer].push_back({r.offset, r.length, true, node});
   }
   // The workgroup count node i was recorded with.
   [[nodiscard]] const std::array<uint32_t, 3>& Grid(size_t i) const { return grids_[i]; }
@@ -385,6 +410,10 @@ class LoomGraph {
   }
 
  private:
+  static void Unique(std::vector<hrx_graph_node_t>* deps) {
+    std::sort(deps->begin(), deps->end());
+    deps->erase(std::unique(deps->begin(), deps->end()), deps->end());
+  }
   struct Access {
     size_t offset, length;
     bool write;

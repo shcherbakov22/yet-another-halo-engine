@@ -1,0 +1,165 @@
+Graph atomic store node: hrx_graph_add_atomic_store_node records a 4 / 8 byte store (iree_hal_command_buffer_atomic_store)
+into the graph's command buffer, so it does not break the partition. With release + system scope the command processor makes
+every earlier write visible to the host and other devices first: the GPU -> NPU "inputs ready" flag of a one-graph prefill.
+
+diff --git a/libhrx/include/hrx_runtime.h b/libhrx/include/hrx_runtime.h
+--- a/libhrx/include/hrx_runtime.h
++++ b/libhrx/include/hrx_runtime.h
+@@ -1138,6 +1138,27 @@
+ HRX_API hrx_status_t hrx_graph_add_host_call_node(
+     hrx_graph_t graph, const hrx_graph_node_t* deps, size_t dep_count,
+     const hrx_graph_host_call_node_attrs_t* attrs, hrx_graph_node_t* out_node);
++// Graph atomic store (LOCAL PROTOTYPE, yah, not upstream): stores |value| to
++// |target| (4 or 8 bytes, naturally aligned) once the node's dependencies have
++// completed. With HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE every
++// earlier write is visible to the host and other devices before the value is.
++// It is recorded in the graph's command buffer: no partition break.
++typedef enum hrx_atomic_flag_bits_t {
++  HRX_ATOMIC_FLAG_NONE = 0,
++  HRX_ATOMIC_FLAG_RELEASE = 1u << 1,
++  HRX_ATOMIC_FLAG_SYSTEM_SCOPE = 1u << 2,
++} hrx_atomic_flag_bits_t;
++
++typedef struct hrx_graph_atomic_store_node_attrs_t {
++  hrx_buffer_ref_t target;
++  uint64_t value;
++  uint32_t flags;
++} hrx_graph_atomic_store_node_attrs_t;
++
++HRX_API hrx_status_t hrx_graph_add_atomic_store_node(
++    hrx_graph_t graph, const hrx_graph_node_t* deps, size_t dep_count,
++    const hrx_graph_atomic_store_node_attrs_t* attrs,
++    hrx_graph_node_t* out_node);
+ HRX_API hrx_status_t hrx_graph_add_dependencies(
+     hrx_graph_t graph, const hrx_graph_node_t* from_nodes,
+     const hrx_graph_node_t* to_nodes, size_t count);
+diff --git a/libhrx/src/libhrx/hrx_internal.h b/libhrx/src/libhrx/hrx_internal.h
+--- a/libhrx/src/libhrx/hrx_internal.h
++++ b/libhrx/src/libhrx/hrx_internal.h
+@@ -304,6 +304,8 @@
+   HRX_GRAPH_NODE_TYPE_INTERNAL_MEMSET = 3 | HRX_GRAPH_NODE_TYPE_RECORDABLE_BIT,
+   HRX_GRAPH_NODE_TYPE_INTERNAL_HOST_CALL = 4,
+   HRX_GRAPH_NODE_TYPE_INTERNAL_GRAPH = 5,
++  HRX_GRAPH_NODE_TYPE_INTERNAL_ATOMIC_STORE =
++      6 | HRX_GRAPH_NODE_TYPE_RECORDABLE_BIT,
+ };
+ typedef uint8_t hrx_graph_node_type_internal_t;
+ 
+@@ -337,6 +339,11 @@
+   iree_hal_fill_flags_t flags;
+ } hrx_graph_memset_node_attrs_internal_t;
+ 
++typedef struct hrx_graph_atomic_store_node_attrs_internal_t {
++  iree_hal_buffer_ref_t target_ref;
++  iree_hal_atomic_store_params_t params;
++} hrx_graph_atomic_store_node_attrs_internal_t;
++
+ typedef struct hrx_graph_host_call_node_attrs_internal_t {
+   void (*fn)(void* user_data);
+   void* user_data;
+@@ -351,6 +358,7 @@
+     hrx_graph_memcpy_node_attrs_internal_t memcpy;
+     hrx_graph_memset_node_attrs_internal_t memset;
+     hrx_graph_host_call_node_attrs_internal_t host;
++    hrx_graph_atomic_store_node_attrs_internal_t atomic_store;
+   } attrs;
+   struct hrx_graph_node_s* dependencies[];
+ } hrx_graph_node_s;
+diff --git a/libhrx/src/libhrx/graph.c b/libhrx/src/libhrx/graph.c
+--- a/libhrx/src/libhrx/graph.c
++++ b/libhrx/src/libhrx/graph.c
+@@ -539,6 +539,69 @@
+   return status;
+ }
+ 
++static_assert((uint32_t)HRX_ATOMIC_FLAG_RELEASE == IREE_HAL_ATOMIC_FLAG_RELEASE,
++              "HRX atomic flags mirror IREE's");
++static_assert((uint32_t)HRX_ATOMIC_FLAG_SYSTEM_SCOPE ==
++                  IREE_HAL_ATOMIC_FLAG_SYSTEM_SCOPE,
++              "HRX atomic flags mirror IREE's");
++
++hrx_status_t hrx_graph_add_atomic_store_node(
++    hrx_graph_t graph, const hrx_graph_node_t* deps, size_t dep_count,
++    const hrx_graph_atomic_store_node_attrs_t* attrs,
++    hrx_graph_node_t* out_node) {
++  IREE_ASSERT_ARGUMENT(graph);
++  IREE_ASSERT_ARGUMENT(attrs);
++  IREE_TRACE_ZONE_BEGIN(z0);
++  hrx_status_t status = hrx_graph_validate_buffer_ref(
++      graph, attrs->target, "atomic store target buffer is NULL");
++  if (hrx_status_is_ok(status) &&
++      ((attrs->target.length != 4 && attrs->target.length != 8) ||
++       attrs->target.offset % attrs->target.length != 0)) {
++    status = hrx_make_status(HRX_STATUS_INVALID_ARGUMENT,
++                             "atomic store target must be 4 or 8 aligned bytes");
++  }
++  if (hrx_status_is_ok(status) &&
++      (attrs->flags & ~(uint32_t)(HRX_ATOMIC_FLAG_RELEASE |
++                                  HRX_ATOMIC_FLAG_SYSTEM_SCOPE)) != 0) {
++    status = hrx_make_status(HRX_STATUS_INVALID_ARGUMENT,
++                             "unknown atomic store flags");
++  }
++  if (!hrx_status_is_ok(status)) {
++    IREE_TRACE_ZONE_END(z0);
++    return status;
++  }
++  hrx_graph_node_s* node = NULL;
++  iree_status_t iree_status = hrx_graph_allocate_node(
++      graph->arena_allocator, dep_count, 0, &node, NULL);
++  if (iree_status_is_ok(iree_status)) {
++    node->type = HRX_GRAPH_NODE_TYPE_INTERNAL_ATOMIC_STORE;
++    node->dependency_count = dep_count;
++    if (dep_count > 0) {
++      memcpy(node->dependencies, deps, dep_count * sizeof(*deps));
++    }
++    hrx_graph_atomic_store_node_attrs_internal_t* a = &node->attrs.atomic_store;
++    a->target_ref = (iree_hal_buffer_ref_t){
++        .buffer = attrs->target.buffer->hal_buffer,
++        .offset = (iree_device_size_t)attrs->target.offset,
++        .length = (iree_device_size_t)attrs->target.length,
++    };
++    memset(&a->params, 0, sizeof(a->params));
++    a->params.value = attrs->value;
++    a->params.flags = (iree_hal_atomic_flags_t)attrs->flags;
++    a->params.width = attrs->target.length == 8 ? IREE_HAL_ATOMIC_WIDTH_64
++                                                : IREE_HAL_ATOMIC_WIDTH_32;
++    iree_status = hrx_graph_capture_buffer_resources(graph, attrs->target.buffer);
++  }
++  if (iree_status_is_ok(iree_status)) {
++    iree_status = hrx_graph_add_node_internal(graph, node);
++  }
++  if (iree_status_is_ok(iree_status) && out_node) {
++    *out_node = node;
++  }
++  IREE_TRACE_ZONE_END(z0);
++  return hrx_status_from_iree(iree_status);
++}
++
+ hrx_status_t hrx_graph_add_host_call_node(
+     hrx_graph_t graph, const hrx_graph_node_t* deps, size_t dep_count,
+     const hrx_graph_host_call_node_attrs_t* attrs, hrx_graph_node_t* out_node) {
+diff --git a/libhrx/src/libhrx/graph_exec.c b/libhrx/src/libhrx/graph_exec.c
+--- a/libhrx/src/libhrx/graph_exec.c
++++ b/libhrx/src/libhrx/graph_exec.c
+@@ -327,6 +327,21 @@
+         }
+         break;
+       }
++      case HRX_GRAPH_NODE_TYPE_INTERNAL_ATOMIC_STORE: {
++        const hrx_graph_atomic_store_node_attrs_internal_t* attrs =
++            &node->attrs.atomic_store;
++        status = iree_hal_command_buffer_atomic_store(
++            command_buffer,
++            IREE_HAL_EXECUTION_STAGE_DISPATCH |
++                IREE_HAL_EXECUTION_STAGE_TRANSFER |
++                IREE_HAL_EXECUTION_STAGE_ATOMIC,
++            IREE_HAL_EXECUTION_STAGE_ATOMIC, attrs->target_ref, attrs->params);
++        if (iree_status_is_ok(status)) {
++          status = iree_hal_resource_set_insert(exec->resource_set, 1,
++                                                &attrs->target_ref.buffer);
++        }
++        break;
++      }
+       default: {
+         status = iree_make_status(
+             IREE_STATUS_INTERNAL,

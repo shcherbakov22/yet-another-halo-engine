@@ -27,6 +27,7 @@ Each patch says at its top what it is for. They apply idempotently, so one that 
 | `0009-loom-omit-dead-fma-mix-seeds` | after allocation, drops the `v_mov_b32 0` that seeds an f16 pair built by `v_fma_mixlo` + `v_fma_mixhi` (no bit of it is ever read), keeping the schedule and registers; afrag kstore cycles -1.0%, bit-identical |
 | `0013-xdna-npu-cascade-gemm-compiler` | Loom AIE2P / XDNA pieces of the NPU cascade GEMM: memory-tile staging, replay and multicast, shared panels, cascade link timing, `worker.accumulate`, leaf-synchronized channels (`constrain.leaf_sync`), replay rings re-armed by the control program, `LOOM_EXP_*` placement and packing knobs (`LOOM_EXP_LS_SEND_PITCH`: leaf-synchronized send-ring slots n records apart, each sending its leading record); NPU-only code paths (GPU emits byte-identical) |
 | `0014-xdna-continuation-invocation` | `iree_hal_amd_xdna_executable_query_continuation`: the control-only repeat invocation (no tile setup), ~545 -> ~150 us fixed cost per NPU call |
+| `0015-graph-atomic-store-node` | `hrx_graph_add_atomic_store_node`: a 4 / 8-byte store recorded in a graph's command buffer (no partition break); with release + system scope the command processor makes every earlier write visible to the host and other devices first. The NPU prefill's "inputs ready" flags (one graph per chunk) |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 
