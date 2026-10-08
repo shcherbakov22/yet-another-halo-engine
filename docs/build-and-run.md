@@ -228,6 +228,7 @@ doas journalctl -k -b -1 --no-pager | grep -iE 'amdgpu|ring .*timeout|reset|MES'
 - Before an A/B, `cmp` the two variants' HALs: a script that loses its env overrides measures the same kernel twice.
 - The tctl limit set with `ryzenadj` resets on reboot. Re-apply it before timing and compare only runs with the same setting.
 - When an optimization loses, find out why before dropping it, and record one line in results.md.
+- A timing ablation that skips a kernel changes the data the rest of the run computes on, and GEMM speed depends on the data (power under the thermal cap): skipping the qkv / gate unpacks ran every later GEMM ~4.6% faster, pp2048 -48 ms of which ~11 ms was the unpacks. Measure a kernel's cost with the output unchanged (run it a second time into a dummy buffer) and require the reference md5; a skip that changes the md5 is an upper bound.
 
 ## Further reading
 

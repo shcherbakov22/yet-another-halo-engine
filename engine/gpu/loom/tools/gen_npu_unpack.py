@@ -27,7 +27,7 @@ def wg(cols):
 
 
 def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=False, tiled=False, qg=False, rem=False,
-        bfp=None):
+        bfp=None, last8=False):
     """resid: out = resid + C (f32; bindings c, resid, out), the kres GEMMs. parts: C is that many consecutive partial C
     blocks (the K chunks of one GEMM), summed in order. swiglu: C is the gate block then the up block; out =
     f16(silu(gate) * up) with the swiglu epilogue's scalar ops. tiled: f16 out fragment-major ([token / 16][column / 16]
@@ -38,14 +38,15 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     chunks) with swiglu: also the NPU's BFP16 activation stream of the next GEMM (ffn_down, whose input columns these are) for
     the columns in its K chunks (chunk_k columns each, gen_bfp16_encode "act" layout, one stream per chunk back to back;
     binding a after out): an item's 8 columns of one token are one bfp16ebs8 row block, encoded from the f16 values
-    (stage_bfp: a workgroup takes 8 tokens x its column chunks, so each chunk's row blocks are one stream fragment)."""
+    (stage_bfp: a workgroup takes 8 tokens x its column chunks, so each chunk's row blocks are one stream fragment).
+    last8: only the last 8 tokens (the conv ring of a qkv split whose conv reads C itself, gen_conv_kq.gen_c)."""
     assert not (resid and (swiglu or tiled or out16)) and not (swiglu and parts > 1) and (resid or not rem)
     assert not bfp or swiglu
     assert not qg or not (resid or swiglu or tiled or out16)
     out16 = out16 or swiglu or tiled
     TN, NJ = GN.TN, GN.TN // 8
     assert tokens % 64 == 0 and off + TN * cols <= (2 if qg else 1) * stride
-    items = tokens * cols * NJ
+    items = (8 if last8 else tokens) * cols * NJ
     c_elems = tokens * cols * TN * CG   # one call's C: per column [group][M block][...]
     L = []
     e = L.append
@@ -121,7 +122,12 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  %tr = index.rem %tid, %c8 : index")
     e("  %cl = index.div %tid, %c8 : index")
     e("  %wq = index.rem %wg, %cnq : index")
-    e("  %wp = index.div %wg, %cnq : index")
+    if last8:
+        e("  %wp0 = index.div %wg, %cnq : index")
+        e(f"  %cwpl = index.constant {tokens // 8 - 1} : index")
+        e("  %wp = index.add %wp0, %cwpl : index")
+    else:
+        e("  %wp = index.div %wg, %cnq : index")
     e("  %tg8 = index.mul %wp, %c8 : index")
     e("  %tokg = index.add %tg8, %tr : index")
     e("  %jq = index.mul %wq, %cnch : index")
@@ -242,6 +248,48 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  kernel.return")
     e("}")
     return "\n".join(L) + "\n"
+
+
+def c_lane(e, p, nc, tokens):
+    """Column part of the group-0 C element of NPU output column nc (0 .. cols * TN - 1), gen's layout split as
+    element = c_lane(nc) + c_tok(token): col * (tokens * TN * CG) + (np * 4 + nh) * 64 + jj, with q = nc % TN,
+    item j = q / 8 = 2 np + nh, jj = q % 8. Returns its SSA name."""
+    for nm, v in (("tn", GN.TN), ("c8", 8), ("c2", 2), ("c4", 4), ("c64", 64), ("cs", tokens * GN.TN * CG)):
+        e(f"  %{p}{nm} = index.constant {v} : index")
+    e(f"  %{p}col = index.div {nc}, %{p}tn : index")
+    e(f"  %{p}q = index.rem {nc}, %{p}tn : index")
+    e(f"  %{p}j = index.div %{p}q, %{p}c8 : index")
+    e(f"  %{p}jj = index.rem %{p}q, %{p}c8 : index")
+    e(f"  %{p}npi = index.div %{p}j, %{p}c2 : index")
+    e(f"  %{p}nh = index.rem %{p}j, %{p}c2 : index")
+    e(f"  %{p}a0 = index.mul %{p}col, %{p}cs : index")
+    e(f"  %{p}a1 = index.mul %{p}npi, %{p}c4 : index")
+    e(f"  %{p}a2 = index.add %{p}a1, %{p}nh : index")
+    e(f"  %{p}a3 = index.mul %{p}a2, %{p}c64 : index")
+    e(f"  %{p}a4 = index.add %{p}a0, %{p}a3 : index")
+    e(f"  %{p}la = index.add %{p}a4, %{p}jj : index")
+    return f"%{p}la"
+
+
+def c_tok(e, p, tok):
+    """Token part of a C element (see c_lane): blk * 64 * TN + (mp * NP * 4 + mh * 2) * 64 + row * 8, with blk = tok / 64,
+    r = tok % 64, mp = r / 16, mh = (r % 16) / 8, row = r % 8. Returns its SSA name."""
+    for nm, v in (("c8", 8), ("c16", 16), ("c64", 64), ("cbs", 64 * GN.TN), ("cmp", GN.NP * 4 * 64), ("c128", 128)):
+        e(f"  %{p}{nm} = index.constant {v} : index")
+    e(f"  %{p}blk = index.div {tok}, %{p}c64 : index")
+    e(f"  %{p}r = index.rem {tok}, %{p}c64 : index")
+    e(f"  %{p}mp = index.div %{p}r, %{p}c16 : index")
+    e(f"  %{p}r16 = index.rem %{p}r, %{p}c16 : index")
+    e(f"  %{p}mh = index.div %{p}r16, %{p}c8 : index")
+    e(f"  %{p}row = index.rem %{p}r, %{p}c8 : index")
+    e(f"  %{p}b0 = index.mul %{p}blk, %{p}cbs : index")
+    e(f"  %{p}b1 = index.mul %{p}mp, %{p}cmp : index")
+    e(f"  %{p}b2 = index.mul %{p}mh, %{p}c128 : index")
+    e(f"  %{p}b3 = index.mul %{p}row, %{p}c8 : index")
+    e(f"  %{p}b4 = index.add %{p}b0, %{p}b1 : index")
+    e(f"  %{p}b5 = index.add %{p}b4, %{p}b2 : index")
+    e(f"  %{p}tb = index.add %{p}b5, %{p}b3 : index")
+    return f"%{p}tb"
 
 
 def load_cg(e, dst, idx):

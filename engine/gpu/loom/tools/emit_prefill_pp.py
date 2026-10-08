@@ -146,6 +146,11 @@ def _rewrite(text, pairs):
     return text
 
 
+def conv_tb_ok(B):
+    """The f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup applies."""
+    return 640 in O16_MT and B % gen_conv_kq.TB == 0 and B % 32 == 0 and gen_gdn_chunk.CONV16
+
+
 def conv_x16(text):
     """yah_ssm_conv_kq reading the qkv GEMM's f16 output (O16_MT 640): each tap widened back to f32 at its load."""
     pairs = [("%x_view = buffer.view %x_noalias[%base] : buffer -> view<[%x_total]xf32>",
@@ -622,7 +627,8 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
 # decoded straight to its BFP16 weight stream ("dqbfp_<fmt>_<mt>_<kb>[_c<chunk>].hal", gen_gemm_tile.DQ_BFP). Per K the
 # activation encoders ("npu_enc_<K>[_c<chunk>][_t].hal", _t: fragment-major input) and the NPU GEMM image
 # ("npu_gemm_<K>.xdna", 8 columns of gen_npu_gemm.TN = 640 rows per call: "npurows"); per site the unpack ("npu_unpack_<site>.hal", ffn also
-# "npu_unpack_ffn_t.hal" with fragment-major output). dispatch.txt: "npusplit_<site> <rows> 0 0", "npubytes_<K> <A>
+# "npu_unpack_ffn_t.hal" with fragment-major output; qkv: "npu_unpack_qkv_tail.hal" + the conv split "convkq_g.hal" /
+# "convkq_c.hal", which reads C itself). dispatch.txt: "npusplit_<site> <rows> 0 0", "npubytes_<K> <A>
 # <W per call> <C per call>", and per kernel "<hal> <workgroups> <workgroup size> 0" (the split GEMMs have GEMM rows).
 NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("YAH_NPU_SPLIT", "").split(",") if x))
 NPU_KS = GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
@@ -839,6 +845,21 @@ def npu_split(rows, combos, B, outdir):
             open(src, "w").write(GU.gen(B, n // GN.TN, N // 2 if site == "q" else N, N - n, **f))
             E.emit(src, ["nop=0"], name, outdir)
             out.append((name, B * n // 8 // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))
+        if site == "qkv" and conv_tb_ok(B):
+            # the conv reads the NPU's v channels straight from C (gen_conv_kq.gen_c) and the GPU's from the f16 output
+            # (gen climit); the unpack writes only the last 8 tokens, the conv ring that prep_ab reads
+            for hal, text, cfg in (
+                    ("npu_unpack_qkv_tail.hal", GU.gen(B, n // GN.TN, N, N - n, out16=True, last8=True), ["nop=0"]),
+                    ("convkq_g.hal", gen_conv_kq.gen(N - n), ["yah_ssm_conv_kq.batch=%d" % B,
+                                                            "yah_ssm_conv_kq.qkv_dim=10240",
+                                                            "yah_ssm_conv_kq.num_key_heads=16"]),
+                    ("convkq_c.hal", gen_conv_kq.gen_c(N - n, n // GN.TN, B), ["nop=0"])):
+                src = os.path.join(tmp, hal[:-4] + ".loom")
+                open(src, "w").write(text)
+                E.emit(src, cfg, hal, outdir)
+            out.append(("npu_unpack_qkv_tail.hal", n // GU.wg(n // GN.TN), GU.wg(n // GN.TN), 0))   # 8 tokens x n / 8 items
+            out.append(("convkq_g.hal", gen_conv_kq.tiles(N - n), 256, 0))
+            out.append(("convkq_c.hal", n // gen_conv_kq.CW, gen_conv_kq.CW, B // gen_conv_kq.TC))
         out.append(("npusplit_" + site, n, 0, 0))
     # NPU images, one per pass count
     env = dict(hrx_paths.env(), **GN.LOOM_ENV)
@@ -1126,7 +1147,7 @@ def main():
     open(dn_src, "w").write(gen_gdn_chunk.gen() if B % 32 == 0 else gen_deltanet_hip.gen())
     # the conv pairs with the DeltaNet kernel: f16 normalized hand-off to the chunked one, f32 conv_out otherwise
     # the f16 hand-off conv per (256 channels, gen_conv_kq.TB tokens) workgroup: bit-identical, inputs read once
-    conv_tb = 640 in O16_MT and B % gen_conv_kq.TB == 0 and B % 32 == 0 and gen_gdn_chunk.CONV16
+    conv_tb = conv_tb_ok(B)
     if conv_tb:
         text = gen_conv_kq.gen()
     else:

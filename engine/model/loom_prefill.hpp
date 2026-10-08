@@ -1516,6 +1516,8 @@ class LoomPrefill {
     const std::uint32_t nq = NpuRows("qkv"), ng = NpuRows("gate");
     const std::string qkv_split = nq ? NpuHal(KstoreHal(pre + "attn_qkv.weight", qkv_af)) : "";
     const std::string gate_split = ng ? NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)) : "";
+    // conv_c: the conv reads the NPU's qkv columns straight from C ("convkq_c.hal"); the unpack writes only the conv ring
+    NpuView conv_c{};
     if (!qkv_split.empty() && !gate_split.empty()) {
       // the NPU's rows of qkv and gate beside alpha / beta and the GPU's rows (one job: the same activations)
       const auto a = NpuEncode("qkv", *scratch_, false);
@@ -1530,7 +1532,12 @@ class LoomPrefill {
       RunKstoreSplit(pre + "attn_qkv.weight", *qkv_, qkv_af, qkv_split, nq);
       RunKstoreSplit(pre + "attn_gate.weight", *gate_, gate_af, gate_split, ng);
       Cut(Segment::kJoin);
-      NpuUnpack("npu_unpack_qkv.hal", cq, {Ref(*qkv_)}, 2);
+      if (geom_.count("convkq_c.hal")) {
+        conv_c = cq;
+        NpuUnpack("npu_unpack_qkv_tail.hal", cq, {Ref(*qkv_)}, 2);
+      } else {
+        NpuUnpack("npu_unpack_qkv.hal", cq, {Ref(*qkv_)}, 2);
+      }
       NpuUnpack("npu_unpack_gate.hal", cg, {Ref(*gate_)}, 2);
     } else {
       RunKstore(pre + "ssm_alpha.weight", *alpha_);
@@ -1545,8 +1552,21 @@ class LoomPrefill {
     // dispatch.txt "convtb <tokens>": a workgroup per tokens (gen_conv_kq), else per token
     const auto ctb = geom_.find("convtb");
     const std::uint32_t conv_tb = ctb != geom_.end() ? ctb->second.tokens : 1;
-    Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", 40, B_ / conv_tb, 1, 256, 1, 1,
-             {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
+    if (conv_c.length) {
+      const Geom& gg = geom_.at("convkq_g.hal");
+      const Geom& gc = geom_.at("convkq_c.hal");
+      Dispatch(Exe("convkq_g.hal"), "yah_ssm_conv_kq", gg.tokens, B_ / conv_tb, 1, 256, 1, 1,
+               {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
+      Dispatch(Exe("convkq_c.hal"), "yah_ssm_conv_kq_c", gc.tokens, gc.tt, 1, gc.rowgrp, 1, 1,
+               {{npu_->C().handle, conv_c.offset, conv_c.length},
+                TRef(*Find(pre + "ssm_conv1d.weight")),
+                cs,
+                Ref(*conv_out_)},
+               8);
+    } else {
+      Dispatch(Exe("convkq.hal"), "yah_ssm_conv_kq", 40, B_ / conv_tb, 1, 256, 1, 1,
+               {Ref(*qkv_), TRef(*Find(pre + "ssm_conv1d.weight")), cs, Ref(*conv_out_), Ref(*kqbuf_)});
+    }
     // One lane index does two jobs: advance the conv ring past the real tokens (i < qkv_size; the next chunk and the
     // decoder read it) and alpha / beta (i < B * heads). So the grid covers max() of the two.
     const std::uint32_t prepab_tiles = (std::max<std::uint32_t>(B_ * kTs, kQkv) + 255u) / 256u;
