@@ -72,11 +72,13 @@ class LoomNpu {
   struct Kernel {
     const void* image_key = nullptr;
     amdf_xdna_kernel_command_t first{};
-    // Seven invocations (gen_npu_gemm GATE). first sets the array up and runs one whole call (any data). push[parity]
-    // queues a call and wait retires the oldest queued one; lead is the even push with its weight fills unpaced, for
-    // the first call of a job (nothing computes yet that pacing would protect). gate opens a job once its ready word
-    // reaches the job's gate value; done writes the done word after the job's last C.
-    amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{}, gate{}, done{};
+    // first sets the array up and runs one whole call (any data). gate opens a job once its ready word reaches the
+    // job's gate value; done writes the done word after the job's last C (gen_npu_gemm GATE).
+    // Streamed (seven invocations): push[parity] queues a call and wait retires the oldest queued one; lead is the even
+    // push with its weight fills unpaced, for the first call of a job (nothing computes yet that pacing would
+    // protect). Not streamed (four invocations, one replay group, HRX patch 0017): call runs one whole call.
+    bool streamed = true;
+    amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{}, gate{}, done{}, call{};
     std::vector<iree_hal_amd_xdna_executable_storage_t> storage;
     std::vector<amdf_host_mapping_t*> storage_maps;
     std::vector<amdf_memory_t*> imports;
@@ -259,11 +261,14 @@ class LoomNpu {
     NpuCheck(iree_hal_amd_xdna_executable_query_continuation(image, entry_ordinal, n, k->storage.data(), false,
                                                              &k->first),
              "query_invocation");
-    if (rec.invocation_count != 7) throw LoomError("npu: " + path + " has no gate (re-emit it)");
-    amdf_xdna_kernel_command_t* const out[] = {&k->push[0], &k->push[1], &k->wait, &k->lead, &k->gate, &k->done};
-    for (uint32_t i = 0; i < 6; ++i)
+    if (rec.invocation_count != 7 && rec.invocation_count != 4)
+      throw LoomError("npu: " + path + " has no gate (re-emit it)");
+    k->streamed = rec.invocation_count == 7;
+    amdf_xdna_kernel_command_t* const streamed[] = {&k->push[0], &k->push[1], &k->wait, &k->lead, &k->gate, &k->done};
+    amdf_xdna_kernel_command_t* const single[] = {&k->call, &k->gate, &k->done};
+    for (uint32_t i = 0; i + 1 < rec.invocation_count; ++i)
       NpuCheck(iree_hal_amd_xdna_executable_query_invocation_ordinal(image, entry_ordinal, n, k->storage.data(), i + 1,
-                                                                     out[i]),
+                                                                     k->streamed ? streamed[i] : single[i]),
                "query_invocation_ordinal");
     kernels_.push_back(std::move(k));
     return *kernels_.back();
@@ -337,7 +342,8 @@ class LoomNpu {
   }
 
  private:
-  // Gated jobs as one command, each [gate c0][lead c0][push c1][wait][push c2][wait] ... [wait][wait][done cN].
+  // Gated jobs as one command, each [gate c0][lead c0][push c1][wait][push c2][wait] ... [wait][wait][done cN], or for
+  // an image that is not streamed [gate c0][call c0] ... [call cN][done cN].
   // Pushes alternate descriptor sets, at most two calls queued: calls overlap, and no command boundary falls while a
   // call's DMA work is in flight (that hung the NPU firmware under DRAM contention). The bodies of the calls' own
   // relocated commands go under one transaction header (libamdf's public format 0.1,
@@ -370,6 +376,11 @@ class LoomNpu {
     for (const auto& calls : runs) {
       int queued = 0;
       append(*calls[0], calls[0]->gate);
+      if (!calls[0]->streamed) {
+        for (const Kernel* k : calls) append(*k, k->call);
+        append(*calls.back(), calls.back()->done);
+        continue;
+      }
       for (std::size_t i = 0; i < calls.size(); ++i) {
         append(*calls[i], i == 0 ? calls[i]->lead : calls[i]->push[i & 1]);
         if (++queued == 2) append(*calls[i], calls[i]->wait), --queued;

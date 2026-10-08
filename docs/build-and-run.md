@@ -29,6 +29,7 @@ Each patch says at its top what it is for. Patches stack (a later one may edit a
 | `0014-xdna-continuation-invocation` | `iree_hal_amd_xdna_executable_query_continuation`: the control-only repeat invocation (no tile setup), ~545 -> ~150 us fixed cost per NPU call |
 | `0015-graph-atomic-store-node` | `hrx_graph_add_atomic_store_node`: a 4 / 8-byte store recorded in a graph's command buffer (no partition break); with release + system scope the command processor makes every earlier write visible to the host and other devices first. The NPU prefill's "inputs ready" flags (one graph per chunk) |
 | `0016-loom-xdna-npu-side-gate` | Loom AIE2P: an NPU job waits for a flag in memory itself (no host relay): core stream channels (`constrain.core_stream`, the core's own stream port), request-driven polls through a shim lock (`constrain.request`), a gate the control program waits for before moving any data and a done record queued after the outputs (`constrain.gate`, `constrain.signal`; streamed plans get `[gate \| done]` invocations), worker storage zeroed at setup; router fix: through a memory tile a route keeps its channel. Ungated images byte-identical |
+| `0017-loom-xdna-gated-call-invocations` | gated plans that are not streamed (one replay group: the NPU GEMM with final outputs) publish [call \| gate \| done] as separate invocations, so a job of calls runs as [gate][call]...[call][done] with one gate; existing images byte-identical |
 
 These are upstream candidates; do not push them to HRX without the owner's agreement.
 
