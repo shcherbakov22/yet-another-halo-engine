@@ -1,11 +1,13 @@
 Graph atomic store node: hrx_graph_add_atomic_store_node records a 4 / 8 byte store (iree_hal_command_buffer_atomic_store)
 into the graph's command buffer, so it does not break the partition. With release + system scope the command processor makes
 every earlier write visible to the host and other devices first: the GPU -> NPU "inputs ready" flag of a one-graph prefill.
+A partition holding one gets a command buffer with the ATOMIC category (the others keep TRANSFER | DISPATCH).
 
 diff --git a/libhrx/include/hrx_runtime.h b/libhrx/include/hrx_runtime.h
+index 72279281f..4b1c318e7 100644
 --- a/libhrx/include/hrx_runtime.h
 +++ b/libhrx/include/hrx_runtime.h
-@@ -1138,6 +1138,27 @@
+@@ -1138,6 +1138,27 @@ HRX_API hrx_status_t hrx_graph_add_fill_buffer_node(
  HRX_API hrx_status_t hrx_graph_add_host_call_node(
      hrx_graph_t graph, const hrx_graph_node_t* deps, size_t dep_count,
      const hrx_graph_host_call_node_attrs_t* attrs, hrx_graph_node_t* out_node);
@@ -33,42 +35,11 @@ diff --git a/libhrx/include/hrx_runtime.h b/libhrx/include/hrx_runtime.h
  HRX_API hrx_status_t hrx_graph_add_dependencies(
      hrx_graph_t graph, const hrx_graph_node_t* from_nodes,
      const hrx_graph_node_t* to_nodes, size_t count);
-diff --git a/libhrx/src/libhrx/hrx_internal.h b/libhrx/src/libhrx/hrx_internal.h
---- a/libhrx/src/libhrx/hrx_internal.h
-+++ b/libhrx/src/libhrx/hrx_internal.h
-@@ -304,6 +304,8 @@
-   HRX_GRAPH_NODE_TYPE_INTERNAL_MEMSET = 3 | HRX_GRAPH_NODE_TYPE_RECORDABLE_BIT,
-   HRX_GRAPH_NODE_TYPE_INTERNAL_HOST_CALL = 4,
-   HRX_GRAPH_NODE_TYPE_INTERNAL_GRAPH = 5,
-+  HRX_GRAPH_NODE_TYPE_INTERNAL_ATOMIC_STORE =
-+      6 | HRX_GRAPH_NODE_TYPE_RECORDABLE_BIT,
- };
- typedef uint8_t hrx_graph_node_type_internal_t;
- 
-@@ -337,6 +339,11 @@
-   iree_hal_fill_flags_t flags;
- } hrx_graph_memset_node_attrs_internal_t;
- 
-+typedef struct hrx_graph_atomic_store_node_attrs_internal_t {
-+  iree_hal_buffer_ref_t target_ref;
-+  iree_hal_atomic_store_params_t params;
-+} hrx_graph_atomic_store_node_attrs_internal_t;
-+
- typedef struct hrx_graph_host_call_node_attrs_internal_t {
-   void (*fn)(void* user_data);
-   void* user_data;
-@@ -351,6 +358,7 @@
-     hrx_graph_memcpy_node_attrs_internal_t memcpy;
-     hrx_graph_memset_node_attrs_internal_t memset;
-     hrx_graph_host_call_node_attrs_internal_t host;
-+    hrx_graph_atomic_store_node_attrs_internal_t atomic_store;
-   } attrs;
-   struct hrx_graph_node_s* dependencies[];
- } hrx_graph_node_s;
 diff --git a/libhrx/src/libhrx/graph.c b/libhrx/src/libhrx/graph.c
+index b1f046d8a..ed4142946 100644
 --- a/libhrx/src/libhrx/graph.c
 +++ b/libhrx/src/libhrx/graph.c
-@@ -539,6 +539,69 @@
+@@ -539,6 +539,69 @@ hrx_status_t hrx_graph_add_fill_ptr_node(
    return status;
  }
  
@@ -139,9 +110,10 @@ diff --git a/libhrx/src/libhrx/graph.c b/libhrx/src/libhrx/graph.c
      hrx_graph_t graph, const hrx_graph_node_t* deps, size_t dep_count,
      const hrx_graph_host_call_node_attrs_t* attrs, hrx_graph_node_t* out_node) {
 diff --git a/libhrx/src/libhrx/graph_exec.c b/libhrx/src/libhrx/graph_exec.c
+index f095eed18..46fef3b7f 100644
 --- a/libhrx/src/libhrx/graph_exec.c
 +++ b/libhrx/src/libhrx/graph_exec.c
-@@ -327,6 +327,21 @@
+@@ -327,6 +327,21 @@ static iree_status_t hrx_graph_record_partition(
          }
          break;
        }
@@ -163,3 +135,62 @@ diff --git a/libhrx/src/libhrx/graph_exec.c b/libhrx/src/libhrx/graph_exec.c
        default: {
          status = iree_make_status(
              IREE_STATUS_INTERNAL,
+@@ -501,12 +516,22 @@ iree_status_t hrx_graph_exec_instantiate_locked(
+           command_buffer_mode |=
+               IREE_HAL_COMMAND_BUFFER_MODE_RETAIN_PROFILE_METADATA;
+         }
++        // Atomic store nodes need the ATOMIC category; other partitions keep
++        // their command buffers as before.
++        iree_hal_command_category_t categories =
++            IREE_HAL_COMMAND_CATEGORY_TRANSFER |
++            IREE_HAL_COMMAND_CATEGORY_DISPATCH;
++        for (uint32_t k = 0; k < partition->count; ++k) {
++          if (schedule.sorted_nodes[partition->start_index + k].node->type ==
++              HRX_GRAPH_NODE_TYPE_INTERNAL_ATOMIC_STORE) {
++            categories |= IREE_HAL_COMMAND_CATEGORY_ATOMIC;
++            break;
++          }
++        }
+         IREE_RETURN_AND_END_ZONE_IF_ERROR(
+             z0, iree_hal_command_buffer_create(
+                     iree_hal_queue_family(exec->device->dispatch_queue),
+-                    command_buffer_mode,
+-                    IREE_HAL_COMMAND_CATEGORY_TRANSFER |
+-                        IREE_HAL_COMMAND_CATEGORY_DISPATCH,
++                    command_buffer_mode, categories,
+                     /*binding_capacity=*/0, &command_buffer));
+         iree_status_t status = iree_hal_resource_set_insert(exec->resource_set,
+                                                             1, &command_buffer);
+diff --git a/libhrx/src/libhrx/hrx_internal.h b/libhrx/src/libhrx/hrx_internal.h
+index afc9b662a..e5afb9728 100644
+--- a/libhrx/src/libhrx/hrx_internal.h
++++ b/libhrx/src/libhrx/hrx_internal.h
+@@ -304,6 +304,8 @@ enum hrx_graph_node_type_internal_e {
+   HRX_GRAPH_NODE_TYPE_INTERNAL_MEMSET = 3 | HRX_GRAPH_NODE_TYPE_RECORDABLE_BIT,
+   HRX_GRAPH_NODE_TYPE_INTERNAL_HOST_CALL = 4,
+   HRX_GRAPH_NODE_TYPE_INTERNAL_GRAPH = 5,
++  HRX_GRAPH_NODE_TYPE_INTERNAL_ATOMIC_STORE =
++      6 | HRX_GRAPH_NODE_TYPE_RECORDABLE_BIT,
+ };
+ typedef uint8_t hrx_graph_node_type_internal_t;
+ 
+@@ -337,6 +339,11 @@ typedef struct hrx_graph_memset_node_attrs_internal_t {
+   iree_hal_fill_flags_t flags;
+ } hrx_graph_memset_node_attrs_internal_t;
+ 
++typedef struct hrx_graph_atomic_store_node_attrs_internal_t {
++  iree_hal_buffer_ref_t target_ref;
++  iree_hal_atomic_store_params_t params;
++} hrx_graph_atomic_store_node_attrs_internal_t;
++
+ typedef struct hrx_graph_host_call_node_attrs_internal_t {
+   void (*fn)(void* user_data);
+   void* user_data;
+@@ -351,6 +358,7 @@ typedef struct hrx_graph_node_s {
+     hrx_graph_memcpy_node_attrs_internal_t memcpy;
+     hrx_graph_memset_node_attrs_internal_t memset;
+     hrx_graph_host_call_node_attrs_internal_t host;
++    hrx_graph_atomic_store_node_attrs_internal_t atomic_store;
+   } attrs;
+   struct hrx_graph_node_s* dependencies[];
+ } hrx_graph_node_s;

@@ -17,8 +17,27 @@ repo="$(awk '$1 == "repo" { print $2 }' "$here/PIN")"
 ref="$(awk '$1 == "ref" { print $2 }' "$here/PIN")"
 patches=("$here"/patches/*.patch)
 
+# Every file the patches touch.
+patched_files() { cat "${patches[@]}" | sed -n 's|^+++ b/||p' | sort -u; }
+# Both missing, or the same bytes.
+same() { if [ -e "$1" ] || [ -e "$2" ]; then cmp -s "$1" "$2"; fi; }
+# The pin with every patch applied in order, as a git worktree of the checkout (removed on exit).
+expected="$hrx/build/patched-pin"
+make_expected() {
+  if [ -e "$expected" ]; then git -C "$hrx" worktree remove --force "$expected"; fi
+  git -C "$hrx" worktree add --quiet --detach "$expected" "$ref"
+  local p
+  for p in "${patches[@]}"; do
+    if ! git -C "$expected" apply "$p"; then
+      echo "hrx: $(basename "$p") does not apply to ${ref:0:9} after the patches before it; refresh it against the pin" >&2
+      return 1
+    fi
+  done
+}
+drop_expected() { if [ -e "$expected" ]; then git -C "$hrx" worktree remove --force "$expected"; fi; }
+
 check() {
-  local ok=0 p files
+  local ok=0 files
   if [ ! -d "$hrx/.git" ] && [ ! -f "$hrx/.git" ]; then
     echo "hrx: no checkout at $hrx (run engine/hrx/bootstrap.sh)"
     return 1
@@ -27,14 +46,17 @@ check() {
     echo "hrx: $hrx is at $(git -C "$hrx" rev-parse --short HEAD), the pin is ${ref:0:9}"
     ok=1
   fi
-  for p in "${patches[@]}"; do
-    if ! git -C "$hrx" apply --check --reverse "$p" 2>/dev/null; then
-      echo "hrx: not applied: $(basename "$p")"
+  # Patches stack (a later one may edit an earlier one's lines), so compare the patched files with the pin plus every
+  # patch applied in order instead of reverse-applying each patch alone.
+  local f
+  for f in $(patched_files); do
+    if ! same "$hrx/$f" "$expected/$f"; then
+      echo "hrx: differs from the pin + patches: $f"
       ok=1
     fi
   done
   # Edits outside the patches make a build nobody else can reproduce.
-  files="$(cat "${patches[@]}" | sed -n 's|^+++ b/||p' | sort -u)"
+  files="$(patched_files)"
   local extra
   extra="$(git -C "$hrx" status --porcelain | awk '{ print $2 }' | sort -u | comm -23 - <(echo "$files"))"
   if [ -n "$extra" ]; then
@@ -47,8 +69,12 @@ check() {
 }
 
 if [ "${1:-}" = "--check" ]; then
-  check
-  exit $?
+  if [ ! -d "$hrx/.git" ] && [ ! -f "$hrx/.git" ]; then check; exit $?; fi
+  make_expected || { drop_expected; exit 1; }
+  status=0
+  check || status=$?
+  drop_expected
+  exit "$status"
 fi
 
 if [ ! -e "$hrx" ]; then
@@ -63,14 +89,17 @@ if [ "$(git -C "$hrx" rev-parse HEAD)" != "$ref" ]; then
   git -C "$hrx" rev-parse --verify --quiet "$ref^{commit}" >/dev/null || git -C "$hrx" fetch --quiet origin
   git -C "$hrx" checkout --quiet --detach "$ref"
 fi
-for p in "${patches[@]}"; do
-  if git -C "$hrx" apply --check --reverse "$p" 2>/dev/null; then
-    echo "hrx: already applied: $(basename "$p")"
-  elif git -C "$hrx" apply "$p"; then
-    echo "hrx: applied: $(basename "$p")"
+# Bring every patched file to the pin + patches (a file already there is left alone).
+make_expected || { drop_expected; exit 1; }
+for f in $(patched_files); do
+  if same "$hrx/$f" "$expected/$f"; then continue; fi
+  if [ -e "$expected/$f" ]; then
+    mkdir -p "$(dirname "$hrx/$f")"
+    cp "$expected/$f" "$hrx/$f"
+    echo "hrx: patched: $f"
   else
-    echo "hrx: $(basename "$p") does not apply to ${ref:0:9}; refresh it against the pin" >&2
-    exit 1
+    git -C "$hrx" rm --quiet --force --ignore-unmatch -- "$f"
+    echo "hrx: removed (the patches delete it): $f"
   fi
 done
 
@@ -95,4 +124,7 @@ fi
 ninja -C "$build" libhrx/src/libhrx/libhrx.so libhrx/src/binding/hip/libamdhip64.so \
   loom/src/loom/tools/iree-run-loom/iree-run-loom loom/src/loom/tools/loom-compile/loom-compile \
   runtime/src/iree/tools/iree-profile/iree-profile experimental/xdna/iree-xdna-run
-check
+status=0
+check || status=$?
+drop_expected
+exit "$status"
