@@ -114,7 +114,7 @@ engine/run/gpu_run.sh serve -- engine/build/yah_server --model <gguf> --prefill 
 engine/build/yah_server --model <gguf> --fake    # canned replies, CPU only: for clients and API tests
 ```
 
-A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is a partial one: its GEMMs run only the 256-token tiles that hold real tokens, so it costs about 0.25 s plus 0.36 s per 256 tokens (an 18-token prompt: 0.63 s to the first token). Tails of a few tokens go through decode steps instead (about 62 ms per token). Greedy decode runs two steps ahead of the host: each argmax feeds the next step on the GPU, and the host only reads the tokens (a host-mapped copy) to stream them and stop. `loom_forward_pp` takes any token count the same way.
+A prompt runs as prefill chunks of 2048 tokens. When it ends inside a chunk, the last chunk is a partial one: its GEMMs run only the 256-token tiles that hold real tokens, so it costs about 0.25 s plus 0.36 s per 256 tokens (an 18-token prompt: 0.63 s to the first token). Tails of a few tokens go through decode steps instead (about 62 ms per token). Decode runs two steps ahead of the host: each step picks its token on the GPU (argmax, or for `temperature` > 0 `yah_dec_sample`: softmax at T cut to the top-p nucleus, an exact draw by Gumbel-max, ~1 ms) into the token stream the next step reads, and the host only reads the tokens (a host-mapped copy) to stream them and stop. A given seed draws other tokens than the earlier host sampler did; the distribution is the same. `loom_forward_pp` takes any token count the same way.
 
 For quick tests, `engine/build/yah_chat` is a terminal chat client: it streams the reply (reasoning dimmed), keeps the conversation, and prints token counts, time to first token and tok/s after each reply. Commands: `/reset`, `/effort E`, `/temp T`, `/max N`, `/system TEXT`, `/quit`; Ctrl-C stops a reply.
 
@@ -166,6 +166,7 @@ It checks the C++ chat template byte for byte against `engine/serve/testdata/cha
 | `cmp` of every emitted HAL | byte identity of an emit | every refactor or cleanup of a generator |
 | `tools/gemv_check.py <gguf> <work> [kind ...]` | every decode GEMV (format, K) against a float64 gguf-py oracle through `hal_run` | GEMV changes |
 | `tools/dattn_check.py <gguf> <work> [T] [pos]` | fp16 decode attention against numpy, scrambled page table | decode attention changes |
+| `tools/sample_check.py <gguf> <work> [draws]` | the decode sampler against a numpy model of it (token for token), the model against the exact top-p distribution | sampler changes |
 | `tools/dattn_q_check.py <gguf> <work> 8\|4\|kb,vb [T] [pos]` | quantized decode attention and the appends against numpy models of the formats | quantized KV changes |
 | `engine/run/gate/` (`gate_run.sh`, `accgate2.py`) | tiered accuracy gate on wikitext windows, all-position logits (`YAH_LOGITS_FROM`): T1 rounding level, T2 quantization level. See `engine/run/gate/README.md` | any numerics change |
 | `engine/run/kvq/` (`run_rowstats.sh`, `gate2.py`, `needle_score.py`) | KV format quality at 32K: long-document KL / dPPL with bootstrap CIs and multi-key retrieval, from `YAH_ROWSTATS` row stats of an fp16-KV reference set and a `YAH_KV` candidate set. See `engine/run/kvq/README.md` | KV format work |

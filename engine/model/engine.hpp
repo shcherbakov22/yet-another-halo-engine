@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -16,7 +15,6 @@
 #include <functional>
 #include <iterator>
 #include <memory>
-#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -62,7 +60,6 @@ class Engine : public TextGenerator {
     const void* th = nullptr;
     tokens_mirror_ = gpu_.AllocateHost((std::size_t{decoder_.context()} + 1) * 4, &th);
     tokens_host_ = static_cast<const std::uint32_t*>(th);
-    host_logits_.resize(LoomPrefill::kVocab);
     const core::MetadataValue* name = gguf_.Meta("general.name");
     name_ = name && !name->s.empty() ? name->s : "qwen3.8-27b";
   }
@@ -81,8 +78,8 @@ class Engine : public TextGenerator {
     if (std::uint64_t{n} + params.max_tokens > context()) throw LoomError("engine: prompt + max_tokens exceeds context");
     GenerateResult r;
     r.prompt_tokens = n;
-    std::mt19937_64 rng(params.sampling.seed ? params.sampling.seed
-                                             : static_cast<std::uint64_t>(t0.time_since_epoch().count()));
+    const std::uint64_t seed =
+        params.sampling.seed ? params.sampling.seed : static_cast<std::uint64_t>(t0.time_since_epoch().count());
     const bool greedy = params.sampling.temperature <= 0.0f;
 
     // Prompt: whole chunks through the prefill; the tail as one more partial chunk or through decode steps, whichever
@@ -114,48 +111,43 @@ class Engine : public TextGenerator {
       Track(chunk_ms_, (std::chrono::steady_clock::now() - tc) / ChunkShare(valid), c + 1 == chunks);
     }
     prefill_.Collect();
+    // Every token, greedy or sampled (LoomDecoder::SetSampling), is picked on the GPU into the decoder's token stream,
+    // which the next step reads, so the steps run kAhead ahead of the token the host reads; made[i] marks the copy of
+    // the host's next token + i into tokens_host_. At most kAhead steps past a stop run for nothing.
+    decoder_.SetSampling(params.sampling.temperature, params.sampling.top_p, seed);
     const bool tail_steps = tail && !tail_chunk;
     const auto ts = std::chrono::steady_clock::now();
     if (tail_steps) {
       decoder_.SetTokens(prompt.data() + full, tail, full);
-      for (std::uint32_t pos = full; pos < n; ++pos) decoder_.Step(pos, n);   // the last argmax goes to token n
+      for (std::uint32_t pos = full; pos < n; ++pos) decoder_.Step(pos, n);   // the last one picks token n
     } else {
       decoder_.ResumeAt(n);
+      if (greedy)
+        prefill_.Argmax(Ref(logits_), decoder_.TokenRef(n));
+      else
+        decoder_.Sample(Ref(logits_), n - 1, decoder_.TokenRef(n));
     }
-    // Greedy: every argmax goes to the decoder's token stream, which the next step reads, so the steps run kAhead ahead
-    // of the token the host reads; made[i] marks the copy of the host's next token + i into tokens_host_. At most
-    // kAhead steps past a stop run for nothing.
     std::deque<LoomEvent> made;
-    core::TokenId tok = 0;
-    if (greedy) {
-      if (!tail_steps) prefill_.Argmax(Ref(logits_), decoder_.TokenRef(n));
-      made.push_back(MarkToken(n));
-    } else {
-      tok = Pick(params.sampling, rng, tail_steps);
-      if (tail_steps) Track(step_ms_, (std::chrono::steady_clock::now() - ts) / tail, true);
-    }
+    made.push_back(MarkToken(n));
     auto t1 = std::chrono::steady_clock::now();
-    r.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     // Decode: report each token, then run the step that consumes it.
     r.finish_reason = "length";
-    std::uint32_t queued = n;  // greedy: the next step to queue
+    std::uint32_t queued = n;  // the next step to queue
     for (std::uint32_t pos = n;; ++pos) {
-      if (greedy) {
-        for (; queued < pos + kAhead && queued + 1 < n + params.max_tokens && queued < decoder_.context(); ++queued) {
-          decoder_.Step(queued, n);
-          made.push_back(MarkToken(queued + 1));
-        }
-        if (made.empty()) throw LoomError("decoder: position past the set's context");
-        gpu_.Wait(made.front());
-        made.pop_front();
-        tok = __atomic_load_n(&tokens_host_[pos], __ATOMIC_ACQUIRE);
-        if (tok >= LoomDecoder::kVocab) throw LoomError("decoder: token id out of range: " + std::to_string(tok));
-        if (pos == n) {   // the first token: the prompt's time ends here
-          if (tail_steps) Track(step_ms_, (std::chrono::steady_clock::now() - ts) / tail, true);
-          t1 = std::chrono::steady_clock::now();
-          r.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        }
+      for (; queued < pos + kAhead && queued + 1 < n + params.max_tokens && queued < decoder_.context(); ++queued) {
+        decoder_.Step(queued, n);
+        made.push_back(MarkToken(queued + 1));
+      }
+      if (made.empty()) throw LoomError("decoder: position past the set's context");
+      gpu_.Wait(made.front());
+      made.pop_front();
+      const core::TokenId tok = __atomic_load_n(&tokens_host_[pos], __ATOMIC_ACQUIRE);
+      if (tok >= LoomDecoder::kVocab) throw LoomError("decoder: token id out of range: " + std::to_string(tok));
+      if (pos == n) {   // the first token: the prompt's time ends here
+        if (tail_steps) Track(step_ms_, (std::chrono::steady_clock::now() - ts) / tail, true);
+        t1 = std::chrono::steady_clock::now();
+        r.prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
       }
       if (std::find(params.stop_ids.begin(), params.stop_ids.end(), tok) != params.stop_ids.end()) {
         r.finish_reason = "stop";
@@ -167,10 +159,6 @@ class Engine : public TextGenerator {
         break;
       }
       if (r.generated_tokens >= params.max_tokens) break;
-      if (greedy) continue;
-      decoder_.SetTokens(&tok, 1, pos);
-      decoder_.Step(pos, pos);
-      tok = Pick(params.sampling, rng, /*from_decoder=*/true);
     }
     r.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
     if (r.generated_tokens > 1) step_ms_ = 0.8 * step_ms_ + 0.2 * r.decode_ms / (r.generated_tokens - 1);
@@ -179,7 +167,7 @@ class Engine : public TextGenerator {
 
  private:
   static hrx_buffer_ref_t Ref(const LoomBuffer& b) { return {b.handle, 0, b.size}; }
-  // Greedy decode steps queued ahead of the token the host reads: the next step is queued while the current one runs.
+  // Decode steps queued ahead of the token the host reads: the next step is queued while the current one runs.
   static constexpr std::uint32_t kAhead = 2;
   // Copies token pos of the decoder's stream to tokens_host_ and marks it.
   LoomEvent MarkToken(std::uint32_t pos) {
@@ -219,44 +207,6 @@ class Engine : public TextGenerator {
     if (synced) est = 0.8 * est + 0.2 * std::chrono::duration<double, std::milli>(elapsed).count();
   }
 
-  // The next sampled token (not greedy: Generate runs greedy decode ahead on the GPU), from the logits on the host.
-  // from_decoder: the decoder's last step produced the logits, else the prefill's head.
-  core::TokenId Pick(const SamplingParams& s, std::mt19937_64& rng, bool from_decoder) {
-    gpu_.Synchronize();
-    if (from_decoder)
-      decoder_.CopyLogits(host_logits_.data());
-    else
-      gpu_.D2H(logits_, host_logits_.data(), host_logits_.size() * 4);
-    return Sample(host_logits_, s, rng);
-  }
-
-  // Temperature + nucleus (top_p) sampling over the full vocabulary.
-  static core::TokenId Sample(const std::vector<float>& logits, const SamplingParams& s, std::mt19937_64& rng) {
-    const float inv_t = 1.0f / s.temperature;
-    const float mx = *std::max_element(logits.begin(), logits.end());
-    // Tokens below 1e-9 of the top probability cannot matter for any top_p; skip them to keep the sort small.
-    const float cut = mx - std::log(1e9f) * s.temperature;
-    std::vector<std::pair<float, core::TokenId>> c;
-    for (core::TokenId i = 0; i < logits.size(); ++i)
-      if (logits[i] >= cut) c.push_back({std::exp((logits[i] - mx) * inv_t), i});
-    std::sort(c.begin(), c.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    double total = 0.0;
-    for (const auto& p : c) total += p.first;
-    if (s.top_p < 1.0f) {
-      double keep = 0.0;
-      std::size_t k = 0;
-      while (k < c.size() && keep < s.top_p * total) keep += c[k++].first;
-      c.resize(std::max<std::size_t>(k, 1));
-      total = keep;
-    }
-    double u = std::uniform_real_distribution<double>(0.0, total)(rng);
-    for (const auto& p : c) {
-      u -= p.first;
-      if (u <= 0.0) return p.second;
-    }
-    return c.back().second;
-  }
-
   core::Gguf gguf_;
   core::Qwen35Config cfg_;
   core::Tokenizer tokenizer_;
@@ -269,7 +219,6 @@ class Engine : public TextGenerator {
   const std::uint32_t* tokens_host_ = nullptr;  // its mapping
   Tail tail_ = Tail::kAuto;
   double chunk_ms_ = 3100.0, step_ms_ = 62.0;  // prefill chunk and decode step costs (pp2048, short context)
-  std::vector<float> host_logits_;
   std::string name_;
 };
 

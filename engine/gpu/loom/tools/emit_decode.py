@@ -168,6 +168,7 @@ def main():
     emit_src(DM.gen_deltanet(), "deltanet_conv", outdir)   # also runs the decode conv
     emit_src(DM.gen_embed_iq4xs(), "embed", outdir)      # token_embd row from the device token stream
     emit_file(L("yah_argmax_f32.loom"), "argmax", outdir, ["yah_argmax.vocab=248320"])
+    emit_src(DM.gen_sample(), "sample", outdir)          # temperature / top-p sampling into the token stream
     for f in os.listdir(os.path.join(LOOM, "tables")):
         shutil.copy(os.path.join(LOOM, "tables", f), os.path.join(outdir, f))
     open(os.path.join(outdir, "decode.txt"), "w").write(
