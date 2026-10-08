@@ -429,56 +429,65 @@ def body(L, cfg, role, ks, a_adv, acap):
         if nxt:   # loads go through pl, so pc steps after the stores (one fewer live pointer)
             e(f"  %plc{t + 1} = copy {pl[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
             e(f"  %pl{t + 1} = padds.modifier %plc{t + 1}, %mls")
+        late = row_end and nxt   # the convert runs between the stores and the next C loads
         for c in range(4):
             for q in range(4):
-                if nxt:
+                if nxt and not late:
                     e(f"  %l{t + 1}_{c}_{q} = vlda.acc {pl[t + 1]}, {256 * c + 64 * q - 512}")
                 e(f"  %o{t}_{c}_{q} = slice {cur[c]}[{q}] : reg<aie2p.mbms x4> -> reg<aie2p.mbms>")
                 e(f"  vst.acc %o{t}_{c}_{q}, {pc[t]}, {256 * c + 64 * q - 512}")
-        def convert(base, back, group):
+        def convert(base, lp, back):
             """Last pass: pack the segment's f32 C (NP sub-tiles) in place to bf16 in its first half, which the C ring sends
-            (LOOM_EXP_LS_SEND_PITCH=2). base is a store pointer back bytes past the segment's slot + 512. No pointer
-            register is free here, so base itself walks the destination and is rebuilt for the join. group: quarters in
-            flight (the free accumulator registers). Returns the join's pointer, which replaces base."""
+            (LOOM_EXP_LS_SEND_PITCH=2). base is a store pointer back bytes past the segment's slot + 512; on a last pass the C
+            load pointer lp equals it, so lp walks the f32 source (post-increment loads) while base walks the bf16
+            destination (post-increment stores); both are rebuilt for the join.
+            It runs between a sub-tile's C stores and the next C loads, so all accumulators are free and loads run 16 ahead.
+            Returns the join's (base, lp)."""
             e(f"  low.cond_br %clast, ^cv{t}, ^nc{t} : reg<aie2p.er>")
             e(f"^nc{t}:")
-            e(f"  low.br ^cj{t}({base}: reg<aie2p.ep>)")
+            e(f"  low.br ^cj{t}({base}: reg<aie2p.ep>, {lp}: reg<aie2p.ep>)")
             e(f"^cv{t}:")
-            # per sub-tile b the destination pointer is fixed at slot + 512 b + 256 (stores at 32 j - 256), so the 16 loads
-            # (index 512 b + 64 j - 256) do not wait on the stores; it advances once per sub-tile
-            cur_p, k, fwd, back = base, 0, back + 256 - 512 * (NP - 1), back + 256
-            while back > 0:
-                step = min(back, 448)
-                back -= step
-                e(f"  %cvb{t}_{k} = padda {cur_p}, {-step}")
-                cur_p, k = f"%cvb{t}_{k}", k + 1
-            for b_ in range(NP):
-                for g0 in range(0, 16, group):   # loads in flight: the free accumulator registers
-                    for j in range(g0, g0 + group):
-                        e(f"  %cvo{t}_{b_}_{j} = mov.static-byte-offset {512 * b_ + 64 * j - 256}")
-                        e(f"  %cvx{t}_{b_}_{j} = mov.address-index %cvo{t}_{b_}_{j}")
-                        e(f"  %cvl{t}_{b_}_{j} = vlda.acc.index {cur_p}, %cvx{t}_{b_}_{j}")
-                    for j in range(g0, g0 + group):
-                        e(f"  vst.convert.f32x16.to.bf16x16 %cvl{t}_{b_}_{j}, {cur_p}, {32 * j - 256}")
-                if b_ + 1 < NP:
-                    bump(L, f"%cvp{t}_{b_}", cur_p, 512)
-                    cur_p = f"%cvp{t}_{b_}"
-            bump(L, f"%cvr{t}", cur_p, fwd)
-            e(f"  low.br ^cj{t}(%cvr{t}: reg<aie2p.ep>)")
-            e(f"^cj{t}(%cj{t}p: reg<aie2p.ep>):")
+            d, k, rest = base, 0, back + 512
+            while rest > 0:
+                step = min(rest, 448)
+                rest -= step
+                e(f"  %cvb{t}_{k} = padda {d}, {-step}")
+                d, k = f"%cvb{t}_{k}", k + 1
+            e(f"  %cvs{t}_0 = copy {d} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            s_ = f"%cvs{t}_0"
+            n = 16 * NP
+
+            def load(i):
+                nonlocal s_
+                e(f"  %cvl{t}_{i}, %cvs{t}_{i + 1} = vlda.acc.post {s_}, 64")
+                s_ = f"%cvs{t}_{i + 1}"
+            for i in range(16):
+                load(i)
+            for i in range(n):
+                e(f"  %cvd{t}_{i} = vst.convert.f32x16.to.bf16x16.post %cvl{t}_{i}, {d}, 32")
+                d = f"%cvd{t}_{i}"
+                if i + 16 < n:
+                    load(i + 16)
+            bump(L, f"%cvr{t}", d, back + 512 - 32 * n)
+            e(f"  %cvq{t} = copy %cvr{t} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            e(f"  low.br ^cj{t}(%cvr{t}: reg<aie2p.ep>, %cvq{t}: reg<aie2p.ep>)")
+            e(f"^cj{t}(%cj{t}p: reg<aie2p.ep>, %cj{t}l: reg<aie2p.ep>):")
             e(f"  %cqr{t} = copy %clast : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
             e(f"  rel.cond %one, %cqr{t}, 2")
-            return f"%cj{t}p"
+            return f"%cj{t}p", f"%cj{t}l"
         if row_end and not nxt:
-            pc[t] = convert(pc[t], 1024 * (NP - 1), 16)
+            pc[t], pl[t] = convert(pc[t], pl[t], 1024 * (NP - 1))
         if nxt:
             e(f"  %pcc{t + 1} = copy {pc[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
             e(f"  %pc{t + 1} = padds.modifier %pcc{t + 1}, %mcs")
+            if late:   # from the next store pointer, so this one is dead
+                pc[t + 1], pl[t + 1] = convert(pc[t + 1], pl[t + 1], 1024 * NP)
+                for c in range(4):
+                    for q in range(4):
+                        e(f"  %l{t + 1}_{c}_{q} = vlda.acc {pl[t + 1]}, {256 * c + 64 * q - 512}")
             for c in range(4):
                 e(f"  %z{t + 1}_{c} = concat(%l{t + 1}_{c}_0, %l{t + 1}_{c}_1, %l{t + 1}_{c}_2, %l{t + 1}_{c}_3) : {MBMS4}")
                 cur[c] = f"%z{t + 1}_{c}"
-            if row_end:   # from the next store pointer, so this one is dead
-                pc[t + 1] = convert(pc[t + 1], 1024 * NP, 4)   # the next sub-tile's C holds 16 of 20
     e("  rel %one, 0")
     e("  %pac = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>")
     e(f"  %pan0 = padds.modifier %pac, {'%mf' if a_adv else '%mz'}")
