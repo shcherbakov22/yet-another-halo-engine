@@ -55,18 +55,22 @@ class Config:
 
 
 # NPU-side gate (cfg.gate = supply): column 0's head waits for each job's ready word itself and its neighbor mid relays.
-# Extra bindings: 3 flag (read; 16-byte record, word 0 ready = job sequence * 64 + its calls), 4 tick (write; scratch),
-# 5 signal (write; go at byte 0, done at byte 16). After its last firing of a job the head polls request-driven
-# (constrain.request: one fresh flag read per tick) until ready >= (its job count + 1) * 64 (jobs count from 1 after the
+# Extra bindings: 3 flag (read; 16-byte record, word 0 ready = the job's gate value), 4 tick (write; scratch), 5 signal
+# (write; go at byte 0, done at byte 16). After its last firing of a job the head polls request-driven
+# (constrain.request: one fresh flag read per tick) until ready >= (its job count + 1) * GATE_CALLS (jobs count from 1 after the
 # setup call; jobs sharing a ready word store theirs in order, after the GPU joined the earlier ones), backing off (pace =
 # GP0 + GPS * max(0, polls - 64) delay iterations; a supply of 1024 polls lasts ~100 ms). It hands [seq, status, polls,
 # ncalls] to the mid over a leaf-synchronized neighbor channel and ticks / reads out the rest of the supply GB records per
 # firing of the next job. The mid emits go and done (constrain.signal + constrain.gate): the control program's gate
 # invocation waits for go before any data moves; its done invocation queues done after the job's egress, so done lands
-# after C. done = the job's ready value, with bit 31 set if the head gave up (status 2). Job state (firings done, firings per job, leftover
+# after C. done = the job's ready value, with GATE_FAILED set if the head gave up (status 2). Job state (firings done, firings per job, leftover
 # supply, pending reads, sequence) lives in private storage, which the array setup of a core stream plan zeroes; a job of
 # N calls is N * nb * passes firings, and before the first gated job (state zero) it is one call: the setup call's.
 GP0, GPS, GB = 650, 26, 8
+# The protocol the host follows (dispatch.txt "npugate <GATE_SUPPLY> <GATE_CALLS> <GATE_RECORD>"): a job's gate value is
+# sequence * GATE_CALLS + its calls (jobs of 1 .. GATE_CALLS - 1 calls); done lands GATE_RECORD bytes into the signal
+# binding. GATE_FAILED in done: the head gave up (the host sets it too for a failed command; gen_npu_unpack.GATED_LOOP).
+GATE_SUPPLY, GATE_CALLS, GATE_RECORD, GATE_FAILED = 1024, 64, 16, 1 << 31
 
 
 def groups(cfg):
@@ -383,8 +387,8 @@ def gate_epilogue(L, cfg, gate):
         e("^gld:")
         # the wait for ready >= seq + 1
         e("  %gnext = add.rr %gseq, %g1")
-        e("  %g64 = mov.i32 64")
-        e("  %gexp = mul %gnext, %g64")   # ready = sequence * 64 + calls
+        e(f"  %g64 = mov.i32 {GATE_CALLS}")
+        e("  %gexp = mul %gnext, %g64")   # ready = sequence * GATE_CALLS + calls
         e(f"  %gsup = mov.i32 {S}")
         e("  %gfast = mov.i32 64")
         e(f"  %gp0 = mov.i32 {GP0}")
@@ -450,7 +454,7 @@ def gate_epilogue(L, cfg, gate):
         e("  mov.ms %gpol")
         e("  mov.ms %g0")
         e("  %gbad = lt %g1, %gsts")
-        e("  %gfb = mov.i32 -2147483648")   # bit 31: the waiter gave up
+        e(f"  %gfb = mov.i32 {GATE_FAILED - (1 << 32)}")   # the waiter gave up
         e("  %gmark = mul %gbad, %gfb")
         e("  %gdone = add.rr %gexp, %gmark")
         e("  mov.ms %gdone")

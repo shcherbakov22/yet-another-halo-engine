@@ -13,10 +13,12 @@
 
 namespace yah::model {
 
-// Sizes of the GPU buffers shared with the NPU (LoomPrefill::npu_plan).
+// Sizes of the GPU buffers shared with the NPU and the gate protocol of the set's NPU image (LoomPrefill::npu_plan).
 struct NpuPlan {
   std::size_t a_bytes = 0, w_bytes = 0, c_bytes = 0;  // encoded activations, encoded weight panels, f32 C panels
-  std::uint32_t gate = 0;  // polls per job of a gated image (dispatch.txt "npugate"; 0: the relay waits)
+  // dispatch.txt "npugate <supply> <calls> <record>" (gen_npu_gemm GATE_*): a job's gate value is sequence * gate_calls
+  // + its calls; done lands gate_record bytes into a call's signal binding.
+  std::uint32_t gate_calls = 0, gate_record = 0;
 };
 
 // A byte range of A, W or C.
@@ -32,27 +34,28 @@ class NpuSplit {
   [[nodiscard]] virtual const LoomBuffer& C() const = 0;
   // One call of the NPU GEMM image at path on these views (cold: loads and binds; the same arguments return the same id).
   virtual std::uint32_t Bind(const std::string& image, NpuView a, NpuView w, NpuView c) = 0;
-  // The prefill graph and the relay hand jobs over through 32-bit words in host memory (one graph per chunk).
-  // Flags(): the GPU view of the words. Word kFlagStatus is set by a GPU wait that timed out.
-  static constexpr std::uint32_t kFlagStatus = 1, kFlagFirstJob = 2;
+  // Handoffs are 32-bit words in host memory (Flags(): their GPU view), with no host between the GPU and the NPU.
+  // The graph stores a job's gate value to its ready word once the job's inputs are written (release, system scope).
+  // The NPU image waits for it (gen_npu_gemm GATE), runs the calls and writes the value to the job's done word.
+  // The graph's yah_npu_flag_wait polls done.
+  // Failure: done with kGateFailed (the NPU gave up waiting, or the host saw its command fail) sets word kFlagStatus.
+  // So does a GPU wait that timed out. It is sticky: every later wait returns at once, and the host reports it.
+  // Bounds: the NPU gives up after gen_npu_gemm.GATE_SUPPLY polls (~100 ms, below the driver's 2000 ms command limit,
+  // amdxdna tdr_timeout_ms); a GPU wait after gen_npu_unpack.FLAG_WAIT_POLLS (~2 s, far beyond any NPU job).
+  static constexpr std::uint32_t kFlagStatus = 1, kGateFailed = 0x80000000u;
   [[nodiscard]] virtual const LoomBuffer* Flags() const = 0;
-  [[nodiscard]] virtual std::uint32_t FlagWords() const = 0;
   [[nodiscard]] virtual std::uint32_t Word(std::uint32_t word) const = 0;
-  // The calls in order once word ready holds epoch (the graph stores it); then the relay stores epoch to word done,
-  // also when the NPU failed, so no GPU wait is left spinning. tag names the job in the stats.
-  virtual void EnqueueFlagged(const std::vector<std::uint32_t>& calls, const std::string& tag, std::uint32_t ready,
-                              std::uint32_t done, std::uint32_t epoch) = 0;
-  // A gated image (NpuPlan::gate) waits for its jobs itself: no relay between the GPU and the NPU. A job's ready word
-  // is its first call's, its done word its last call's (GateWords: {ready, done}); the graph stores the job's gate value
-  // (NextGate: sequence * 64 + calls, jobs counting from 1 in queue order) to ready, the NPU writes it to done (bit 31:
-  // the NPU gave up). EnqueueFlagged then takes the gate value as epoch and queues the job at once.
-  // Stores value to done word: ends the GPU's wait for a job that will never run (a gated value with bit 31, so the wait
-  // reports it). For a chunk graph already launched when queueing its jobs failed.
-  virtual void Release(std::uint32_t done, std::uint32_t value) = 0;
-  [[nodiscard]] virtual bool Gated() const = 0;
-  virtual std::uint32_t NextGate(const std::vector<std::uint32_t>& calls) = 0;
-  [[nodiscard]] virtual std::pair<std::uint32_t, std::uint32_t> GateWords(
-      const std::vector<std::uint32_t>& calls) const = 0;
+  // A job's flag words (its first call's ready, its last call's done) and gate value.
+  struct Job {
+    std::uint32_t ready = 0, done = 0, gate = 0;
+  };
+  // The next job, of these calls (jobs count from 1 in queue order; the NPU counts them too).
+  virtual Job NewJob(const std::vector<std::uint32_t>& calls) = 0;
+  // Queues the job at once: the NPU waits for its ready word itself. tag names the job in the stats.
+  virtual void Enqueue(const std::vector<std::uint32_t>& calls, const std::string& tag, const Job& job) = 0;
+  // Ends the GPU's wait for a job that will never run (done = gate | kGateFailed).
+  // For a launched chunk graph whose jobs failed to queue.
+  virtual void Release(const Job& job) = 0;
 };
 
 }  // namespace yah::model

@@ -631,10 +631,9 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
 # "convkq_c.hal", which reads C itself). dispatch.txt: "npusplit_<site> <rows> 0 0", "npubytes_<K> <A>
 # <W per call> <C per call>", and per kernel "<hal> <workgroups> <workgroup size> 0" (the split GEMMs have GEMM rows).
 NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("YAH_NPU_SPLIT", "").split(",") if x))
-# NPU-side gate (YAH_NPU_GATE=<polls per job>, e.g. 1024; HRX patch 0016): the NPU image waits for each job's ready word
-# itself (gen_npu_gemm GATE), so no host relay sits between the GPU and the NPU. dispatch.txt: "npugate <polls> 0 0", and
-# npu_flag_wait.hal waits for a done word at least the job's sequence (gen_npu_unpack.gen_flag_wait gated).
-NPU_GATE = int(os.environ.get("YAH_NPU_GATE", "0"))
+# The NPU image waits for each job's ready word itself (gen_npu_gemm GATE, HRX patch 0016): no host relay sits between
+# the GPU and the NPU. dispatch.txt: "npugate <supply> <calls> <record>" (gen_npu_gemm GATE_*), and npu_flag_wait.hal
+# waits for a job's done word (gen_npu_unpack.gen_flag_wait).
 NPU_KS = GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
 NPU_ROWS = 8 * GN.TN   # output rows per NPU call (8 columns)
 NPU_SITES = {"qkv": ("kstore", 640, 20), "gate": ("kstore", 384, 20), "q": ("kqg", 768, 20), "out": ("kres", 320, 24),
@@ -865,18 +864,17 @@ def npu_split(rows, combos, B, outdir):
             out.append(("convkq_g.hal", gen_conv_kq.tiles(N - n), 256, 0))
             out.append(("convkq_c.hal", n // gen_conv_kq.CW, gen_conv_kq.CW, B // gen_conv_kq.TC))
         out.append(("npusplit_" + site, n, 0, 0))
-    # one graph per chunk (YAH_NPU_ONEGRAPH): the GPU waits for each NPU job on a flag word (gen_npu_unpack.gen_flag_wait)
+    # one graph per chunk: the GPU waits for each NPU job on a flag word (gen_npu_unpack.gen_flag_wait)
     src = os.path.join(tmp, "npu_flag_wait.loom")
-    open(src, "w").write(GU.gen_flag_wait(gated=NPU_GATE > 0))
+    open(src, "w").write(GU.gen_flag_wait())
     E.emit(src, ["nop=0"], "npu_flag_wait.hal", outdir)
     out.append(("npu_flag_wait.hal", 1, 32, 0))
-    if NPU_GATE:
-        out.append(("npugate", NPU_GATE, 0, 0))
+    out.append(("npugate", GN.GATE_SUPPLY, GN.GATE_CALLS, GN.GATE_RECORD))
     # NPU images, one per pass count
     env = dict(hrx_paths.env(), **GN.LOOM_ENV)
     for passes in sorted({p for s in NPU_SPLIT for _, p in npu_chunks(s)}):
         K = 1024 * passes
-        cfg = GN.Config(8, B // 64, NPU_KS, passes, gate=NPU_GATE)
+        cfg = GN.Config(8, B // 64, NPU_KS, passes, gate=GN.GATE_SUPPLY)
         src = os.path.join(tmp, "npu_gemm_%d.loom" % K)
         open(src, "w").write(GN.gen(cfg))
         r = subprocess.run([hrx_paths.LOOM_COMPILE, src, "--root=@" + cfg.entry,

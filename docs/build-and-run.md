@@ -61,7 +61,7 @@ Emitters run on the CPU and take a few minutes. Paths below are relative to `eng
 | prefill, one pass of B tokens | `python3 tools/emit_prefill_pp.py <gguf> <dir> 2048` (B must be a multiple of 256) |
 | prefill, chunked, context T | `YAH_CTX=32768 python3 tools/emit_prefill_pp.py <gguf> <dir> 2048` (chunk 2048, pools for 32768 tokens; T a multiple of B) |
 | prefill with kv8a16 / kv4a16 | add `YAH_KV=kv8` or `YAH_KV=kv4` (or mixed `k8v4`, `k4v8`; `k8` / `v4` alone quantize one side, prefill only) |
-| prefill with the NPU column split | add `YAH_NPU_SPLIT=qkv=4480,gate=2560,q=5120,out=2560,down=2560,ffn=7680` (NPU rows per site, multiples of 640, q of 2560; any subset; see `emit_prefill_pp.npu_split`) and `YAH_NPU_GATE=1024` (the NPU waits for its inputs itself, no host relay; omit for the relay); run `loom_forward_pp` with `YAH_NPU=1` (full 2048-token chunks; AC power and `power_dpm_force_performance_level=high`, see results.md) |
+| prefill with the NPU column split | add `YAH_NPU_SPLIT=qkv=4480,gate=2560,q=5120,out=2560,down=2560,ffn=7680` (NPU rows per site, multiples of 640, q of 2560; any subset; see `emit_prefill_pp.npu_split`); run `loom_forward_pp` with `YAH_NPU=1` (full 2048-token chunks; AC power and `power_dpm_force_performance_level=high`, see results.md) |
 | decode | `python3 tools/emit_decode.py <gguf> <dir> <max_context>` (multiple of 256, default 4096) |
 | decode after a prefill | same, with `max_context` = the prefill set's context and the same `YAH_KV` |
 
@@ -209,7 +209,7 @@ Rules:
 5. Never bind a buffer smaller than the kernel's declared footprint. The prefill emitter runs `tools/footprint_gate.py`; `hal_run` checks declared sizes; `tools/safe_bench.py` and `tools/loom_preflight.py` check the compile report's footprint against the bindings.
 6. Rebuild drivers with `engine/build_hrx.sh` after every source change, and do not edit `engine/run/*.cc` during a measuring round (`gpu_run.sh` will then refuse the remaining runs).
 7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/yah-scratch/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
-8. A launched chunk graph waits on NPU done words (~2 s bound each). Never leave it waiting on jobs that will not run: when queueing them fails, release the waits (`NpuSplit::Release`). A graph of ~250 unreleased waits spun for minutes, starved the display ring and needed a reset. Test new NPU host paths CPU-driven first (no GPU kernels), then end to end.
+8. A launched chunk graph waits on NPU done words (~2 s bound each). Never leave it waiting on jobs that will not run: when queueing them fails, release the waits (`NpuSplit::Release`); a failed wait sets a sticky status that ends every later wait at once. A graph of ~250 unreleased waits (before the sticky status) spun for minutes, starved the display ring and needed a reset. Test new NPU host paths CPU-driven first (no GPU kernels), then end to end.
 
 After a hang and reboot, read the previous boot's kernel log:
 

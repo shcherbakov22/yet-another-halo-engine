@@ -96,7 +96,8 @@ class LoomPrefill {
       p.a_bytes = std::max(p.a_bytes, q.a_bytes), p.w_bytes = std::max(p.w_bytes, q.w_bytes),
       p.c_bytes = std::max(p.c_bytes, q.c_bytes);
     p.w_bytes *= 2;   // two slots: a job's weights are decoded while the previous job runs (NpuDecode)
-    if (const auto it = geom_.find("npugate"); it != geom_.end()) p.gate = it->second.tokens;
+    if (const auto it = geom_.find("npugate"); it != geom_.end())
+      p.gate_calls = it->second.rowgrp, p.gate_record = it->second.tt;
     return p;
   }
   // Split the set's NPU sites of full chunks with the NPU from now on: it computes their trailing npusplit rows.
@@ -105,7 +106,8 @@ class LoomPrefill {
     for (const auto& [name, g] : geom_)
       if (name.rfind("npusplit_", 0) == 0) npu_rows_[name.substr(9)] = g.tokens;
     if (!npu || npu_rows_.empty()) throw LoomError("prefill: the set has no NPU split");
-    if (!geom_.count("npu_flag_wait.hal")) throw LoomError("prefill: the set has no npu_flag_wait.hal (re-emit it)");
+    if (!geom_.count("npu_flag_wait.hal") || !geom_.count("npugate"))
+      throw LoomError("prefill: the set has no gated NPU handoffs (npu_flag_wait.hal, npugate; re-emit it)");
     npu_ = npu;
     std::size_t rem = 0;
     for (const auto& [site, rows] : npu_rows_)
@@ -179,7 +181,6 @@ class LoomPrefill {
     if (!df_planned_) PlanDecodeFree(ci);
     // NPU split: full chunks only, its handoffs graph nodes on flag words (NpuEnqueue / NpuJoin)
     npu_on_ = npu_ && n_ == B_;
-    if (npu_on_) ++epoch_;
     flagged_.clear();
     predecoded_.clear();
     npu_job_ = 0;
@@ -207,11 +208,10 @@ class LoomPrefill {
     for (std::size_t i = 0; i < flagged_.size(); ++i) {
       const Flagged& j = flagged_[i];
       try {
-        npu_->EnqueueFlagged(j.calls, j.tag, j.ready, j.done, j.gated ? j.seq : epoch_);
+        npu_->Enqueue(j.calls, j.tag, j.words);
       } catch (...) {
         // the graph runs: release its waits for this and every later job, which will never run
-        for (std::size_t k = i; k < flagged_.size(); ++k)
-          npu_->Release(flagged_[k].done, flagged_[k].gated ? flagged_[k].seq : epoch_);
+        for (std::size_t k = i; k < flagged_.size(); ++k) npu_->Release(flagged_[k].words);
         flagged_.clear();
         throw;
       }
@@ -1221,18 +1221,15 @@ class LoomPrefill {
   }
 
   // NPU handoffs are graph nodes on flag words in host memory (NpuSplit::Flags), so the host never splits the chunk.
-  // NpuEnqueue: the graph stores the chunk's epoch to the job's ready word once its encoders / decoders are done
-  // (release, system scope: A and W reach memory first); the relay then runs the job and stores the epoch to the done
-  // word. NpuJoin: yah_npu_flag_wait polls the done word; it stands for the NPU's reads of A / W and writes of C, so the
-  // unpacks and the next job's encoders and decoders order after it.
-  // A gated image (NpuSplit::Gated) needs no relay: the graph stores the job's gate value (NpuSplit::NextGate) to its
-  // first call's ready word, the NPU's gate waits for it and writes it to the last call's done word, and the wait ends
-  // once done reaches it.
+  // NpuEnqueue: the graph stores the job's gate value to its ready word once its encoders / decoders are done (release,
+  // system scope: A and W reach memory first); the NPU waits for it itself. NpuJoin: yah_npu_flag_wait polls the done
+  // word; it stands for the NPU's reads of A / W and writes of C, so the unpacks and the next job's encoders and
+  // decoders order after it. The jobs are queued right after the chunk graph launches.
   struct Flagged {
     std::vector<std::uint32_t> calls;
     std::string tag;
-    std::uint32_t ready, job, done = 0, seq = 0;
-    bool gated = false;
+    std::uint32_t job;   // index in the chunk (W slot = job % 2)
+    NpuSplit::Job words;
   };
   // A weight decode of the planning pass (EnableNpu), dispatched early in one-graph mode.
   struct PlannedDecode {
@@ -1258,21 +1255,11 @@ class LoomPrefill {
   // The job's calls; tag names it in the NPU stats.
   void NpuEnqueue(std::vector<std::uint32_t> calls, std::string tag) {
     const std::uint32_t job = npu_job_++;
-    if (npu_->Gated()) {
-      if (npu_planning_) return;
-      const auto [ready, done] = npu_->GateWords(calls);
-      const std::uint32_t seq = npu_->NextGate(calls);
-      graph_->AtomicStore(FlagWord(ready), seq, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE,
-                          {Ref(npu_->A()), WSlot(job)}, {Ref(npu_->C())});
-      flagged_.push_back({std::move(calls), std::move(tag), ready, job, done, seq, true});
-      return;
-    }
-    const std::uint32_t ready = NpuSplit::kFlagFirstJob + 2 * job;
-    if (ready + 1 >= npu_->FlagWords()) throw LoomError("prefill: more NPU jobs per chunk than flag words");
     if (npu_planning_) return;
-    graph_->AtomicStore(FlagWord(ready), epoch_, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE,
+    const NpuSplit::Job words = npu_->NewJob(calls);
+    graph_->AtomicStore(FlagWord(words.ready), words.gate, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE,
                         {Ref(npu_->A()), WSlot(job)}, {Ref(npu_->C())});
-    flagged_.push_back({std::move(calls), std::move(tag), ready, job, ready + 1});
+    flagged_.push_back({std::move(calls), std::move(tag), job, words});
   }
   // Queue the GPU work that runs beside the last enqueued job before this.
   void NpuJoin() {
@@ -1287,7 +1274,7 @@ class LoomPrefill {
     const Flagged& j = flagged_.back();
     const std::vector<hrx_buffer_ref_t> npu_side{Ref(npu_->A()), WSlot(j.job), Ref(npu_->C())};
     Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1,
-             {FlagWord(j.done), FlagWord(j.ready), FlagWord(NpuSplit::kFlagStatus)}, 4, &npu_side);
+             {FlagWord(j.words.done), FlagWord(j.words.ready), FlagWord(NpuSplit::kFlagStatus)}, 4, &npu_side);
   }
 
   // af: the afrag form, input normt_ (fragment-major)
@@ -1697,8 +1684,7 @@ class LoomPrefill {
   bool ffn_bfp_ = false;           // the last ffn unpack wrote down's BFP16 input for its columns (FfnUnpack)
   std::string norm_bfp_;           // the site whose NPU input the last norm wrote (RunNorm npu_site)
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
-  std::uint32_t epoch_ = 0;        // the chunk's value in the flag words
-  std::vector<Flagged> flagged_;   // this chunk's NPU jobs, handed to the relay after the launch
+  std::vector<Flagged> flagged_;   // this chunk's NPU jobs, queued after the launch
   std::vector<std::vector<PlannedDecode>> planned_dq_;  // per job: its weight decodes (planning pass)
   std::vector<PlannedDecode> predecoded_;               // the next job's, dispatched at the last Join
   std::map<std::string, std::uint32_t> npu_rows_;  // NPU rows per site (dispatch.txt "npusplit_<site>")
