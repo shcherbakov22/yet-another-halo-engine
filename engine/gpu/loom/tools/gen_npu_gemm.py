@@ -128,6 +128,8 @@ def loom_env(cfg, swap=False):
         env["LOOM_EXP_PANEL_INTERLEAVE"] = str(NP)
     if cfg.dcol == 2 or cfg.fuse:   # the fill egress rings are contiguous (fuse_prologue steps them by a record)
         env["LOOM_EXP_LS_SEND_PITCH_RECORD"] = str(NP * 4 * 256 // 8 * 4)
+    if cfg.fuse:   # the shared last-two-rows panel interleaved per unit (its filler emits both rows' slabs of a unit
+        env["LOOM_EXP_PANEL_INTERLEAVE"] = str(NP)   # together; uniform slots of KS (36, 36, 36, 20) would not fit)
     if not groups(cfg):
         env["LOOM_EXP_PANEL_GROUPS"] = str(cfg.passes)
         if cfg.dcol == 2:   # one group, still streamed from the decoder column (HRX patch 0019)
@@ -546,10 +548,9 @@ def fuse_record(cfg, r):
 
 def fuse_raw(w, cfg):
     """The fused raw binding from the weight binding (int32 words, [column][group][slice][pass in group][NP slabs]):
-    per column, per replay group: its units' slabs of rows 0 .. rows - 2 ([unit][row][slab]), then its units' last-row
-    slabs ([unit][slab])."""
+    per column, per replay group, per unit (pass in group, slab): the rows' slabs ([unit][row][slab])."""
     import numpy as np
-    rows, P = len(cfg.ks), cfg.passes
+    P = cfg.passes
     panel = sum(P * NP * slab(k) for k in cfg.ks) // 4
     out = []
     for c in range(cfg.cols):
@@ -561,9 +562,7 @@ def fuse_raw(w, cfg):
                 sl.append(w[off:off + n].reshape(len(g) * NP, slab(k) // 4))
                 off += n
             for u in range(len(g) * NP):
-                for r in range(rows - 1):
-                    out.append(sl[r][u])
-            out.extend(sl[rows - 1])
+                out.extend(s_[u] for s_ in sl)
     return np.concatenate(out)
 
 
@@ -697,15 +696,18 @@ class _Fill:
 def fuse_prologue(L, cfg, role, ks, r):
     """A filling worker's firing (row r < rows - 1): the firing counter (private), the W slot by parity (leaf-synced
     W, acquired here and released at the exit); at each replay group's first firing (firings run group, M block,
-    pass), that group's fill: per unit, skip the rows before its own, take its slab, skip the rest; then the group's
-    last-row slabs (row rows - 2 takes them, its panel holds the tail's slice too) (pass-through). A group's fill ends
-    on a whole record; the record count runs on across groups and calls (the egress ring's slot parity)."""
+    pass), that group's fill: per unit, skip the rows before its own, take its slab (row rows - 2 also the last
+    row's: their panel is interleaved per unit), skip the rest (pass-through). A group's fill ends on a whole record;
+    the record count runs on across groups and calls (the egress ring's slot parity)."""
+    assert len(groups(cfg)) > 1, "fuse: the interleaved last-two-rows panel needs streamed replay groups"
     e = L.append
     rows = len(cfg.ks)
     dp, _ = fuse_ports(role)
     wrec = NP * slab(ks)
     sw = [slab(k) // 4 for k in cfg.ks]
-    pre, mine, post = sum(sw[:r]), sw[r], sum(sw[r + 1:rows - 1])
+    pre = sum(sw[:r])
+    mine = sum(sw[r:]) if r == rows - 2 else sw[r]
+    post = sum(sw[r + 1:]) - (mine - sw[r])
     e("  %fzs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e("  %fzp = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     e("  %fzjs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
@@ -759,7 +761,6 @@ def fuse_prologue(L, cfg, role, ks, r):
             f.take(mine)
             f.skip(post)
         f.loop(n, unit)
-        (f.take if r == rows - 2 else f.skip)(n * sw[rows - 1])
         e(f"  rel %one, {dp}")   # the group's last record (full)
         e(f"  %fzen{i} = lda %fzp, 8")
         e(f"  %fzen1{i} = add.rr %fzen{i}, %one")
