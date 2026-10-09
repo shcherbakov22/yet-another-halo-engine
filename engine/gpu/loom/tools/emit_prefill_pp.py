@@ -635,8 +635,17 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 # The NPU image waits for each job's ready word itself (gen_npu_gemm GATE, HRX patch 0016): no host relay sits between
 # the GPU and the NPU. dispatch.txt: "npugate <supply> <calls> <record>" (gen_npu_gemm GATE_*), and npu_flag_wait.hal
 # waits for a job's done word (gen_npu_unpack.gen_flag_wait).
-NPU_KS = GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
-NPU_ROWS = 8 * GN.TN   # output rows per NPU call (8 columns)
+# YAH_NPU_DCOL=1: the NPU decodes its weights itself (gen_npu_gemm dcol 2): 7 GEMM columns read by a decoder column
+# from the raw GGUF rows the engine registers with the NPU, so no GPU decode ("dqbfp") runs. Per format with a decoder
+# (DCOL_FMTS) and site K the image "npu_dcol_<fmt>_<K>.xdna", and per format "npu_dcol_<fmt>.swap.xdna" (its decoder
+# tiles' setup alone: the engine switches formats inside a command). The decoders' k-block order (gen_npu_dec.KPERM)
+# permutes the activations (gen_bfp16_encode.ACT_PERM): "p4" for the fused writers (norm, postnorm, ffn unpack) and the
+# plain encoders, "pk" (Q4_K) by the "_pk" encoders into A's second half. Tensors of other formats stay on the GPU.
+NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1"
+DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk")}
+NPU_KS = (36, 36, 36, 20) if NPU_DCOL else GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
+NPU_COLS = 7 if NPU_DCOL else 8
+NPU_ROWS = NPU_COLS * GN.TN   # output rows per NPU call
 NPU_SITES = {"qkv": ("kstore", 640, 20), "gate": ("kstore", 384, 20), "q": ("kqg", 768, 20), "out": ("kres", 320, 24),
              "down": ("kres", 320, 68), "ffn": ("ffn", 1088, 20)}
 NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
@@ -663,6 +672,26 @@ def npu_rem_tile(fmt, kbw, kbt):
     return dataclasses.replace(TG.default_tile(fmt, "kstore", kbw), **AF_TILE, **knobs)
 
 
+def fit_rowgrp(t, mt):
+    """Tile t over mt row tiles: decoder-column splits (560-row NPU calls) leave GPU / remainder row counts the tile's
+    row group need not divide; the largest of its row group, 4, 2, 1 that does."""
+    if not NPU_DCOL or mt % t.rowgrp == 0:
+        return t
+    import gen_gemm_tile as TG
+    for r in (4, 2, 1):
+        if r >= t.rowgrp or mt % r:
+            continue
+        bm = t.bm * r // t.rowgrp   # rowgrp = bm / 16 (ffn: bm / 32)
+        for wm in range(min(t.wm, bm // 16), 0, -1):
+            c = dataclasses.replace(t, bm=bm, wm=wm)
+            try:
+                TG.check(c)
+                return c
+            except ValueError:
+                pass
+    raise SystemExit("no row group of %s divides %d row tiles" % (t, mt))
+
+
 def npu_split(rows, combos, B, outdir):
     import gen_bfp16_encode as GE
     import gen_gemm_tile as TG
@@ -673,6 +702,8 @@ def npu_split(rows, combos, B, outdir):
     assert not bad, "unknown NPU split sites %s" % sorted(bad)
     assert all(v % NPU_ROWS == 0 and 0 < v < NPU_SITES[k][1] * 16 for k, v in NPU_SPLIT.items()) and B % 512 == 0
     assert NPU_SPLIT.get("q", 0) % 512 == 0, "q: whole heads"
+    assert not (NPU_DCOL and "q" in NPU_SPLIT), "dcol: q's whole heads are not 560-row calls"
+    GE.ACT_PERM = "p4" if NPU_DCOL else None
     out = []
     tmp = os.path.join(outdir, ".emit_tmp")
     os.makedirs(tmp, exist_ok=True)
@@ -680,16 +711,25 @@ def npu_split(rows, combos, B, outdir):
     def split(fmt, kind, mt, kb, t, name, nn, persist=None, tokens=B):
         """The GPU's share: rows [0, mt * 16 - nn) of the GEMM HAL name (tile t) at the full stride, over tokens."""
         mtg = mt - nn // 16
-        assert mtg % t.rowgrp == 0 and tokens % t.bn == 0, (name, nn)
-        TG.check(t)
+        tf = fit_rowgrp(t, mtg)
+        if tf is not t and persist is not None:   # the persistent kres keeps its row blocks: the tiled form runs instead
+            return
+        assert mtg % tf.rowgrp == 0 and tokens % tf.bn == 0, (name, nn)
+        TG.check(tf)
         if persist is not None:
             gen = lambda f, k: gen_kres_persist.persist(TG.gen(f, "kres", persist, False),
                                                        TG.gen(f, "kstore", dataclasses.replace(persist, respre=0), False),
-                                                       tokens // t.bn)
+                                                       tokens // tf.bn)
         else:
-            gen = lambda f, k: TG.gen(f, k, t, False)
-        out.append(_emit_gen(gen, t.bn, fmt, mtg, kb, tokens, name[:-4] + ".npu.hal", outdir, kind, t.rowgrp,
-                             ostride=mt * 16))
+            gen = lambda f, k: TG.gen(f, k, tf, False)
+        try:
+            out.append(_emit_gen(gen, tf.bn, fmt, mtg, kb, tokens, name[:-4] + ".npu.hal", outdir, kind, tf.rowgrp,
+                                 ostride=mt * 16))
+        except (SystemExit, RuntimeError, ValueError) as ex:
+            if tf is t:
+                raise
+            # a decoder-column split's narrower row group may not emit (spills): the engine runs that form unsplit
+            print("npu split %s: not emitted with row group %d (%s)" % (name, tf.rowgrp, str(ex)[:120]))
 
     def variants(fmt, kind, mt, kb, base, nn):
         """Every form of GEMM base the set emits (tile_kstore, afrag_variants): its split."""
@@ -731,6 +771,7 @@ def npu_split(rows, combos, B, outdir):
         out.append((name, TG.dq_wgs(nn // 16, kbc, dt, fmt), dt.lanes, 0))
 
     done = set()
+    dcol_images = set()
     for kind, fmt, port, mt, kb in sorted(combos):
         for site, (skind, smt, skb) in NPU_SITES.items():
             if site not in NPU_SPLIT or mt != smt or kb != skb or fmt not in TILE_FMTS:
@@ -754,13 +795,17 @@ def npu_split(rows, combos, B, outdir):
             chunks = npu_chunks(site)
             chunked = len(chunks) > 1 or npu_rem(site)
             for ci, chunk in (enumerate(chunks) if chunked else ((None, None),)):
+                if NPU_DCOL:
+                    if fmt in DCOL_FMTS:
+                        dcol_images.add((fmt, kb * 256))
+                    continue
                 if (fmt, mt, kb, chunk) not in done:
                     done.add((fmt, mt, kb, chunk))
                     dqbfp(fmt, mt, kb, NPU_SPLIT[site], ci, chunk)
             if npu_rem(site) and (site, fmt) not in done:   # the GPU's K remainder of the NPU's rows (f32 [B][nn])
                 done.add((site, fmt))
                 kbw = npu_rem(site) // 256
-                tr = npu_rem_tile(fmt, kbw, kb)
+                tr = fit_rowgrp(npu_rem_tile(fmt, kbw, kb), nn // 16)
 
                 def gen_rem(f, k, tr=tr, kb=kb, kbw=kbw):
                     TG.KWIN = (kb - kbw, kb)
@@ -809,12 +854,18 @@ def npu_split(rows, combos, B, outdir):
         out.append(("npuffnbfp", ffn_off, 0, 0))
     for K, ci, (k_off, passes) in sorted(encs, key=lambda x: (x[0], -1 if x[1] is None else x[1])):
         for tiled in (False, True):
-            name = "npu_enc_%d%s%s.hal" % (K, "" if ci is None else "_c%d" % ci, "_t" if tiled else "")
-            src = os.path.join(tmp, name[:-4] + ".loom")
-            open(src, "w").write(GE.gen("act", B, list(NPU_KS), passes, tiled=tiled, k_off=k_off,
-                                        k_src=K if 1024 * passes != K else None))
-            E.emit(src, ["nop=0"], name, outdir)   # emit_hal.py wants a config; the encoder has none
-            out.append((name, B // 8 * (passes * sum(NPU_KS)) // GE.WG, GE.WG, 0))
+            for perm in (("p4", "pk") if NPU_DCOL else (None,)):
+                name = "npu_enc_%d%s%s%s.hal" % (K, "" if ci is None else "_c%d" % ci, "_t" if tiled else "",
+                                                 "_pk" if perm == "pk" else "")
+                src = os.path.join(tmp, name[:-4] + ".loom")
+                GE.ACT_PERM = perm
+                try:
+                    open(src, "w").write(GE.gen("act", B, list(NPU_KS), passes, tiled=tiled, k_off=k_off,
+                                                k_src=K if 1024 * passes != K else None))
+                finally:
+                    GE.ACT_PERM = "p4" if NPU_DCOL else None
+                E.emit(src, ["nop=0"], name, outdir)   # emit_hal.py wants a config; the encoder has none
+                out.append((name, B // 8 * (passes * sum(NPU_KS)) // GE.WG, GE.WG, 0))
     # the norms that feed K = 5120 sites also write the NPU's BFP16 input (gen_half_norm.gen_split bfp): "<norm>_bfp.hal"
     if {"qkv", "q", "ffn"} & set(NPU_SPLIT):
         for tiled, name in ((False, "norm_bfp.hal"), (True, "norm_t_bfp.hal"), ("both", "norm_rt_bfp.hal")):
@@ -871,6 +922,10 @@ def npu_split(rows, combos, B, outdir):
     E.emit(src, ["nop=0"], "npu_flag_wait.hal", outdir)
     out.append(("npu_flag_wait.hal", 1, 32, 0))
     out.append(("npugate", GN.GATE_SUPPLY, GN.GATE_CALLS, GN.GATE_RECORD))
+    if NPU_DCOL:
+        out.extend(npu_dcol_images(dcol_images, B, tmp, outdir))
+        GE.ACT_PERM = None
+        return out
     # NPU images, one per pass count
     env = dict(hrx_paths.env(), **GN.LOOM_ENV)
     for passes in sorted({p for s in NPU_SPLIT for _, p in npu_chunks(s)}):
@@ -887,6 +942,39 @@ def npu_split(rows, combos, B, outdir):
         out.append(("npubytes_%d" % K,) + tuple(GN.stream_bytes(cfg)))
     out.append(("npurows", NPU_ROWS, 0, 0))
     return out
+
+
+def npu_dcol_images(images, B, tmp, outdir):
+    """The decoder-column images (NPU_DCOL): per (format, site K) the gated GEMM reading raw rows of that K, per format
+    its decoder swap image; dispatch.txt "npudcol <cols>", "npubytes_5120" and "npurows"."""
+    import concurrent.futures
+    sys.path.insert(0, os.path.dirname(HERE))
+    import hrx_paths
+    jobs = []
+    for fmt, K in sorted(images):
+        cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0], kraw=K)
+        jobs.append((cfg, "npu_dcol_%s_%d" % (fmt, K), False))
+    for fmt in sorted({f for f, _ in images}):
+        cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0])
+        jobs.append((cfg, "npu_dcol_%s.swap" % fmt, True))
+    srcs = []
+    for cfg, name, swap in jobs:
+        src = os.path.join(tmp, name + ".loom")
+        open(src, "w").write(GN.gen(cfg))
+        srcs.append(src)
+
+    def compile_one(job, src):
+        cfg, name, swap = job
+        r = subprocess.run([hrx_paths.LOOM_COMPILE, src, "--root=@" + cfg.entry,
+                            "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
+                            "--output=" + os.path.join(outdir, name + ".xdna")], capture_output=True, text=True,
+                           env=dict(hrx_paths.env(), **GN.loom_env(cfg, swap)))
+        if r.returncode:
+            raise SystemExit("NPU decoder-column compile failed (%s): %s" % (name, r.stderr[-800:]))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(compile_one, jobs, srcs))
+    cfg = jobs[0][0]
+    return [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(cfg)), ("npurows", NPU_ROWS, 0, 0)]
 
 
 def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):

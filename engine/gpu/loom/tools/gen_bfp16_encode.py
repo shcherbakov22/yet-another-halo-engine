@@ -18,6 +18,12 @@ import sys
 
 WG = 256
 GROUPS = (2, 3)   # passes per replay group of a 5-pass call (gen_npu_gemm)
+# The k-block order of the activation stream when the NPU decodes the weights itself (gen_npu_dec: its panels hold the
+# k-blocks of each sub-block group in the order its decoder computes them): None (k ascending), "p4" (per 4 k-blocks
+# 0, 2, 1, 3: IQ4_XS, IQ3_S, IQ3_XXS), "pk" (per 8: 0, 4, 1, 5, 2, 6, 3, 7: Q4_K). Panel position p holds k-block
+# perm[p], so k-block kb goes to position perm^-1[kb]: p4 swaps kb's two low bits, pk rotates its three low bits.
+ACT_PERM = None
+
 
 
 def pass_groups(passes):
@@ -93,12 +99,21 @@ def gen(layout, rows, ks, passes, tile=64, pad=True, tiled=False, k_off=0, k_src
     e(f"    %kbi = index.rem %ipair, {ckbe} : index")
     e("    %g16x2 = index.mul %g16i, %c2 : index")
     e("    %g8 = index.add %g16x2, %ihalf : index")
-    frag = emit_offset(e, layout, rows, ks, passes, tile, pad, "%g8", "%kbi")
+    # ACT_PERM: this encoder permutes its source instead (position kbi reads k-block perm[kbi]; destination offsets keep
+    # their range proofs, which a permuted destination loses for partial streams)
+    frag = emit_offset(e, layout, rows, ks, passes, tile, pad, "%g8", "%kbi", perm=False)
+    kbs = "%kbi"
+    if layout == "act" and ACT_PERM:
+        kbs = emit_perm(e, "%kbi", ACT_PERM, "s_", forward=True)
+        # the permutation stays inside its group of 4 / 8 k-blocks: state kbs < kbe for the bound proofs
+        e(f"    %s_kbl = index.constant {kbe - 1} : index")
+        e(f"    %s_kbm = index.min {kbs}, %s_kbl : index")
+        kbs = "%s_kbm"
     # inputs: 8 rows x 8 halves
     e("    %row0 = index.mul %g8, %c8 : index")
     if not tiled:
         e("    %rb = index.mul %row0, %cK : index")
-    e("    %kc = index.mul %kbi, %c8 : index")
+    e(f"    %kc = index.mul {kbs}, %c8 : index")
     if k_off:
         e(f"    %kco = index.constant {k_off} : index")
         e("    %kc0 = index.add %kc, %kco : index")
@@ -139,11 +154,13 @@ def gen(layout, rows, ks, passes, tile=64, pad=True, tiled=False, k_off=0, k_src
     return "\n".join(L) + "\n"
 
 
-def emit_offset(e, layout, rows, ks, passes, tile, pad, g8, kbi, p="", ind="    "):
+def emit_offset(e, layout, rows, ks, passes, tile, pad, g8, kbi, p="", ind="    ", perm=True):
     """Emit the byte offset of the fragment of row group g8 (8 rows) and k-block kbi in the stream layout; returns its name.
     The caller defines the index constants %{p}c2, %{p}c144, %{p}c72, %{p}csub (tile / 16), %{p}cpk (sum(ks)) and %{p}cpass."""
     sb = [slab_bytes(k, pad) for k in ks]
     sub = tile // 16
+    if layout == "act" and ACT_PERM and perm:
+        kbi = emit_perm(e, kbi, ACT_PERM, p, ind)
     groups = pass_groups(passes)
     ga, gb = groups[0], groups[-1]
     if layout == "act":
@@ -213,6 +230,36 @@ def emit_offset(e, layout, rows, ks, passes, tile, pad, g8, kbi, p="", ind="    
     x(f"%{p}off2 = index.add %{p}off0, %{p}ko : index")
     x(f"%{p}frag = index.add %{p}off2, %{p}ho : index")
     return f"%{p}frag"
+
+
+def emit_perm(e, kbi, perm, p="", ind="    ", forward=False):
+    """Emit k-block kbi's position in the permuted stream (ACT_PERM), or with forward the k-block at position kbi;
+    returns its name."""
+    def x(line):
+        e(ind + line)
+    n = {"p4": 4, "pk": 8}[perm]
+    x(f"%{p}pn = index.constant {n} : index")
+    x(f"%{p}p2 = index.constant 2 : index")
+    x(f"%{p}pj = index.rem {kbi}, %{p}pn : index")
+    x(f"%{p}pq = index.div {kbi}, %{p}pn : index")
+    x(f"%{p}pg = index.mul %{p}pq, %{p}pn : index")   # (kbi / n) n: no subtraction for the range proofs
+    x(f"%{p}p4 = index.constant 4 : index")
+    if perm == "p4":     # j = 2 b1 + b0 -> 2 b0 + b1 (its own inverse)
+        x(f"%{p}pb0 = index.rem %{p}pj, %{p}p2 : index")
+        x(f"%{p}pb1 = index.div %{p}pj, %{p}p2 : index")
+        mul = "%{p}p2".format(p=p)
+    elif not forward:    # k-block j = 4 b2 + l (l < 4) -> position 2 l + b2
+        x(f"%{p}pb0 = index.rem %{p}pj, %{p}p4 : index")
+        x(f"%{p}pb1 = index.div %{p}pj, %{p}p4 : index")
+        mul = "%{p}p2".format(p=p)
+    else:                # position j = 2 l + b -> k-block l + 4 b
+        x(f"%{p}pb0 = index.rem %{p}pj, %{p}p2 : index")
+        x(f"%{p}pb1 = index.div %{p}pj, %{p}p2 : index")
+        mul = "%{p}p4".format(p=p)
+    x(f"%{p}pt = index.mul %{p}pb0, {mul} : index")
+    x(f"%{p}pu = index.add %{p}pt, %{p}pb1 : index")
+    x(f"%{p}pkb = index.add %{p}pg, %{p}pu : index")
+    return f"%{p}pkb"
 
 
 def emit_encode(e, load, frag, ov, nout, p="", ind="    "):

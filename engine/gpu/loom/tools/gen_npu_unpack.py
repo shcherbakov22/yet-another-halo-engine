@@ -21,9 +21,10 @@ CG = len(GE.GROUPS)   # C partials per NPU call, one per replay group, summed he
 
 
 def wg(cols):
-    """Workgroup size of an unpack over cols NPU columns: 8 tokens x 32 column chunks, 16 where 32 do not divide them."""
+    """Workgroup size of an unpack over cols NPU columns: 8 tokens x 32 column chunks, 16 or 8 where 32 do not divide
+    them (7-column calls: gen_npu_gemm dcol 2)."""
     nch = cols * GN.TN // 8
-    return 8 * (32 if nch % 32 == 0 else 16)
+    return 8 * next(c for c in (32, 16, 8) if nch % c == 0)
 
 
 def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=False, tiled=False, qg=False, rem=False,

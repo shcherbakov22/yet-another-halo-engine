@@ -7,6 +7,7 @@
 #define YAH_MODEL_LOOM_NPU_HPP_
 
 #include <dlfcn.h>
+#include <immintrin.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -63,6 +64,7 @@ class LoomNpu {
     std::uint64_t fd_offset = 0;
     void* host = nullptr;              // host pages (CreateShared host), else none
     amdf_memory_t* native = nullptr;   // their libamdf registration, bound directly
+    bool external = false;             // RegisterHost: the caller's pages (no HRX import, not unmapped)
   };
   struct View {
     Shared* shared;
@@ -71,6 +73,14 @@ class LoomNpu {
   // One loaded instance of an image with its bindings and native command storage.
   struct Kernel {
     const void* image_key = nullptr;
+    iree_hal_amd_xdna_image_t* image = nullptr;
+    uint32_t entry_ordinal = 0;
+    // Decoder-column images (gen_npu_gemm dcol 2) share all array state but their decoder tiles: family names the set
+    // of such images (nullptr: the image alone), dec the decoder format, swap the image whose setup re-programs only
+    // the decoder tiles (LOOM_EXP_SETUP_TILES; spliced into a command where the format changes).
+    const void* family = nullptr;
+    int dec = -1;
+    const Kernel* swap = nullptr;
     amdf_xdna_kernel_command_t first{};
     // first sets the array up and runs one whole call (any data). gate opens a job once its ready word reaches the
     // job's gate value; done writes the done word after the job's last C (gen_npu_gemm GATE).
@@ -81,8 +91,12 @@ class LoomNpu {
     amdf_xdna_kernel_command_t push[2]{}, wait{}, lead{}, gate{}, done{}, call{};
     std::vector<iree_hal_amd_xdna_executable_storage_t> storage;
     std::vector<amdf_host_mapping_t*> storage_maps;
-    std::vector<amdf_memory_t*> imports;
     std::vector<iree_hal_buffer_t*> buffers;
+  };
+  // One call: its kernel instance's invocation bytes as bound for it (an instance serves many calls: Rebind).
+  struct Call {
+    const Kernel* k = nullptr;
+    std::vector<std::uint8_t> push[2], wait, lead, gate, done, call;
   };
 
   LoomNpu(LoomDevice& gpu, std::uint32_t columns) : gpu_(gpu), columns_(columns) {
@@ -122,11 +136,13 @@ class LoomNpu {
       for (auto* m : k->storage_maps) api_->host_mapping_destroy(m);
       for (auto& s : k->storage) api_->memory_destroy(s.memory);
       for (auto* b : k->buffers) iree_hal_buffer_release(b);
-      for (auto* m : k->imports) api_->memory_destroy(m);
     }
+    for (auto& [key, m] : imports_) api_->memory_destroy(m);
     for (auto& [key, image] : images_) iree_hal_amd_xdna_image_destroy(image);
     for (auto& s : shared_) {
-      if (s->host) {   // the HRX import first, then the registration, then the pages
+      if (s->external) {
+        api_->memory_destroy(s->native);
+      } else if (s->host) {   // the HRX import first, then the registration, then the pages
         s->gpu.reset();
         api_->memory_destroy(s->native);
         munmap(s->host, s->bytes);
@@ -186,6 +202,28 @@ class LoomNpu {
   }
   // Shared buffers round to pages.
   [[nodiscard]] static std::size_t Align(std::size_t bytes) { return (bytes + 4095) / 4096 * 4096; }
+  // The caller's page-aligned host pages (e.g. raw GGUF weight rows) registered for NPU reads; they stay the caller's.
+  // libamdf pins them for writing, so they must be writable (a private file mapping gets copies of the pages it pins).
+  Shared& RegisterHost(void* pages, std::size_t bytes) {
+    auto s = std::make_unique<Shared>();
+    s->bytes = bytes;
+    s->external = true;
+    amdf_memory_create_info_t ci{};
+    ci.type = AMDF_STRUCTURE_TYPE_MEMORY_CREATE_INFO;
+    ci.structure_size = sizeof(ci);
+    ci.memory_profile_ordinal = RegisterProfile();
+    ci.access_count = 1;
+    ci.accesses = &access_;
+    ci.required_flags = AMDF_MEMORY_FLAG_HOST_VISIBLE;
+    ci.byte_length = bytes;
+    ci.minimum_alignment = 4096;
+    ci.registered_host_pointer = pages;
+    ci.registered_host_cacheability = AMDF_HOST_CACHEABILITY_WRITE_BACK;
+    YAH_AMDF(api_->memory_create(scope_, &ci, &s->native), "memory_create(registered weights)");
+    s->device = pages;
+    shared_.push_back(std::move(s));
+    return *shared_.back();
+  }
 
   // A new instance of the image at path (entry), its bindings the given views.
   Kernel& Load(const std::string& path, const std::string& entry, const std::vector<View>& views) {
@@ -199,50 +237,9 @@ class LoomNpu {
     if (rec.binding_count != views.size()) throw LoomError("npu: " + path + ": binding count");
     auto k = std::make_unique<Kernel>();
     k->image_key = image;
-    std::vector<iree_hal_amd_xdna_executable_binding_t> bindings(views.size());
-    for (std::size_t i = 0; i < views.size(); ++i) {
-      const View& v = views[i];
-      if (v.offset + v.length > v.shared->bytes) throw LoomError("npu: bad view");
-      const iree_xdna_elf_binding_record_t contract =
-          iree_hal_amd_xdna_image_tables_binding(tables, rec.first_binding + static_cast<uint32_t>(i));
-      amdf_memory_import_info_t ii{};
-      ii.type = AMDF_STRUCTURE_TYPE_MEMORY_IMPORT_INFO;
-      ii.structure_size = sizeof(ii);
-      ii.memory_profile_ordinal = profile_.ordinal;
-      ii.access_count = 1;
-      ii.minimum_alignment = contract.minimum_alignment;
-      ii.accesses = &access_;
-      amdf_external_memory_t em{};   // borrowed: the fd stays ours
-      em.type = AMDF_EXTERNAL_MEMORY_TYPE_DMA_BUF_FD;
-      em.payload.file_descriptor = v.shared->fd;
-      em.source_byte_offset = v.shared->fd_offset + v.offset;
-      em.byte_length = v.length;
-      amdf_memory_t* mem = v.shared->native;
-      std::uint64_t addr = 0, mem_off = 0;
-      if (mem) {   // registered host pages: bound at the view's offset
-        mem_off = v.offset;
-      } else {
-        YAH_AMDF(api_->memory_import(scope_, &ii, &em, &mem), "memory_import");
-        k->imports.push_back(mem);
-      }
-      YAH_AMDF(api_->memory_query_address(mem, 0, AMDF_MEMORY_ADDRESS_XDNA_DMA, &addr), "memory_query_address");
-      addr += mem_off;
-      // executable_bind checks this wrapper's range and access only; the span is never dereferenced.
-      iree_hal_buffer_t* buffer = nullptr;
-      NpuCheck(iree_hal_heap_buffer_wrap(
-                   iree_hal_buffer_placement_undefined(),
-                   IREE_HAL_MEMORY_TYPE_HOST_LOCAL | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE |
-                       IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE,
-                   IREE_HAL_MEMORY_ACCESS_READ | IREE_HAL_MEMORY_ACCESS_WRITE, IREE_HAL_BUFFER_USAGE_STORAGE,
-                   v.length, iree_make_byte_span(static_cast<std::uint8_t*>(v.shared->device) + v.offset, v.length),
-                   iree_hal_buffer_release_callback_null(), iree_allocator_system(), &buffer),
-               "heap_buffer_wrap");
-      k->buffers.push_back(buffer);
-      bindings[i].buffer_ref = iree_hal_make_buffer_ref(buffer, 0, v.length);
-      bindings[i].memory = mem;
-      bindings[i].memory_byte_offset = mem_off;
-      bindings[i].device_address = addr;
-    }
+    k->image = image;
+    k->entry_ordinal = entry_ordinal;
+    const std::vector<iree_hal_amd_xdna_executable_binding_t> bindings = Bindings(*k, views);
     k->storage.resize(rec.allocation_use_count);
     k->storage_maps.resize(rec.allocation_use_count);
     for (uint32_t i = 0; i < rec.allocation_use_count; ++i) {
@@ -274,10 +271,94 @@ class LoomNpu {
     return *kernels_.back();
   }
 
+  // The executable bindings of views for instance k (k.buffers keeps the range wrappers). DMA-BUF views are imported
+  // once per view; registered host pages bind at the view's offset.
+  std::vector<iree_hal_amd_xdna_executable_binding_t> Bindings(Kernel& k, const std::vector<View>& views) {
+    const iree_hal_amd_xdna_image_tables_t* tables = iree_hal_amd_xdna_image_tables(k.image);
+    const iree_xdna_elf_entry_record_t rec = iree_hal_amd_xdna_image_tables_entry(tables, k.entry_ordinal);
+    if (rec.binding_count != views.size()) throw LoomError("npu: binding count");
+    std::vector<iree_hal_amd_xdna_executable_binding_t> bindings(views.size());
+    for (std::size_t i = 0; i < views.size(); ++i) {
+      const View& v = views[i];
+      if (v.offset + v.length > v.shared->bytes) throw LoomError("npu: bad view");
+      const iree_xdna_elf_binding_record_t contract =
+          iree_hal_amd_xdna_image_tables_binding(tables, rec.first_binding + static_cast<uint32_t>(i));
+      amdf_memory_t* mem = v.shared->native;
+      std::uint64_t addr = 0, mem_off = 0;
+      if (mem) {   // registered host pages: bound at the view's offset
+        mem_off = v.offset;
+      } else if (const auto it = imports_.find({v.shared, v.offset, v.length}); it != imports_.end()) {
+        mem = it->second;
+      } else {
+        amdf_memory_import_info_t ii{};
+        ii.type = AMDF_STRUCTURE_TYPE_MEMORY_IMPORT_INFO;
+        ii.structure_size = sizeof(ii);
+        ii.memory_profile_ordinal = profile_.ordinal;
+        ii.access_count = 1;
+        ii.minimum_alignment = contract.minimum_alignment;
+        ii.accesses = &access_;
+        amdf_external_memory_t em{};   // borrowed: the fd stays ours
+        em.type = AMDF_EXTERNAL_MEMORY_TYPE_DMA_BUF_FD;
+        em.payload.file_descriptor = v.shared->fd;
+        em.source_byte_offset = v.shared->fd_offset + v.offset;
+        em.byte_length = v.length;
+        YAH_AMDF(api_->memory_import(scope_, &ii, &em, &mem), "memory_import");
+        imports_[{v.shared, v.offset, v.length}] = mem;
+      }
+      YAH_AMDF(api_->memory_query_address(mem, 0, AMDF_MEMORY_ADDRESS_XDNA_DMA, &addr), "memory_query_address");
+      addr += mem_off;
+      // executable_bind checks this wrapper's range and access only; the span is never dereferenced (the address is
+      // device_address). Wrappers start 64-byte aligned: raw weight rows need not.
+      std::uint8_t* span = static_cast<std::uint8_t*>(v.shared->device) + v.offset;
+      const std::size_t lead = reinterpret_cast<std::uintptr_t>(span) & 63;
+      iree_hal_buffer_t* buffer = nullptr;
+      NpuCheck(iree_hal_heap_buffer_wrap(
+                   iree_hal_buffer_placement_undefined(),
+                   IREE_HAL_MEMORY_TYPE_HOST_LOCAL | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE |
+                       IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE,
+                   IREE_HAL_MEMORY_ACCESS_READ | IREE_HAL_MEMORY_ACCESS_WRITE, IREE_HAL_BUFFER_USAGE_STORAGE,
+                   v.length + lead, iree_make_byte_span(span - lead, v.length + lead),
+                   iree_hal_buffer_release_callback_null(), iree_allocator_system(), &buffer),
+               "heap_buffer_wrap");
+      k.buffers.push_back(buffer);
+      bindings[i].buffer_ref = iree_hal_make_buffer_ref(buffer, 0, v.length + lead);
+      bindings[i].memory = mem;
+      bindings[i].memory_byte_offset = mem_off;
+      bindings[i].device_address = addr;
+    }
+    return bindings;
+  }
+  // Bind instance k to other views (one instance of an image serves many calls: its invocation bytes are copied per
+  // call, Snapshot).
+  void Rebind(Kernel& k, const std::vector<View>& views) {
+    const std::vector<iree_hal_amd_xdna_executable_binding_t> bindings = Bindings(k, views);
+    const auto n = static_cast<iree_host_size_t>(k.storage.size());
+    NpuCheck(iree_hal_amd_xdna_executable_bind(k.image, k.entry_ordinal, n, k.storage.data(), bindings.size(),
+                                               bindings.data()),
+             "executable_bind");
+    for (uint32_t i = 0; i < n; ++i)
+      YAH_AMDF(api_->host_mapping_cache_control(k.storage_maps[i], AMDF_HOST_CACHE_OPERATION_FLUSH, 0,
+                                                k.storage[i].mapping.data_length),
+               "host_mapping_cache_control(storage)");
+  }
+  // The invocation bytes of k as bound now.
+  Call Snapshot(const Kernel& k) const {
+    Call c;
+    c.k = &k;
+    auto copy = [&](const amdf_xdna_kernel_command_t& cmd, std::vector<std::uint8_t>& out) {
+      if (!cmd.byte_length) return;
+      const std::uint8_t* src = CommandBytes(k, cmd);
+      out.assign(src, src + cmd.byte_length);
+    };
+    copy(k.push[0], c.push[0]), copy(k.push[1], c.push[1]), copy(k.wait, c.wait), copy(k.lead, c.lead);
+    copy(k.gate, c.gate), copy(k.done, c.done), copy(k.call, c.call);
+    return c;
+  }
+
   // A gated image's job (NpuSplit::Enqueue): its calls, done word and gate value; the NPU waits for its ready word
   // itself and writes the gate value to *done.
   struct GatedJob {
-    std::vector<Kernel*> kernels;
+    std::vector<const Call*> calls;
     volatile std::uint32_t* done = nullptr;
     std::uint32_t gate = 0;
     std::string tag;
@@ -289,20 +370,30 @@ class LoomNpu {
   void EnqueueGated(std::vector<GatedJob> jobs) {
     CheckHealth();
     const auto t0 = std::chrono::steady_clock::now();
-    Kernel* k = jobs[0].kernels[0];
+    const Kernel* k = jobs[0].calls[0]->k;
+    const void* family = k->family ? k->family : k->image_key;
     bool resident = false;
+    int dec = -1;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      resident = resident_ == k->image_key;
+      resident = resident_ == family;
+      dec = resident_dec_;
     }
     if (!resident) {
       YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k->first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
       std::lock_guard<std::mutex> lock(mu_);
-      resident_ = k->image_key;
+      resident_ = family;
+      dec = resident_dec_ = k->dec;
     }
-    std::vector<std::vector<Kernel*>> runs;
-    for (const GatedJob& g : jobs) runs.push_back(g.kernels);
-    const std::uint64_t submission = Submit(FusedCommand(runs));
+    std::vector<std::vector<const Call*>> runs;
+    for (const GatedJob& g : jobs) runs.push_back(g.calls);
+    // commands run in submission order: the next one starts with this one's last decoder
+    const auto& [command, end_dec] = FusedCommand(runs, dec);
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      resident_dec_ = end_dec;
+    }
+    const std::uint64_t submission = Submit(command);
     {
       std::lock_guard<std::mutex> lock(mu_);
       pending_.push_back({submission, std::move(jobs), t0});
@@ -360,33 +451,45 @@ class LoomNpu {
       if (st.memory == c.memory) return static_cast<const std::uint8_t*>(st.mapping.data) + (c.byte_offset - st.memory_byte_offset);
     throw LoomError("npu: command outside its kernel storage");
   }
-  const amdf_xdna_kernel_command_t& FusedCommand(const std::vector<std::vector<Kernel*>>& runs) {
-    if (const auto it = fused_.find(runs); it != fused_.end()) return it->second;
+  // Decoder-column images: where a call's decoder format differs from the one set up, the queued calls drain, the
+  // format's swap setup follows and the call starts like a job's first (lead; the parity restarts there).
+  // Returns the command and the decoder format set up at its end.
+  const std::pair<amdf_xdna_kernel_command_t, int>& FusedCommand(const std::vector<std::vector<const Call*>>& runs,
+                                                                 int dec) {
+    const auto key = std::make_pair(runs, dec);
+    if (const auto it = fused_.find(key); it != fused_.end()) return it->second;
     std::vector<std::uint8_t> bytes;
     std::uint32_t ops = 0;
-    auto append = [&](const Kernel& k, const amdf_xdna_kernel_command_t& c) {
-      const std::uint8_t* src = CommandBytes(k, c);
+    auto append_raw = [&](const std::uint8_t* src, std::size_t length) {
       std::uint32_t n = 0, size = 0;
       std::memcpy(&n, src + 8, 4), std::memcpy(&size, src + 12, 4);
-      if (size != c.byte_length) throw LoomError("npu: unexpected command header");
+      if (size != length) throw LoomError("npu: unexpected command header");
       if (bytes.empty()) bytes.assign(src, src + 16);
       bytes.insert(bytes.end(), src + 16, src + size);
       ops += n;
     };
+    auto append = [&](const std::vector<std::uint8_t>& b) { append_raw(b.data(), b.size()); };
     for (const auto& calls : runs) {
-      int queued = 0;
-      append(*calls[0], calls[0]->gate);
-      if (!calls[0]->streamed) {
-        for (const Kernel* k : calls) append(*k, k->call);
-        append(*calls.back(), calls.back()->done);
+      int queued = 0, since = 0;
+      append(calls[0]->gate);
+      if (!calls[0]->k->streamed) {
+        for (const Call* c : calls) append(c->call);
+        append(calls.back()->done);
         continue;
       }
       for (std::size_t i = 0; i < calls.size(); ++i) {
-        append(*calls[i], i == 0 ? calls[i]->lead : calls[i]->push[i & 1]);
-        if (++queued == 2) append(*calls[i], calls[i]->wait), --queued;
+        const Call& c = *calls[i];
+        if (c.k->swap && c.k->dec != dec) {
+          for (; queued > 0; --queued) append(calls[i - 1]->wait);
+          append_raw(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length);
+          dec = c.k->dec, since = 0;
+        }
+        append(since == 0 ? c.lead : c.push[since & 1]);
+        ++since;
+        if (++queued == 2) append(c.wait), --queued;
       }
-      for (; queued > 0; --queued) append(*calls.back(), calls.back()->wait);
-      append(*calls.back(), calls.back()->done);
+      for (; queued > 0; --queued) append(calls.back()->wait);
+      append(calls.back()->done);
     }
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
@@ -409,9 +512,9 @@ class LoomNpu {
     c.byte_offset = a.storage.memory_byte_offset + a.used;
     c.byte_length = size;
     a.used += (size + kCommandAlign - 1) / kCommandAlign * kCommandAlign;
-    return fused_[runs] = c;
+    return fused_[key] = {c, dec};
   }
-  std::map<std::vector<std::vector<Kernel*>>, amdf_xdna_kernel_command_t> fused_;
+  std::map<std::pair<std::vector<std::vector<const Call*>>, int>, std::pair<amdf_xdna_kernel_command_t, int>> fused_;
   std::deque<Arena> arenas_;
 
   static constexpr std::uint32_t kGateFailed = NpuSplit::kGateFailed;
@@ -459,6 +562,7 @@ class LoomNpu {
         std::lock_guard<std::mutex> lock(mu_);
         if (failure_.empty()) failure_ = e.what();
         resident_ = nullptr;
+        resident_dec_ = -1;
       }
       const auto now = std::chrono::steady_clock::now();
       const double ms = std::chrono::duration<double, std::milli>(now - std::max(p.t0, last_retired_)).count();
@@ -469,7 +573,7 @@ class LoomNpu {
         if (ok) {
           for (const GatedJob& g : p.jobs) {
             auto& st = stats_[g.tag];
-            st.jobs += 1, st.calls += g.kernels.size();
+            st.jobs += 1, st.calls += g.calls.size();
           }
           commands_.commands += 1, commands_.busy_ms += ms, commands_.max_ms = std::max(commands_.max_ms, ms);
           last_command_ms_ = ms;
@@ -700,7 +804,9 @@ class LoomNpu {
   std::map<std::string, iree_hal_amd_xdna_image_t*> images_;
   std::vector<std::unique_ptr<Shared>> shared_;
   std::vector<std::unique_ptr<Kernel>> kernels_;
-  const void* resident_ = nullptr;  // the image whose array state is set up; under mu_
+  const void* resident_ = nullptr;  // the image (family) whose array state is set up; under mu_
+  int resident_dec_ = -1;            // its decoder format at the end of the last submitted command; under mu_
+  std::map<std::tuple<const Shared*, std::size_t, std::size_t>, amdf_memory_t*> imports_;   // DMA-BUF views
   std::atomic<double> last_command_ms_{0};
   std::map<std::string, TagStats> stats_;  // under mu_
   CommandStats commands_;                  // under mu_
@@ -719,7 +825,7 @@ class LoomNpuSplit : public NpuSplit {
         a_(npu_.CreateShared(plan.a_bytes)),
         w_(npu_.CreateShared(plan.w_bytes)),
         c_(npu_.CreateShared(plan.c_bytes, true)),  // the NPU writes C (see CreateShared)
-        flags_(npu_.CreateShared(65536, true)),
+        flags_(npu_.CreateShared(plan.dcol ? kDcolFlagBytes : 65536, true)),
         plan_(plan) {
     if (!plan.gate_calls) throw LoomError("npu: the set has no gate protocol (dispatch.txt npugate; re-emit it)");
     if (!GpuPinnedHigh())
@@ -734,16 +840,63 @@ class LoomNpuSplit : public NpuSplit {
     const auto key = std::make_tuple(image, a.offset, a.length, w.offset, w.length, c.offset, c.length);
     if (const auto it = ids_.find(key); it != ids_.end()) return it->second;
     // the call's gate slot: flag record, tick scratch, signal (go, done)
-    const std::size_t slot = kGateBase + kGateSlot * kernels_.size();
-    if (slot + kGateSlot > flags_.bytes) throw LoomError("npu: more NPU calls than gate slots");
-    kernels_.push_back(&npu_.Load(image, "npu_gemm",
-                                  {{&a_, a.offset, a.length},
-                                   {&w_, w.offset, w.length},
-                                   {&c_, c.offset, c.length},
-                                   {&flags_, slot, plan_.gate_record},
-                                   {&flags_, slot + kTick, plan_.gate_record},
-                                   {&flags_, slot + kSignal, 2 * plan_.gate_record}}));
-    return ids_[key] = static_cast<std::uint32_t>(kernels_.size() - 1);
+    const std::size_t slot = GateSlot();
+    calls_.push_back(npu_.Snapshot(npu_.Load(image, "npu_gemm",
+                                             {{&a_, a.offset, a.length},
+                                              {&w_, w.offset, w.length},
+                                              {&c_, c.offset, c.length},
+                                              {&flags_, slot, plan_.gate_record},
+                                              {&flags_, slot + kTick, plan_.gate_record},
+                                              {&flags_, slot + kSignal, 2 * plan_.gate_record}})));
+    return ids_[key] = static_cast<std::uint32_t>(calls_.size() - 1);
+  }
+  void RegisterRaw(const void* p, std::size_t bytes) override {
+    const auto b = reinterpret_cast<std::uintptr_t>(p) & ~std::uintptr_t{4095};
+    const auto e = (reinterpret_cast<std::uintptr_t>(p) + bytes + 4095) & ~std::uintptr_t{4095};
+    for (const Raw& r : raw_)
+      if (r.begin <= b && e <= r.end) return;
+    // libamdf pins for writing: the private mapping gets its own copies of these pages (the same bytes; the page cache
+    // ones stay reclaimable, and the GPU's userptr import follows the new pages). The NPU does not snoop the CPU's
+    // caches, so the copies are flushed to memory.
+    auto* pages = reinterpret_cast<void*>(b);
+    if (mprotect(pages, e - b, PROT_READ | PROT_WRITE)) throw LoomError("npu: mprotect(weights)");
+    LoomNpu::Shared& s = npu_.RegisterHost(pages, e - b);
+    for (std::uintptr_t a = b; a < e; a += 64) _mm_clflushopt(reinterpret_cast<void*>(a));
+    _mm_sfence();
+    mprotect(pages, e - b, PROT_READ);
+    raw_.push_back({b, e, &s});
+  }
+  std::uint32_t BindRaw(const std::string& image, const std::string& swap, int dec, NpuView a, const void* raw,
+                        std::size_t raw_bytes, NpuView c) override {
+    const auto r0 = reinterpret_cast<std::uintptr_t>(raw);
+    const auto key = std::make_tuple(image, a.offset, a.length, std::size_t{r0}, raw_bytes, c.offset, c.length);
+    if (const auto it = ids_.find(key); it != ids_.end()) return it->second;
+    const Raw* r = nullptr;
+    for (const Raw& x : raw_)
+      if (x.begin <= r0 && r0 + raw_bytes <= x.end) r = &x;
+    if (!r) throw LoomError("npu: raw weights outside the registered ranges");
+    const std::size_t slot = GateSlot();
+    // bindings: A, the panel (not read), C, the gate's flag / tick / signal, the fill sink (not written), raw rows
+    const std::vector<LoomNpu::View> views = {{&a_, a.offset, a.length},
+                                              {&w_, 0, plan_.w_bytes},
+                                              {&c_, c.offset, c.length},
+                                              {&flags_, slot, plan_.gate_record},
+                                              {&flags_, slot + kTick, plan_.gate_record},
+                                              {&flags_, slot + kSignal, 2 * plan_.gate_record},
+                                              {&w_, 0, plan_.w_bytes},
+                                              {r->shared, r0 - r->begin, raw_bytes}};
+    // one instance per image, re-bound per call (an instance's storage is ~0.7 MB, mostly its array setup)
+    LoomNpu::Kernel*& k = instances_[image];
+    if (!k) {
+      k = &npu_.Load(image, "npu_gemm", views);
+      LoomNpu::Kernel*& sw = instances_[swap];
+      if (!sw) sw = &npu_.Load(swap, "npu_gemm", views);   // only its setup runs
+      k->family = &dcol_family_, k->dec = dec, k->swap = sw;
+    } else {
+      npu_.Rebind(*k, views);
+    }
+    calls_.push_back(npu_.Snapshot(*k));
+    return ids_[key] = static_cast<std::uint32_t>(calls_.size() - 1);
   }
   // A flag word from / to the host, through memory (the NPU does not snoop CPU caches).
   void HostStore(std::uint32_t word, std::uint32_t value) {
@@ -787,7 +940,7 @@ class LoomNpuSplit : public NpuSplit {
         for (std::size_t i = queued + command.size(); i < jobs.size() && command.size() < kJobsPerCommand; ++i) {
           if (!command.empty() && calls + jobs[i].calls.size() > kCallsPerCommand) break;
           LoomNpu::GatedJob g;
-          for (const std::uint32_t id : jobs[i].calls) g.kernels.push_back(kernels_.at(id));
+          for (const std::uint32_t id : jobs[i].calls) g.calls.push_back(&calls_.at(id));
           g.done = static_cast<volatile std::uint32_t*>(flags_.host) + jobs[i].words.done;
           g.gate = jobs[i].words.gate;
           g.tag = jobs[i].tag;
@@ -831,11 +984,25 @@ class LoomNpuSplit : public NpuSplit {
   // Jobs per NPU command: few commands, while the longest (its waits for the GPU included) stays far below the driver's
   // 2000 ms command limit.
   static constexpr std::size_t kJobsPerCommand = 16, kCallsPerCommand = 256;
+  // Decoder-column sets bind a few thousand calls (a gate slot each).
+  static constexpr std::size_t kDcolFlagBytes = 2u << 20;
+  std::size_t GateSlot() const {
+    const std::size_t slot = kGateBase + kGateSlot * calls_.size();
+    if (slot + kGateSlot > flags_.bytes) throw LoomError("npu: more NPU calls than gate slots");
+    return slot;
+  }
+  struct Raw {
+    std::uintptr_t begin, end;
+    LoomNpu::Shared* shared;
+  };
   LoomNpu npu_;
   LoomNpu::Shared &a_, &w_, &c_, &flags_;
   NpuPlan plan_;
   std::uint32_t seq_ = 0;
-  std::vector<LoomNpu::Kernel*> kernels_;
+  std::deque<LoomNpu::Call> calls_;   // stable addresses (LoomNpu::GatedJob)
+  std::vector<Raw> raw_;
+  std::map<std::string, LoomNpu::Kernel*> instances_;
+  const char dcol_family_ = 0;
   std::map<std::tuple<std::string, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>,
            std::uint32_t>
       ids_;

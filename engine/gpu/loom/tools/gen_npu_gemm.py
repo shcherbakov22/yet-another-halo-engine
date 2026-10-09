@@ -25,6 +25,8 @@ first call, fills unpaced; LoomNpu submits the pushes one call ahead of the wait
 Needs HRX patch 0013; compile with LOOM_ENV. Config.gate > 0 adds the NPU-side gate (GATE below; HRX patch 0016).
 """
 import dataclasses
+import importlib
+import os
 import sys
 
 import gen_bfp16_encode as GE
@@ -52,6 +54,14 @@ class Config:
     acap_t: int = 2     # activation ring slabs, tail (its memory also holds C)
     entry: str = "npu_gemm"
     gate: int = 0       # NPU-side gate: poll supply per job (0: ungated); see GATE below
+    dcol: int = 0       # 2: the fill column decodes fmt from a raw binding (gen_npu_dec); 1: a fill column (column cols, rows 2..5) streams each GEMM column's weight panel into its memory
+                        # tile (constrain.fill; worker f fills columns 2 f, 2 f + 1); the panel binding is not read
+    frec: int = 2304    # fill record bytes
+    fmt: str = "IQ4_XS"  # dcol 2: the raw weights' GGUF format
+    kraw: int = 0       # dcol 2: the raw rows' K (row stride; the call reads K = 1024 * passes of it), 0: the call's K
+    ofeat: int = 0      # final f32 output, fragment-major into [token / 16][ofeat / 16][16][16]: column c's 80 features are
+                        # fragments 5c .. 5c + 4; needs one replay group (GE.GROUPS = (passes,)) and
+                        # LOOM_EXP_LS_SEND_PITCH=1 (the whole f32 slot is sent)
 
 
 # NPU-side gate (cfg.gate = supply): column 0's head waits for each job's ready word itself and its neighbor mid relays.
@@ -73,6 +83,32 @@ GP0, GPS, GB = 650, 26, 8
 GATE_SUPPLY, GATE_CALLS, GATE_RECORD, GATE_FAILED = 1024, 64, 16, 1 << 31
 
 
+_LEAVES = {}
+
+
+def decoder(fmt):
+    """gen_npu_dec for fmt (its constants follow DQ_FMT at import)."""
+    import gen_npu_dec
+    if gen_npu_dec.FMT != fmt:
+        os.environ["DQ_FMT"] = fmt
+        gen_npu_dec = importlib.reload(gen_npu_dec)
+    return gen_npu_dec
+
+
+def loom_env(cfg, swap=False):
+    """LOOM_ENV for cfg. The decoder column (dcol 2): records interleaved per panel slab, the send pitch on the C ring
+    only (the decoders' fill rings keep pitch 1). swap: the image's setup alone, only the decoder tiles' records (an
+    image switch between decoder formats of otherwise identical images)."""
+    env = dict(LOOM_ENV)
+    if cfg.dcol == 2:
+        env["LOOM_EXP_PANEL_INTERLEAVE"] = str(NP)
+        env["LOOM_EXP_LS_SEND_PITCH_RECORD"] = str(NP * 4 * 256 // 8 * 4)
+    if swap:
+        env["LOOM_EXP_SETUP_ONLY"] = "1"
+        env["LOOM_EXP_SETUP_TILES"] = ",".join(f"{cfg.cols}:{2 + f}" for f in range(fill_workers(cfg)))
+    return env
+
+
 def groups(cfg):
     """The call's replay groups of passes, () for a single group."""
     g = GE.pass_groups(cfg.passes)
@@ -89,6 +125,23 @@ def stream_bytes(cfg):
     a = sum(cfg.nb * cfg.passes * MP * slab(k) for k in cfg.ks)
     w = cfg.cols * sum(cfg.passes * NP * slab(k) for k in cfg.ks)
     return a, w, max(1, len(groups(cfg))) * cfg.cols * cfg.nb * MP * NP * 2 * 256
+
+
+def shuffle16_cycles():
+    """The non-trivial cycles of piece i -> 2 (i % 8) + i // 8 on 16 pieces."""
+    seen, out = set(), []
+    for i in range(16):
+        c, j = [], i
+        while j not in seen:
+            seen.add(j)
+            c.append(j)
+            j = 2 * (j % 8) + j // 8
+        if len(c) > 1:
+            out.append(c)
+    return out
+
+
+SHUFFLE16_CYCLES = shuffle16_cycles()
 
 
 def bump(L, dst, src, off):
@@ -110,7 +163,7 @@ def array_program(L, cfg):
     cols, nb, P = cfg.cols, cfg.nb, cfg.passes
     e("aie2p.target<array> @array_target\naie2p.target<core> @core_target\n")
     e(f"low.func.def public retain target<amd.xdna.aie2p.array>(@array_target) abi(array_program) @{cfg.entry}() asm {{")
-    for k, v in (("zero", 0), ("one", 1), ("two", 2), ("nw", rows * cols), ("rec", nb * P), ("orec", nb), ("fold", P)):
+    for k, v in (("zero", 0), ("one", 1), ("two", 2), ("nw", rows * cols + (fill_workers(cfg) if cfg.dcol else 0)), ("rec", nb * P), ("orec", nb), ("fold", P)):
         e(f"  %{k} = constant.u32 {v} : reg<aie2p.array.scalar : index>")
     e("  %origin = constant.u64 0 : reg<aie2p.array.offset : offset>")
     e("  %workers = group %nw")
@@ -131,12 +184,26 @@ def array_program(L, cfg):
     seg = MP * NP * 4 * 256 // MP
     ng = max(1, len(groups(cfg)))   # C segments per M block and group
     e(f"  %nseg = constant.u32 {ng * nb * MP} : reg<aie2p.array.scalar : index>")
-    e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{ng * nb * MP}x{seg // 8}xi32>>")
+    if cfg.ofeat:
+        # a segment is [sub-tile 5][16 tokens][16 f32] (the tail's convert_f32)
+        # the tail's slot is [sub-tile][16 tokens][16 f32] (convert_f32): NP consecutive fragments of one 16-token row
+        # (the 1280 contiguous words as 5 x 256: a shim DMA wrap holds at most 1023)
+        rec = f"{NP}x256"
+        # with two replay groups each group's partial is its own tensor, stacked: [group][token / 16][ofeat / 16][16][16]
+        e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{ng * nb * MP}x{rec}xi32, "
+          f"#encoding.layout.strided<strides=[{NP * 256}, {cfg.ofeat * 16}, 256, 1]>>>")
+        stype = f"tile<{rec}xi32>"
+    else:
+        rec = f"{seg // 8}"
+        e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{ng * nb * MP}x{rec}xi32>>")
+        stype = f"tile<{rec}xi32>"
     for c in range(cols):
-        e(f"  %cr{c} = partition.receiver %c_all, %origin, %n{c}, %ncols : reg<aie2p.array.receiver : tile<{seg // 8}xi32>>")
-        e(f"  %sc{c} = sender %k{c}_{rows - 1}, 2 : reg<aie2p.array.sender : tile<{seg // 8}xi32>>")
-        e(f"  %chc{c} = channel %sc{c}, %cr{c}, %n{MP}, %nseg : reg<aie2p.array.channel : tile<{seg // 8}xi32>>")
+        e(f"  %cr{c} = partition.receiver %c_all, %origin, %n{c}, %ncols : reg<aie2p.array.receiver : tile<{rec}xi32>>")
+        e(f"  %sc{c} = sender %k{c}_{rows - 1}, 2 : reg<aie2p.array.sender : {stype}>")
+        e(f"  %chc{c} = channel %sc{c}, %cr{c}, %n{MP}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
         e(f"  constrain.leaf_sync %chc{c}")
+    if cfg.dcol:
+        fill_channels(e, cfg, panel)
     # weights: per-column panels [slice][pass][record], staged in that column's memory tile, replayed per M block
     for c in range(cols):
         for r in range(rows):
@@ -149,6 +216,10 @@ def array_program(L, cfg):
             e(f"  %rw{c}_{r} = receiver %k{c}_{r}, 1 : reg<aie2p.array.receiver : tile<{wrec // 4}xi32>>")
             e(f"  %chw{c}_{r} = channel %wv{c}_{r}, %rw{c}_{r}, %two, %rec : reg<aie2p.array.channel : tile<{wrec // 4}xi32>>")
             e(f"  constrain.stage %chw{c}_{r}, %n{c if cols > 1 else 1}")
+        if cfg.dcol:
+            e(f"  constrain.fill %chw{c}_0, %chf{c}")
+    if cfg.dcol:
+        fill_inputs(e, cfg, panel)
     # activations: one stream per row, one slab per record, multicast along the row (first branch rotates)
     for r in range(rows):
         fa = slab(cfg.ks[r])
@@ -193,6 +264,102 @@ def array_program(L, cfg):
         e("  constrain.gate %chgs")
         e("  constrain.signal %chgs")
     e("  return\n}\n")
+
+
+FILL_PER = 2   # GEMM columns per fill worker
+FILL_DIV = 1   # timing emulation: input records frec / FILL_DIV, written FILL_DIV times (raw-sized DRAM reads)
+
+
+def fill_workers(cfg):
+    return (cfg.cols + FILL_PER - 1) // FILL_PER
+
+
+def fill_channels(e, cfg, panel):
+    """Fill workers in column cols (rows 2..): worker f takes columns 2 f, 2 f + 1, each a contiguous panel of %wb in
+    frec-byte records (in port j, out port 2 + j), into the dummy write binding %fsb (lane c)."""
+    cols, rows = cfg.cols, len(cfg.ks)
+    assert cols <= 7 and panel % cfg.frec == 0
+    frec = 2304 if cfg.dcol == 2 else cfg.frec
+    nrec = panel // frec
+    fw = frec // 4
+    e(f"  %fcol = constant.u32 {cols} : reg<aie2p.array.scalar : index>")
+    e(f"  %fnrec = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
+    e(f"  %fsb = binding {6 if cfg.gate else 3}, \"write\"")
+    e(f"  %fs_all = receiver %fsb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nrec}x{fw}xi32>>")
+    for f in range(fill_workers(cfg)):
+        e(f"  %flane{f} = constant.u32 {rows * cols + f} : reg<aie2p.array.scalar : index>")
+        e(f"  %frow{f} = constant.u32 {2 + f} : reg<aie2p.array.scalar : index>")
+        e(f"  %kf{f} = worker %workers, %flane{f}, @fill{min(FILL_PER, cols - FILL_PER * f)}")
+        e(f"  constrain.location %kf{f}, %fcol, %frow{f}")
+    for c in range(cols):
+        f, j = c // FILL_PER, c % FILL_PER
+        nports = min(FILL_PER, cols - FILL_PER * f)
+        e(f"  %fsr{c} = partition.receiver %fs_all, %origin, %n{c}, %fcol : reg<aie2p.array.receiver : tile<{fw}xi32>>")
+        e(f"  %fss{c} = sender %kf{f}, {nports + j} : reg<aie2p.array.sender : tile<{fw}xi32>>")
+        e(f"  %chf{c} = channel %fss{c}, %fsr{c}, %two, %fnrec : reg<aie2p.array.channel : tile<{fw}xi32>>")
+        if cfg.dcol == 2:
+            e(f"  constrain.leaf_sync %chf{c}")
+
+
+def fill_inputs(e, cfg, panel):
+    """The fill workers' input channels (after the panels: each stages in its column's memory tile, behind the panel)."""
+    nrec, fw = panel // cfg.frec, cfg.frec // 4 // FILL_DIV
+    if cfg.dcol == 2:
+        # raw rows [N][kraw / 256][BLK]: per column 25 (pass, slab) units of [16 rows][4 super-blocks]
+        D = decoder(cfg.fmt)
+        P_, NS_ = cfg.passes, NP
+        RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * D.BLK // 4   # row stride in words
+        RW = D.ROWB // 4                                  # record row words (fixed for every format)
+        assert sum(cfg.ks) == 128
+        e(f"  %rwb = binding {7 if cfg.gate else 4}, \"read\"")
+        e(f"  %funits = constant.u32 {P_ * NS_} : reg<aie2p.array.scalar : index>")
+        for c in range(cfg.cols):
+            f, j = c // FILL_PER, c % FILL_PER
+            e(f"  %fo{c} = constant.u64 {c * TN * RS * 4} : reg<aie2p.array.offset : offset>")
+            e(f"  %fi_all{c} = sender %rwb, 0 : reg<aie2p.array.sender : tile<{P_}x{NS_}x16x{RW}xi32, "
+              f"#encoding.layout.strided<strides=[{D.BLK}, {16 * RS}, {RS}, 1]>>>")
+            e(f"  %fiv{c} = view.sender %fi_all{c}, %fo{c} : reg<aie2p.array.sender : tile<16x{RW}xi32>>")
+            e(f"  %fir{c} = receiver %kf{f}, {j} : reg<aie2p.array.receiver : tile<16x{RW}xi32>>")
+            e(f"  %chfi{c} = channel %fiv{c}, %fir{c}, %one, %funits : reg<aie2p.array.channel : tile<16x{RW}xi32>>")
+            a_cols = {(2 * r) % cfg.cols for r in range(len(cfg.ks))}
+            e(f"  constrain.stage %chfi{c}, {'%fcol' if c in a_cols else f'%n{c}'}")
+        return
+    for c in range(cfg.cols):
+        f, j = c // FILL_PER, c % FILL_PER
+        e(f"  %fo{c} = constant.u64 {c * panel} : reg<aie2p.array.offset : offset>")
+        e(f"  %fi_all{c} = sender %wb, 0 : reg<aie2p.array.sender : tile<{nrec}x{fw}xi32>>")
+        e(f"  %fiv{c} = view.sender %fi_all{c}, %fo{c} : reg<aie2p.array.sender : tile<{fw}xi32>>")
+        e(f"  %fir{c} = receiver %kf{f}, {j} : reg<aie2p.array.receiver : tile<{fw}xi32>>")
+        e(f"  %chfi{c} = channel %fiv{c}, %fir{c}, %two, %fnrec : reg<aie2p.array.channel : tile<{fw}xi32>>")
+        # the activation rows stage in memory tiles (2 r) % cols: those columns' fills stage in the fill column's
+        a_cols = {(2 * r) % cfg.cols for r in range(len(cfg.ks))}
+        e(f"  constrain.stage %chfi{c}, {'%fcol' if c in a_cols else f'%n{c}'}")
+
+
+def fill_leaf(L, cfg, nports):
+    """Pass-through fill leaf: copies each port's record (in i -> out nports + i)."""
+    e = L.append
+    e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @fill{nports}() asm {{")
+    for i in range(2 * nports):
+        e(f"  %r{i} = resource<native_pointer> {{index = {i}, source_type = buffer}} : reg<aie2p.ep>")
+    for j in range(nports):
+        src, dst = f"%r{j}", f"%r{nports + j}"
+        cur = src
+        for v in range(cfg.frec // 64):
+            if v and v % 7 == 0:
+                e(f"  %d{j}_{v} = padda {dst}, 448")
+                dst = f"%d{j}_{v}"
+            u = v // FILL_DIV                       # FILL_DIV > 1: each input vector written FILL_DIV times
+            if v % FILL_DIV == 0:
+                if u and u % 7 == 0:
+                    e(f"  %s{j}_{v} = padda {cur}, 448")
+                    cur = f"%s{j}_{v}"
+                e(f"  %v{j}_{v} = vlda.512.i8x64 {cur}, {64 * (u % 7)}")
+                last = f"%v{j}_{v}"
+            e(f"  vst.512.i8x64 {last}, {dst}, {64 * (v % 7)}")
+    e("  return")
+    e("}")
+    e("")
 
 
 def leaf(L, cfg, role, ks, gate=None):
@@ -692,6 +859,39 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
             e(f"  %cqr{t} = copy %clast : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
             e(f"  rel.cond %one, %cqr{t}, 2")
             return f"%cj{t}p", f"%cj{t}l"
+        def convert_f32(base, lp, back):
+            """Last pass (cfg.ofeat): permute each (sub-tile, mh) half of the segment's f32 C in place from [nh][row][8]
+            to [row][nh][8] (whole 32-byte chain rows), so the slot is [sub-tile][16 tokens][16 f32] for the strided C
+            receiver (fragment-major output). A half's 16 rows are all loaded before any is stored. Returns the join's (base, lp)."""
+            e(f"  low.cond_br %clast, ^cv{t}, ^nc{t} : reg<aie2p.er>")
+            e(f"^nc{t}:")
+            e(f"  low.br ^cj{t}({base}: reg<aie2p.ep>, {lp}: reg<aie2p.ep>)")
+            e(f"^cv{t}:")
+            e(f"  %cvk{t} = copy {base} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            d, k, rest = f"%cvk{t}", 0, back + 512 - 256   # the first half's middle
+            while rest > 0:
+                step = min(rest, 448)
+                rest -= step
+                e(f"  %cvb{t}_{k} = padda {d}, {-step}")
+                d, k = f"%cvb{t}_{k}", k + 1
+            for h in range(2 * NP):
+                if h:
+                    bump(L, f"%cvh{t}_{h}", d, 512)
+                    d = f"%cvh{t}_{h}"
+                # piece i = 8 nh + row (32 bytes at 32 i) belongs at 2 row + nh: a perfect shuffle, cycles of <= 4 pieces
+                for cyc in SHUFFLE16_CYCLES:
+                    for i in cyc:
+                        e(f"  %cvx{t}_{h}_{i} = vlda.256.i32x8 {d}, {32 * i - 256}")
+                    for i in cyc:
+                        e(f"  vst.256.i32x8 %cvx{t}_{h}_{i}, {d}, {32 * (2 * (i % 8) + i // 8) - 256}")
+            e(f"  %cvq{t} = copy {base} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            e(f"  low.br ^cj{t}({base}: reg<aie2p.ep>, %cvq{t}: reg<aie2p.ep>)")
+            e(f"^cj{t}(%cj{t}p: reg<aie2p.ep>, %cj{t}l: reg<aie2p.ep>):")
+            e(f"  %cqr{t} = copy %clast : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
+            e(f"  rel.cond %one, %cqr{t}, 2")
+            return f"%cj{t}p", f"%cj{t}l"
+        if cfg.ofeat:
+            convert = convert_f32
         if row_end and not nxt:
             pc[t], pl[t] = convert(pc[t], pl[t], 1024 * (NP - 1))
         if nxt:
@@ -739,6 +939,15 @@ def gen(cfg):
     assert len(set(cfg.ks[1:-1])) == 1, "the mids share one leaf"
     leaf(L, cfg, "mid", cfg.ks[1])
     leaf(L, cfg, "tail", cfg.ks[-1])
+    if cfg.dcol:
+        for n in sorted({min(FILL_PER, cfg.cols - FILL_PER * f) for f in range(fill_workers(cfg))}):
+            if cfg.dcol == 2:
+                if (cfg.fmt, n) not in _LEAVES:   # scheduled in Python (gen_npu_dec, npu_lsched): once per process
+                    _LEAVES[(cfg.fmt, n)] = decoder(cfg.fmt).leaf(f"fill{n}", n)
+                L.append(_LEAVES[(cfg.fmt, n)])
+                L.append("")
+            else:
+                fill_leaf(L, cfg, n)
     if cfg.gate:
         leaf(L, cfg, "head", cfg.ks[0], gate="waiter")
         leaf(L, cfg, "mid", cfg.ks[1], gate="relay")

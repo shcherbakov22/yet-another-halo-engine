@@ -1,0 +1,715 @@
+diff --git a/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors.py b/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors.py
+index 180bb32de..f62f7f55a 100644
+--- a/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors.py
++++ b/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors.py
+@@ -526,6 +526,22 @@ _DESCRIPTORS = (
+         schedule_class=_SCHEDULE_GRAPH,
+         flags=(DescriptorFlag.SIDE_EFFECTING,),
+     ),
++    Descriptor(
++        key=f"{_DESCRIPTOR_SET_KEY}.constrain.fill",
++        mnemonic="constrain.fill",
++        semantic_tag="array.constraint.fill",
++        operands=(
++            _operand(_REG_CHANNEL, "panel"),
++            _operand(_REG_CHANNEL, "source"),
++        ),
++        asm_forms=_asm(
++            "constrain.fill",
++            operands=("panel", "source"),
++        ),
++        effects=(_TOPOLOGY_EFFECT,),
++        schedule_class=_SCHEDULE_GRAPH,
++        flags=(DescriptorFlag.SIDE_EFFECTING,),
++    ),
+     Descriptor(
+         key=f"{_DESCRIPTOR_SET_KEY}.constrain.signal",
+         mnemonic="constrain.signal",
+diff --git a/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors_test.py b/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors_test.py
+index 6e017b661..7cdd1e135 100644
+--- a/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors_test.py
++++ b/loom/py/loom/target/arch/amd/xdna/aie2p/array_descriptors_test.py
+@@ -228,6 +228,7 @@ def test_asm_mnemonics_are_target_relative() -> None:
+         "constant.u64",
+         "constant.u32",
+         "constrain.core_stream",
++        "constrain.fill",
+         "constrain.gate",
+         "constrain.leaf_sync",
+         "constrain.location",
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
+index bf5451799..5df6d0f59 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/binding.c
+@@ -160,6 +160,8 @@ bool loom_aie2p_array_resolve_binding_transfer(
+   uint64_t transfer_byte_length = logical_transfer_byte_length;
+   uint64_t task_repeat_count = 1;
+   uint8_t dma_dimension_count = 0;
++  uint32_t iteration_step_size = 0;
++  uint16_t iteration_wrap = 0;
+   loom_aie2p_array_binding_dma_dimension_t
+       dma_dimensions[LOOM_AIE2P_ARRAY_BINDING_DMA_DIMENSION_COUNT] = {0};
+ 
+@@ -296,7 +298,38 @@ bool loom_aie2p_array_resolve_binding_transfer(
+     binding_span_byte_length = binding_span_bit_length / 8u;
+ 
+     if (!transfer_is_dense) {
+-      const uint8_t transfer_rank = source_rank - first_transfer_axis;
++      uint8_t transfer_rank = source_rank - first_transfer_axis;
++      if (transfer_rank == dma_facts->address_dimension_count + 1u) {
++        // One axis too many: the outermost becomes the descriptor iteration,
++        // the queued task repeating the descriptor once per index.
++        const uint32_t dimension = loom_aie2p_array_binding_dimension_value(
++            facts, source_type, first_transfer_axis);
++        uint64_t element_stride = 0;
++        uint64_t step_bits = 0;
++        if (!loom_aie2p_array_binding_stride_value(
++                &layout, first_transfer_axis, &element_stride, out_reason)) {
++          return false;
++        }
++        if (!iree_checked_mul_u64(element_stride, (uint64_t)element_bit_width,
++                                  &step_bits) ||
++            step_bits % family->address_generation_granularity_bits != 0 ||
++            step_bits == 0 || dimension < 2 || dimension > 64 ||
++            step_bits / family->address_generation_granularity_bits >
++                (UINT64_C(1) << 20) ||
++            transfer_byte_length % dimension != 0) {
++          return loom_aie2p_array_reject_binding_transfer(
++              IREE_SV("the iterated outermost axis exceeds the shim DMA "
++                      "iteration fields"),
++              out_reason);
++        }
++        iteration_step_size =
++            (uint32_t)(step_bits / family->address_generation_granularity_bits);
++        iteration_wrap = (uint16_t)dimension;
++        transfer_byte_length /= dimension;
++        task_repeat_count *= dimension;
++        ++first_transfer_axis;
++        --transfer_rank;
++      }
+       if (transfer_rank > dma_facts->address_dimension_count) {
+         return loom_aie2p_array_reject_binding_transfer(
+             IREE_SV("the strided transfer requires more address dimensions "
+@@ -342,7 +375,8 @@ bool loom_aie2p_array_resolve_binding_transfer(
+         out_reason);
+   }
+   uint64_t chain_length = 1;
+-  if (task_repeat_count > dma_facts->maximum_task_repeat_count &&
++  if (iteration_wrap == 0 &&
++      task_repeat_count > dma_facts->maximum_task_repeat_count &&
+       maximum_chain_length > 1 &&
+       task_repeat_count % dma_facts->maximum_task_repeat_count == 0 &&
+       task_repeat_count / dma_facts->maximum_task_repeat_count <=
+@@ -373,6 +407,8 @@ bool loom_aie2p_array_resolve_binding_transfer(
+   binding_plan->task_repeat_count = (uint16_t)task_repeat_count;
+   binding_plan->chain_length = (uint16_t)chain_length;
+   binding_plan->dma_dimension_count = dma_dimension_count;
++  binding_plan->iteration_step_size = iteration_step_size;
++  binding_plan->iteration_wrap = iteration_wrap;
+   memcpy(binding_plan->dma_dimensions, dma_dimensions,
+          sizeof(binding_plan->dma_dimensions));
+   return true;
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+index 970d4fa5e..2dd295b34 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+@@ -136,6 +136,7 @@ static uint32_t loom_aie2p_array_channel_resources_leaf_bank_stride(
+ 
+ // Experimental LOOM_EXP_LS_SEND_PITCH=<n>: a leaf-synchronized send ring's slots are n records apart; each slot sends
+ // its leading record (a leaf that keeps wider data per slot, e.g. f32 accumulators, sends a packed copy of it).
++// LOOM_EXP_LS_SEND_PITCH_RECORD=<bytes> limits it to rings of that record size (other leaf sends keep pitch 1).
+ static uint32_t loom_aie2p_array_channel_resources_leaf_send_pitch(
+     const loom_aie2p_array_compute_endpoint_request_t* request) {
+   if (!iree_any_bit_set(
+@@ -144,6 +145,11 @@ static uint32_t loom_aie2p_array_channel_resources_leaf_send_pitch(
+       request->direction != LOOM_AIE2P_ARRAY_DMA_DIRECTION_MEMORY_TO_STREAM) {
+     return 0;
+   }
++  const char* only = getenv("LOOM_EXP_LS_SEND_PITCH_RECORD");
++  if (only != NULL && atoi(only) > 0 &&
++      (uint32_t)atoi(only) != request->record_byte_length) {
++    return 0;
++  }
+   const char* value = getenv("LOOM_EXP_LS_SEND_PITCH");
+   return value != NULL && atoi(value) > 1
+              ? (uint32_t)atoi(value) * request->record_byte_length
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index 0a7a9e0fd..ed5fab70d 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -621,6 +621,8 @@ static void loom_aie2p_array_extract_channel(
+   channel->gate = false;
+   channel->request_partner = UINT32_MAX;
+   channel->signal = false;
++  channel->fill_source = UINT32_MAX;
++  channel->fill_target = UINT32_MAX;
+   channel->request_poll = false;
+   channel->request_lock_id = UINT8_MAX;
+   channel->stage_dma_index = UINT32_MAX;
+@@ -637,6 +639,9 @@ static void loom_aie2p_array_extract_channel(
+   memset(channel->stage_panel_group_records, 0,
+          sizeof(channel->stage_panel_group_records));
+   channel->stage_panel_stream = false;
++  channel->stage_panel_sub_bytes = 0;
++  channel->stage_panel_sub_offset = 0;
++  channel->stage_panel_unit_bytes = 0;
+   channel->stage_first_record = UINT32_MAX;
+   loom_aie2p_array_define_entity(builder, channel->value_id,
+                                  LOOM_AIE2P_ARRAY_ENTITY_CHANNEL,
+@@ -872,6 +877,17 @@ static iree_status_t loom_aie2p_array_extract_topology(
+         builder->channels[tick].request_partner = poll;
+         break;
+       }
++      case AIE2P_ARRAY_DESCRIPTOR_REF_ARRAY_CONSTRAIN_FILL: {
++        const uint32_t panel =
++            loom_aie2p_array_lookup_entity(builder, loom_op_operands(op)[0])
++                ->index;
++        const uint32_t source =
++            loom_aie2p_array_lookup_entity(builder, loom_op_operands(op)[1])
++                ->index;
++        builder->channels[panel].fill_source = source;
++        builder->channels[source].fill_target = panel;
++        break;
++      }
+       case AIE2P_ARRAY_DESCRIPTOR_REF_ARRAY_CONSTRAIN_SIGNAL: {
+         builder->channels[loom_aie2p_array_lookup_entity(
+                               builder, loom_op_operands(op)[0])
+@@ -1496,7 +1512,54 @@ static iree_status_t loom_aie2p_array_admit_memory_tile_panel(
+   }
+   const uint32_t groups = owner->stage_panel_group_count;
+   const uint32_t half_descriptor_count = stage_dma->buffer_descriptor_count / 2u;
+-  if (groups * member_count > half_descriptor_count) {
++  // EXPERIMENT: LOOM_EXP_PANEL_INTERLEAVE=<n> interleaves the members' records
++  // per sub-record (see stage_panel_sub_bytes); the fill then takes 2 m + 1
++  // descriptors per group (m first-unit slices acquiring the members' credits,
++  // the bulk, m last-unit slices releasing their ready locks).
++  const char* interleave_value = getenv("LOOM_EXP_PANEL_INTERLEAVE");
++  const uint32_t interleave =
++      interleave_value != NULL && atoi(interleave_value) > 1
++          ? (uint32_t)atoi(interleave_value)
++          : 0u;
++  if (interleave) {
++    uint64_t unit = 0;
++    for (uint32_t slot = 0; slot < member_count; ++slot) {
++      for (iree_host_size_t i = 0; i < builder->plan->channel_count; ++i) {
++        loom_aie2p_array_channel_t* member = &builder->channels[i];
++        if (member->stage_panel_owner != owner_index ||
++            member->stage_panel_slot != slot) {
++          continue;
++        }
++        if (!member->stage_panel_stream ||
++            member->record_byte_length % (interleave * 16u) != 0 ||
++            memcmp(member->stage_panel_group_records,
++                   owner->stage_panel_group_records,
++                   sizeof(owner->stage_panel_group_records)) != 0) {
++          return loom_aie2p_array_reject_channel_resources(
++              builder, (uint32_t)i, stage,
++              IREE_SV("an interleaved panel needs streamed members with equal "
++                      "groups and records that split into 16-byte multiples"));
++        }
++        member->stage_panel_sub_bytes = member->record_byte_length / interleave;
++        member->stage_panel_sub_offset = (uint32_t)unit;
++        unit += member->stage_panel_sub_bytes;
++      }
++    }
++    owner->stage_panel_unit_bytes = (uint32_t)unit;
++    builder->plan->panel_interleave = (uint8_t)interleave;
++    uint64_t total = 0;
++    for (uint32_t g = 0; g < groups; ++g) {
++      if (owner->stage_panel_group_records[g] * interleave < 2u) {
++        return loom_aie2p_array_reject_channel_resources(
++            builder, owner_index, stage,
++            IREE_SV("an interleaved panel group needs at least two units"));
++      }
++      total += (uint64_t)owner->stage_panel_group_records[g] * interleave * unit;
++    }
++    largest = total;
++  }
++  if (groups * (interleave ? 2u * member_count + 1u : member_count) >
++      half_descriptor_count) {
+     return loom_aie2p_array_reject_channel_resources(
+         builder, owner_index, stage,
+         IREE_SV("a shared memory-tile panel needs its slices within one "
+@@ -2379,10 +2442,14 @@ static iree_status_t loom_aie2p_array_plan_stage(
+       loom_aie2p_array_tile_state(builder, coordinate);
+   loom_aie2p_array_tile_resources_t* resources = &state->resources;
+   const uint16_t record_count = (uint16_t)channel->stage_record_count;
++  // An interleaved panel is one record that every member slot aliases.
++  const bool interleaved = channel->stage_panel_owner == channel_index &&
++                           channel->stage_panel_unit_bytes != 0;
+   // Ring storage and the credit/ready lock pair.
+   loom_aie2p_array_ring_resource_proposal_t ring = {0};
+   if (loom_aie2p_array_channel_resources_propose_neighbor(
+-          resources, coordinate, /*load_address_base=*/0, (uint8_t)record_count,
++          resources, coordinate, /*load_address_base=*/0,
++          interleaved ? (uint8_t)1 : (uint8_t)record_count,
+           channel->stage_panel_owner == channel_index
+               ? channel->stage_panel_record_bytes
+               : channel->record_byte_length * channel->stage_group,
+@@ -2409,7 +2476,8 @@ static iree_status_t loom_aie2p_array_plan_stage(
+   // group); its fill writes every member's slice, a descriptor per group.
+   const bool panel = channel->stage_panel_owner == channel_index;
+   const uint16_t groups = panel ? channel->stage_panel_group_count : 1u;
+-  const uint16_t fill_count = (uint16_t)(groups * record_count);
++  const uint16_t fill_count =
++      (uint16_t)(groups * (interleaved ? 2u * record_count + 1u : record_count));
+   const uint16_t drain_count = panel ? groups : record_count;
+   uint16_t* fill_cursor = &state->memory_tile_bd_cursors[fill_channel & 1u];
+   uint16_t* drain_cursor = &state->memory_tile_bd_cursors[drain_channel & 1u];
+@@ -2502,7 +2570,7 @@ static iree_status_t loom_aie2p_array_plan_stage(
+   channel->stage_first_record = (uint32_t)builder->stage_record_cursor;
+   for (uint32_t record = 0; record < record_count; ++record) {
+     builder->stage_record_offsets[builder->stage_record_cursor++] =
+-        ring.owner_offsets[record];
++        ring.owner_offsets[interleaved ? 0u : record];
+   }
+   return iree_ok_status();
+ }
+@@ -2758,10 +2826,16 @@ static iree_status_t loom_aie2p_array_plan_external_channel(
+       staged             ? channel->stage_column
+       : owns_compute_dma ? compute_proposal.ring.coordinate.column
+                          : shared_compute_dma->coordinate.column;
+-  const bool owns_shim_dma = iree_any_bit_set(
+-      channel->resource_flags,
+-      LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_MEMORY_TO_STREAM |
+-          LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_STREAM_TO_MEMORY);
++  // A worker-filled panel (constrain.fill) and its source transfer no binding:
++  // the source's stream feeds the panel's memory-tile fill directly.
++  const bool fill_linked = channel->fill_source != UINT32_MAX ||
++                           channel->fill_target != UINT32_MAX;
++  const bool owns_shim_dma =
++      !fill_linked &&
++      iree_any_bit_set(
++          channel->resource_flags,
++          LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_MEMORY_TO_STREAM |
++              LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_STREAM_TO_MEMORY);
+   loom_aie2p_array_shim_endpoint_proposal_t shim_proposal = {0};
+   // A streamed plan alternates two descriptor sets between invocations; a
+   // streamed panel owner transfers each group with its own descriptor.
+@@ -2864,13 +2938,33 @@ static iree_status_t loom_aie2p_array_plan_external_channel(
+         &builder->dma_channels[channel->stage_dma_index];
+     const loom_aie2p_array_dma_plan_t* drain = fill + 1;
+     // The memory-tile leg uses its own prefix root beyond the channel range.
++    bool fill_routed = false;
++    if (channel->fill_source != UINT32_MAX) {
++      // constrain.fill: the source worker's memory-to-stream DMA (planned
++      // first) streams straight into the fill.
++      const loom_aie2p_array_channel_t* fill_source =
++          &builder->channels[channel->fill_source];
++      if (fill_source->sender_dma_index == UINT32_MAX) {
++        return loom_aie2p_array_reject_channel_resources(
++            builder, channel_index, fill->coordinate,
++            IREE_SV("a constrain.fill source channel must precede the panel "
++                    "it fills"));
++      }
++      const loom_aie2p_array_dma_plan_t* source_dma =
++          &builder->dma_channels[fill_source->sender_dma_index];
++      fill_routed = loom_aie2p_array_route_workers(
++          &builder->route_builder, channel_index, channel->fill_source,
++          source_dma->coordinate, source_dma->dma_channel, fill->coordinate,
++          fill->dma_channel);
++    } else {
++      fill_routed = loom_aie2p_array_route_ingress(
++          &builder->route_builder, channel_index,
++          channel->source_channel_index, shim_dma->coordinate,
++          shim_dma->dma_channel, fill->coordinate, LOOM_XDNA_STREAM_PORT_DMA,
++          fill->dma_channel, /*vertical_first=*/false);
++    }
+     const bool staged_routed =
+-        loom_aie2p_array_route_ingress(
+-            &builder->route_builder, channel_index,
+-            channel->source_channel_index, shim_dma->coordinate,
+-            shim_dma->dma_channel, fill->coordinate,
+-            LOOM_XDNA_STREAM_PORT_DMA, fill->dma_channel,
+-            /*vertical_first=*/false) &&
++        fill_routed &&
+         loom_aie2p_array_route_workers(
+             &builder->route_builder, channel_index,
+             (uint32_t)builder->plan->channel_count + channel_index,
+@@ -2879,10 +2973,24 @@ static iree_status_t loom_aie2p_array_plan_external_channel(
+     if (!staged_routed) {
+       return loom_aie2p_array_diagnose_route_capacity(builder, channel_index);
+     }
+-    loom_aie2p_array_binding_plan_t* binding_plan =
+-        &builder->binding_plans[channel->binding_plan_index];
+-    binding_plan->dma_index = shim_dma_index;
+-    binding_plan->completion_route_index = UINT32_MAX;
++    if (owns_shim_dma) {
++      loom_aie2p_array_binding_plan_t* binding_plan =
++          &builder->binding_plans[channel->binding_plan_index];
++      binding_plan->dma_index = shim_dma_index;
++      binding_plan->completion_route_index = UINT32_MAX;
++    }
++    loom_aie2p_array_bind_worker_port(builder, worker_endpoint, channel_index,
++                                      committed_compute.credit_lock_index);
++    return iree_ok_status();
++  }
++  if (channel->fill_target != UINT32_MAX) {
++    // A fill source: its sending DMA and ring only; the panel routes it.
++    if (ingress || !owns_compute_dma) {
++      return loom_aie2p_array_reject_channel_resources(
++          builder, channel_index, worker->coordinate,
++          IREE_SV("a constrain.fill source must be an unshared worker egress "
++                  "channel"));
++    }
+     loom_aie2p_array_bind_worker_port(builder, worker_endpoint, channel_index,
+                                       committed_compute.credit_lock_index);
+     return iree_ok_status();
+@@ -3187,7 +3295,10 @@ static iree_status_t loom_aie2p_array_admit_physical_cardinalities(
+           LOOM_AIE2P_ARRAY_DMA_DIRECTION_STREAM_TO_MEMORY, receiver_coordinate,
+           &demands, out_cardinalities));
+     }
+-    if (builder->valid && owns_shim_memory_to_stream) {
++    // constrain.fill pairs keep a binding plan (layout facts) but no shim DMA.
++    const bool fill_linked = channel->fill_source != UINT32_MAX ||
++                             channel->fill_target != UINT32_MAX;
++    if (builder->valid && owns_shim_memory_to_stream && !fill_linked) {
+       IREE_RETURN_IF_ERROR(loom_aie2p_array_admit_shim_endpoint_cardinality(
+           builder, channel_index,
+           LOOM_AIE2P_ARRAY_DMA_DIRECTION_MEMORY_TO_STREAM, receiver_coordinate,
+@@ -3196,7 +3307,7 @@ static iree_status_t loom_aie2p_array_admit_physical_cardinalities(
+       // planned).
+       out_cardinalities->lock_count += channel->request_poll ? 1u : 0u;
+     }
+-    if (builder->valid && owns_shim_stream_to_memory) {
++    if (builder->valid && owns_shim_stream_to_memory && !fill_linked) {
+       IREE_RETURN_IF_ERROR(loom_aie2p_array_admit_shim_endpoint_cardinality(
+           builder, channel_index,
+           LOOM_AIE2P_ARRAY_DMA_DIRECTION_STREAM_TO_MEMORY, sender_coordinate,
+@@ -3387,7 +3498,26 @@ static void loom_aie2p_array_finalize_physical_counts(
+   builder->plan->lock_count = builder->lock_cursor;
+   builder->plan->dma_channel_count = builder->dma_channel_cursor;
+   builder->plan->route_count = builder->route_builder.route_count;
+-  builder->plan->binding_plan_count = builder->binding_plan_cursor;
++  // Fill-linked channels (constrain.fill) keep a binding plan for their layout
++  // facts during planning but transfer nothing: drop those plans.
++  iree_host_size_t kept = 0;
++  for (iree_host_size_t i = 0; i < builder->binding_plan_cursor; ++i) {
++    const loom_aie2p_array_binding_plan_t* binding_plan =
++        &builder->binding_plans[i];
++    const loom_aie2p_array_channel_t* owner =
++        &builder->channels[binding_plan->channel_index];
++    const bool dropped = binding_plan->dma_index == UINT32_MAX &&
++                         (owner->fill_source != UINT32_MAX ||
++                          owner->fill_target != UINT32_MAX);
++    for (iree_host_size_t c = 0; c < builder->plan->channel_count; ++c) {
++      if (builder->channels[c].binding_plan_index == i) {
++        builder->channels[c].binding_plan_index =
++            dropped ? UINT32_MAX : (uint32_t)kept;
++      }
++    }
++    if (!dropped) builder->binding_plans[kept++] = *binding_plan;
++  }
++  builder->plan->binding_plan_count = kept;
+ }
+ 
+ iree_status_t loom_aie2p_array_plan_build(
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+index 6abe1393a..0b3974270 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+@@ -238,6 +238,14 @@ typedef struct loom_aie2p_array_channel_t {
+   // the gate phase (a gate when constrain.gate) and record 1 in the done
+   // phase, after every other egress of the invocation completed.
+   bool signal;
++  // constrain.fill %panel, %source: the staged panel owner |panel| fills its
++  // memory-tile ring from the worker egress channel |source| (the worker's
++  // memory-to-stream DMA routed into the panel's fill) instead of reading its
++  // binding through a shim: neither the panel's binding nor the source's
++  // receiving binding is transferred. Set on the panel owner (the source
++  // channel) and on the source (the panel); UINT32_MAX otherwise.
++  uint32_t fill_source;
++  uint32_t fill_target;
+   // True on the poll side of a request pair.
+   bool request_poll;
+   // The pair's shim lock once planned.
+@@ -282,6 +290,14 @@ typedef struct loom_aie2p_array_channel_t {
+   // Experimental (LOOM_EXP_PANEL_STREAM): counting locks, a looping fill and no
+   // per-invocation lock restores, so invocations stream back to back.
+   bool stage_panel_stream;
++  // Experimental (LOOM_EXP_PANEL_INTERLEAVE=<n>): a streamed panel holds its
++  // members' records split into n sub-records, interleaved per sub-record:
++  // [group][record][sub-record][member]. The fill writes the binding stream
++  // linearly; each member drains its slice with a strided descriptor. Members:
++  // sub-record bytes and offset within one interleave unit; owner: unit bytes.
++  uint32_t stage_panel_sub_bytes;
++  uint32_t stage_panel_sub_offset;
++  uint32_t stage_panel_unit_bytes;
+ } loom_aie2p_array_channel_t;
+ 
+ // Declared requirements associated with a worker entry symbol.
+@@ -541,6 +557,12 @@ typedef struct loom_aie2p_array_binding_plan_t {
+   // Innermost-first multidimensional address-generator rows.
+   loom_aie2p_array_binding_dma_dimension_t
+       dma_dimensions[LOOM_AIE2P_ARRAY_BINDING_DMA_DIMENSION_COUNT];
++  // A strided transfer one axis beyond the address dimensions: its outermost
++  // axis is the descriptor's iteration (each repeat of the queued task
++  // advances the base by iteration_step_size native units, iteration_wrap
++  // repeats per cycle); zero when unused.
++  uint32_t iteration_step_size;
++  uint16_t iteration_wrap;
+ } loom_aie2p_array_binding_plan_t;
+ 
+ // Complete arena-owned logical topology and deterministic NPU2 physical plan.
+@@ -635,6 +657,9 @@ typedef struct loom_aie2p_array_plan_t {
+   // flight at once (1 for group 0, 2 for group 1).
+   bool stream_panels;
+   uint8_t stream_pace[4];
++  // Experimental (LOOM_EXP_PANEL_INTERLEAVE): sub-records per panel record, 0
++  // when panels keep one slot per member.
++  uint8_t panel_interleave;
+ } loom_aie2p_array_plan_t;
+ 
+ // Extracts and plans one verified amd.xdna.aie2p.array Low function.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index d46004c42..4155c91a3 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -896,6 +896,77 @@ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+       release_lock = &plan->locks[dma->credit_lock_index + 2u * group];
+     }
+   }
++  // An interleaved panel ([group][record][sub-record][member], see
++  // stage_panel_sub_bytes): the fill writes each group as m first-unit slices
++  // (acquiring the members' credits), the bulk and m last-unit slices
++  // (releasing their ready locks); each member drains strided.
++  const loom_aie2p_array_channel_t* panel_owner =
++      channel->stage_panel_owner != UINT32_MAX
++          ? &plan->channels[channel->stage_panel_owner]
++          : NULL;
++  const uint32_t unit =
++      panel_owner != NULL ? panel_owner->stage_panel_unit_bytes : 0u;
++  bool interleaved_drain = false;
++  int32_t interleaved_acquire = 0;
++  int32_t interleaved_release = 0;
++  uint32_t drain_sub_words = 0;
++  if (unit != 0) {
++    const uint32_t interleave = plan->panel_interleave;
++    const uint32_t member_count = panel_owner->stage_record_count;
++    const uint32_t per_group = fill ? 2u * member_count + 1u : 1u;
++    const uint32_t panel_group = fill ? slot_ordinal / per_group : slot_ordinal;
++    uint32_t group_base = 0;
++    for (uint32_t g = 0; g < panel_group; ++g) {
++      group_base += panel_owner->stage_panel_group_records[g] * interleave * unit;
++    }
++    const uint32_t units =
++        panel_owner->stage_panel_group_records[panel_group] * interleave;
++    const loom_aie2p_array_channel_t* member = channel;
++    uint32_t part = 0;
++    if (fill) {
++      part = slot_ordinal % per_group;
++      const uint32_t member_slot =
++          part < member_count ? part : part - member_count - 1u;
++      member = NULL;
++      for (iree_host_size_t i = 0; part != member_count && i < plan->channel_count;
++           ++i) {
++        if (plan->channels[i].stage_panel_owner == dma->channel_index &&
++            plan->channels[i].stage_panel_slot == member_slot) {
++          member = &plan->channels[i];
++        }
++      }
++      if (part != member_count && member == NULL) {
++        return iree_make_status(IREE_STATUS_INTERNAL,
++                                "interleaved panel member slot %u not found",
++                                member_slot);
++      }
++    }
++    uint32_t byte_length = 0;
++    record_slot = 0;
++    if (fill && part < member_count) {
++      record_byte_offset = group_base + member->stage_panel_sub_offset;
++      byte_length = member->stage_panel_sub_bytes;
++      acquire_lock = &plan->locks[member->stage_panel_lock_index + 2u * panel_group];
++      interleaved_acquire = -(int32_t)member->stage_repeat_count;
++    } else if (fill && part == member_count) {
++      record_byte_offset = group_base + unit;
++      byte_length = (units - 2u) * unit;
++    } else if (fill) {
++      record_byte_offset =
++          group_base + (units - 1u) * unit + member->stage_panel_sub_offset;
++      byte_length = member->stage_panel_sub_bytes;
++      release_lock =
++          &plan->locks[member->stage_panel_lock_index + 2u * panel_group + 1u];
++      interleaved_release = (int32_t)member->stage_repeat_count;
++    } else {
++      record_byte_offset = group_base + channel->stage_panel_sub_offset;
++      byte_length = units * channel->stage_panel_sub_bytes;
++      drain_sub_words = channel->stage_panel_sub_bytes / 4u;
++      interleaved_drain = true;
++    }
++    encoded_length = byte_length / stage_dma->transfer_length_granularity -
++                     stage_dma->transfer_length_offset;
++  }
+   uint16_t acquire_selector = 0;
+   uint16_t release_selector = 0;
+   IREE_RETURN_IF_ERROR(loom_xdna_array_form_lock_selector(
+@@ -947,6 +1018,63 @@ static iree_status_t loom_aie2p_program_build_memory_tile_dma_descriptor(
+       &words[1]);
+   loom_aie2p_program_encode_admitted_field(
+       LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_VALID_BD, 1, &words[7]);
++  if (interleaved_drain) {
++    // Words of one sub-record as d0 x d1 (each wrap at most 1023), then the
++    // members' unit stride over the record's sub-records, then the record stride.
++    uint32_t d0 = 0;
++    for (uint32_t c = 1023u; c > 0 && d0 == 0; --c) {
++      if (drain_sub_words % c == 0 && drain_sub_words / c <= 1023u) d0 = c;
++    }
++    if (d0 == 0) {
++      return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
++                              "interleaved panel sub-record of %u words does "
++                              "not split into two wraps",
++                              drain_sub_words);
++    }
++    const uint32_t unit_words = unit / 4u;
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD2_D0_STEP_SIZE, 0,
++        &words[2]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD2_D0_WRAP, d0, &words[2]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD3_D1_STEP_SIZE, d0 - 1u,
++        &words[3]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD3_D1_WRAP,
++        drain_sub_words / d0, &words[3]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD4_D2_STEP_SIZE,
++        unit_words - 1u, &words[4]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD4_D2_WRAP,
++        plan->panel_interleave, &words[4]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD5_D3_STEP_SIZE,
++        plan->panel_interleave * unit_words - 1u, &words[5]);
++  }
++  if (unit != 0 && fill) {
++    if (interleaved_acquire != 0) {
++      loom_aie2p_program_encode_admitted_field(
++          LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_ENABLE, 1,
++          &words[7]);
++      loom_aie2p_program_encode_admitted_field(
++          LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_VALUE,
++          interleaved_acquire, &words[7]);
++      loom_aie2p_program_encode_admitted_field(
++          LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_ACQUIRE_ID,
++          acquire_selector, &words[7]);
++    }
++    if (interleaved_release != 0) {
++      loom_aie2p_program_encode_admitted_field(
++          LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_RELEASE_VALUE,
++          interleaved_release, &words[7]);
++      loom_aie2p_program_encode_admitted_field(
++          LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_RELEASE_ID,
++          release_selector, &words[7]);
++    }
++    return iree_ok_status();
++  }
+   if (gated_drain && stream) {
+     loom_aie2p_program_encode_admitted_field(
+         LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD7_LOCK_RELEASE_VALUE, 1,
+@@ -1169,6 +1297,14 @@ static void loom_aie2p_program_build_shim_dma_descriptor_at(
+           &words[word_index]);
+     }
+   }
++  if (binding_plan->iteration_wrap > 1) {
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD6_ITERATION_STEP_SIZE,
++        binding_plan->iteration_step_size - 1u, &words[6]);
++    loom_aie2p_program_encode_admitted_field(
++        LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD6_ITERATION_WRAP,
++        binding_plan->iteration_wrap - 1u, &words[6]);
++  }
+   loom_aie2p_program_encode_admitted_field(
+       LOOM_XDNA_REGISTER_FIELD_SHIM_NOC_DMA_BD_WORD4_BURST_LENGTH,
+       LOOM_AIE2P_SHIM_DMA_BURST_LENGTH_ENCODING, &words[4]);
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
+index 82fac82c7..c41160e4f 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/emit/xdna_product.c
+@@ -4,6 +4,7 @@
+ // See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ 
++#include <stdlib.h>
+ #include "loom/target/arch/amd/xdna/aie2p/emit/xdna_product.h"
+ 
+ #include <string.h>
+@@ -368,6 +369,49 @@ static void loom_aie2p_xdna_native_record(
+   }
+ }
+ 
++
++// EXPERIMENT LOOM_EXP_SETUP_TILES="col:row,...": invocation 0's array records keep only those tiles' records (a
++// partial setup that re-programs a few workers, e.g. a decoder column swapped between images sharing the rest).
++static bool loom_aie2p_xdna_setup_keep(const loom_aie2p_xdna_entry_t* entry,
++                                       const loom_aie2p_program_record_t* record) {
++  const char* spec = getenv("LOOM_EXP_SETUP_TILES");
++  if (spec == NULL || spec[0] == 0) return true;
++  const loom_xdna_array_family_t* family = entry->array_plan->family;
++  uint32_t column = 0, row = 0;
++  switch (record->type) {
++    case LOOM_AIE2P_PROGRAM_RECORD_TILE_PROGRAM_LOAD: {
++      const loom_aie2p_xdna_tile_t* tile =
++          &entry->tiles[record->value.tile_program_load.tile_program_index];
++      column = tile->coordinate.column;
++      row = tile->coordinate.row;
++      break;
++    }
++    case LOOM_AIE2P_PROGRAM_RECORD_DMA_TASK_WAIT:
++      return false;
++    default: {
++      const uint32_t address =
++          record->type == LOOM_AIE2P_PROGRAM_RECORD_REGISTER_WRITE32
++              ? record->value.register_write32.address
++          : record->type == LOOM_AIE2P_PROGRAM_RECORD_REGISTER_MASK_WRITE32
++              ? record->value.register_mask_write32.address
++              : record->value.register_block_write32.address;
++      column = address >> family->column_shift;
++      row = (address >> family->row_shift) &
++            ((1u << (family->column_shift - family->row_shift)) - 1u);
++      break;
++    }
++  }
++  for (const char* p = spec; *p;) {
++    char* end = NULL;
++    const unsigned long c = strtoul(p, &end, 10);
++    if (end == p || *end != ':') return false;
++    const unsigned long r = strtoul(end + 1, &end, 10);
++    if (c == column && r == row) return true;
++    p = *end == ',' ? end + 1 : end;
++  }
++  return false;
++}
++
+ static iree_status_t loom_aie2p_xdna_measure_entry(
+     const loom_aie2p_xdna_entry_t* entry, uint32_t alignment,
+     iree_arena_allocator_t* arena, loom_aie2p_xdna_entry_layout_t* layout) {
+@@ -377,6 +421,7 @@ static iree_status_t loom_aie2p_xdna_measure_entry(
+   uint64_t array_operation_count = 0;
+   for (iree_host_size_t i = 0; i < program->array_record_count; ++i) {
+     const loom_aie2p_program_record_t* record = &program->array_records[i];
++    if (!loom_aie2p_xdna_setup_keep(entry, record)) continue;
+     if (record->type == LOOM_AIE2P_PROGRAM_RECORD_TILE_PROGRAM_LOAD) {
+       const loom_aie2p_linked_tile_t* tile =
+           entry->tiles[record->value.tile_program_load.tile_program_index]
+@@ -430,6 +475,12 @@ static iree_status_t loom_aie2p_xdna_measure_entry(
+     layout->invocation_count = program->stream_lead_end != 0 ? 7 : 5;
+     memcpy(layout->range_begin, begins, sizeof(begins));
+     memcpy(layout->range_end, ends, sizeof(ends));
++    // EXPERIMENT LOOM_EXP_SETUP_ONLY=1: invocation 0 is the array setup alone (no first call), so a runtime can splice
++    // an image's setup into a command between other images' jobs (image switches inside one command).
++    const char* setup_only = getenv("LOOM_EXP_SETUP_ONLY");
++    if (setup_only != NULL && setup_only[0] == '1') {
++      layout->range_end[0] = 0;
++    }
+   } else if (program->gated_call_end != 0) {
+     // [call | gate | done]: array + call, call, gate, done.
+     const uint32_t call_end = (uint32_t)program->gated_call_end;
+@@ -549,6 +600,7 @@ static void loom_aie2p_xdna_emit_entry(
+   uint32_t destination = 0;
+   for (iree_host_size_t i = 0; i < program->array_record_count; ++i) {
+     const loom_aie2p_program_record_t* record = &program->array_records[i];
++    if (!loom_aie2p_xdna_setup_keep(entry, record)) continue;
+     if (record->type == LOOM_AIE2P_PROGRAM_RECORD_TILE_PROGRAM_LOAD) {
+       const uint32_t tile_index =
+           record->value.tile_program_load.tile_program_index;

@@ -19,6 +19,9 @@ struct NpuPlan {
   // dispatch.txt "npugate <supply> <calls> <record>" (gen_npu_gemm GATE_*): a job's gate value is sequence * gate_calls
   // + its calls; done lands gate_record bytes into a call's signal binding.
   std::uint32_t gate_calls = 0, gate_record = 0;
+  // dispatch.txt "npudcol": the NPU decodes the weights itself from raw GGUF rows (gen_npu_gemm dcol 2; w_bytes is
+  // then one call's unread panel binding).
+  bool dcol = false;
 };
 
 // A byte range of A, W or C.
@@ -34,6 +37,13 @@ class NpuSplit {
   [[nodiscard]] virtual const LoomBuffer& C() const = 0;
   // One call of the NPU GEMM image at path on these views (cold: loads and binds; the same arguments return the same id).
   virtual std::uint32_t Bind(const std::string& image, NpuView a, NpuView w, NpuView c) = 0;
+  // Decoder-column sets (NpuPlan::dcol): the NPU reads raw weight rows from the model's own mapping.
+  // RegisterRaw makes the pages holding [p, p + bytes) readable by the NPU (once per range, before any work).
+  // BindRaw is one call of a decoder-column image whose raw rows are [raw, raw + raw_bytes) of a registered range;
+  // swap is the image that re-programs only the decoder tiles for its format, dec that format's id.
+  virtual void RegisterRaw(const void* p, std::size_t bytes) = 0;
+  virtual std::uint32_t BindRaw(const std::string& image, const std::string& swap, int dec, NpuView a,
+                                const void* raw, std::size_t raw_bytes, NpuView c) = 0;
   // Handoffs are 32-bit words in host memory (Flags(): their GPU view), with no host between the GPU and the NPU.
   // The graph stores a job's gate value to its ready word once the job's inputs are written (release, system scope).
   // The NPU image waits for it (gen_npu_gemm GATE), runs the calls and writes the value to the job's done word.
