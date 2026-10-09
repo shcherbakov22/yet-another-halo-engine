@@ -1022,7 +1022,9 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
             raise SystemExit("NPU decoder-column compile failed (%s): %s" % (name, r.stderr[-800:]))
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(compile_one, built))
-    cfg = jobs[0][0]
+    # a site's K = 5120 call (with no sites, the FFN block's gate / up activations still use its A)
+    cfg = jobs[0][0] if images else GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2,
+                                              fmt="IQ4_XS")
     return [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(cfg)), ("npurows", NPU_ROWS, 0, 0)]
 
 
