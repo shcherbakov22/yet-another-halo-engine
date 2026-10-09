@@ -743,10 +743,10 @@ def fuse_prologue(L, cfg, role, ks, r):
     post = sum(sw[r + 1:]) - (mine - sw[r])
     e("  %fzs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e("  %fzp = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
-    e("  %fzjs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     if cfg.fuse == 2:
         fuse2_entry(L, cfg, dp, r, wrec)
         return
+    e("  %fzjs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e("  %fzjp = storage_address %fzjs : low.storage<private> -> reg<aie2p.ep>")
     e("  %fzc = lda %fzp, 0")
     e("  %fzc1 = add.rr %fzc, %one")
@@ -875,8 +875,9 @@ FZ_SP, FZ_IN, FZ_SP2, FZ_OUT = 0, 3264, 16384, 23616   # fuse 2 scratch (from th
 
 def fuse_decode(L, cfg, dp, r):
     """fuse 2: a replay group's fill (^fzdq(units)): per (pass, slab) unit, the raw stream's [16 rows][4 super-blocks]
-    -> this row's super-blocks into the decoder's input record (the rest popped), the inlined IQ4_XS decoder, then the
-    row's k-blocks (panel order [kb][h]) copied record by record into the egress ring. Scratch is the W ring (idle
+    -> the decoder's input record (all 4 super-blocks: a record row holds them), the inlined IQ4_XS decoder on this
+    row's super-blocks, then its k-blocks (panel order [kb][h]) copied record by record into the egress ring. Scratch
+    is the W ring (idle
     until this panel's drain, which starts after the last record). Unit index and count live in private storage
     (the decoder needs every register)."""
     e = L.append
@@ -885,6 +886,7 @@ def fuse_decode(L, cfg, dp, r):
     fw, _ = fuse_record(cfg, r)
     W = FUSE_BLK // 4                                  # words per super-block
     pieces = fuse_pieces(cfg, r)
+    assert FUSE_SB * FUSE_BLK <= D.RECROW and FUSE_SB * W % 16 <= 8
     assert FZ_SP + D.SCR_B <= FZ_IN and FZ_IN + 16 * D.RECROW <= FZ_SP2 and FZ_SP2 + D.SCR2_B <= FZ_OUT
     assert FZ_OUT + nsb * 2 * D.OUT_B + 2047 <= 2 * NP * slab(cfg.ks[r]) and fw % 16 == 0
     e("^fzdq(%fzN: reg<aie2p.er>):")
@@ -906,56 +908,48 @@ def fuse_decode(L, cfg, dp, r):
     e("  %fzkm2048 = mov.i32 -2048")
     e("  %fzsb = and %fzwb, %fzkm2048")
     for nm, off in (("sp", FZ_SP), ("in", FZ_IN), ("sp2", FZ_SP2), ("out", FZ_OUT)):
-        e(f"  %fzo_{nm} = mov.i32 {off}")
-        e(f"  %fza_{nm} = add.rr %fzsb, %fzo_{nm}")
-    e("  %fzjpR = storage_address %fzjs : low.storage<private> -> reg<aie2p.ep>")
-    e("  %fzinp = mov.scalar-to-address %fza_in")
-    # the raw unit: per row, skip / take / skip words (pairs)
-    e("  %fz2 = mova.i32 2")
-    e("  %fz8 = mova.i32 8")
-    e("  %fzm8 = mov.modifier %fz8")
+        v = "in0" if nm == "in" and s0 else nm
+        e(f"  %fzo_{v} = mov.i32 {off}")
+        e(f"  %fza_{v} = add.rr %fzsb, %fzo_{v}")
+    e(f"  %fzinp = mov.scalar-to-address %fza_{'in0' if s0 else 'in'}")
+    # the raw unit: every row's 4 super-blocks into the record row (RECROW holds them), 16 words a step
+    e("  %fz32 = mova.i32 32")
+    e("  %fzm32 = mov.modifier %fz32")
     e(f"  %fzrr = mov.i32 {D.RECROW}")
     e("  %fz16r = mova.i32 16")
+    e(f"  %fzws = mova.i32 {FUSE_SB * W // 16}")
     e("  low.br ^fzrw(%fzR0: reg<aie2p.er>, %fzinp: reg<aie2p.ep>)")
     e("^fzrw(%fzri: reg<aie2p.er>, %fzrp: reg<aie2p.ep>):")
     e("  %fzrm = lt %fzri, %fz16r")
     e("  low.cond_br %fzrm, ^fzrb, ^fzrx : reg<aie2p.er>")
     e("^fzrb:")
-
-    def pairs(tag, n, take):
-        """n words from the stream, as pairs: stored at %fzrp (take) or into the junk block."""
-        if n == 0:
-            return
-        assert n % 2 == 0
-        e(f"  %fzk{tag} = mov.i32 {n // 2}")
-        if take:
-            e(f"  low.br ^fz{tag}(%fzR0: reg<aie2p.er>, %fzrp: reg<aie2p.ep>)")
-            e(f"^fz{tag}(%fzi{tag}: reg<aie2p.er>, %fzq{tag}: reg<aie2p.ep>):")
-        else:
-            e(f"  low.br ^fz{tag}(%fzR0: reg<aie2p.er>)")
-            e(f"^fz{tag}(%fzi{tag}: reg<aie2p.er>):")
-        e(f"  %fzm{tag} = lt %fzi{tag}, %fzk{tag}")
-        e(f"  low.cond_br %fzm{tag}, ^fz{tag}b, ^fz{tag}x : reg<aie2p.er>")
-        e(f"^fz{tag}b:")
-        for w in range(2):
-            e(f"  %fzv{tag}{w} = mov.ss")
-            e(f"  st %fzv{tag}{w}, {f'%fzq{tag}' if take else '%fzjpR'}, {4 * w}")
-        e(f"  %fzi1{tag} = add.rr %fzi{tag}, %fzR1")
-        if take:
-            e(f"  %fzq1{tag} = padds.modifier %fzq{tag}, %fzm8")
-            e(f"  low.br ^fz{tag}(%fzi1{tag}: reg<aie2p.er>, %fzq1{tag}: reg<aie2p.ep>)")
-        else:
-            e(f"  low.br ^fz{tag}(%fzi1{tag}: reg<aie2p.er>)")
-        e(f"^fz{tag}x:")
-    pairs("pre", W * s0, False)
-    pairs("tk", W * nsb, True)
-    pairs("post", W * (FUSE_SB - s0 - nsb), False)
+    e("  %fzrpc = copy %fzrp : reg<aie2p.ep> -> reg<aie2p.ep>")
+    e("  %fzrq = padds.modifier %fzrpc, %fzm32")      # 16 words a step around the pointer (offsets -32 .. 28)
+    e("  low.br ^fzw(%fzR0: reg<aie2p.er>, %fzrq: reg<aie2p.ep>)")
+    e("^fzw(%fzwi: reg<aie2p.er>, %fzwq: reg<aie2p.ep>):")
+    e("  %fzwlm = lt %fzwi, %fzws")
+    e("  low.cond_br %fzwlm, ^fzwb, ^fzwx : reg<aie2p.er>")
+    e("^fzwb:")
+    for w in range(16):   # (a stream read holds the core ~10 cycles: measured, no stall event)
+        e(f"  %fzv{w} = mov.ss")
+    for w in range(16):
+        e(f"  st %fzv{w}, %fzwq, {4 * w - 32}")
+    e("  %fzwq1 = padda %fzwq, 64")
+    e("  %fzwi1 = add.rr %fzwi, %fzR1")
+    e("  low.br ^fzw(%fzwi1: reg<aie2p.er>, %fzwq1: reg<aie2p.ep>)")
+    e("^fzwx:")
+    for w in range(FUSE_SB * W % 16):                   # the row's last words
+        e(f"  %fzt{w} = mov.ss")
+        e(f"  st %fzt{w}, %fzwq, {4 * w - 32}")
     e("  %fzrpa = mov.address-to-scalar %fzrp")
     e("  %fzrpb = add.rr %fzrpa, %fzrr")
     e("  %fzrpn = mov.scalar-to-address %fzrpb")
     e("  %fzri1 = add.rr %fzri, %fzR1")
     e("  low.br ^fzrw(%fzri1: reg<aie2p.er>, %fzrpn: reg<aie2p.ep>)")
     e("^fzrx:")
+    if s0:   # the decoder reads this row's super-blocks
+        e(f"  %fzo_ins = mov.i32 {FUSE_BLK * s0}")
+        e("  %fza_in = add.rr %fza_in0, %fzo_ins")
     for nm in ("sp", "in", "sp2", "out"):
         e(f"  %dq_{nm} = mov.scalar-to-address %fza_{nm}")
     # the decoder (its values and labels prefixed)
