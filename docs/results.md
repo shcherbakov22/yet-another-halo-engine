@@ -25,6 +25,7 @@ NPU FFN block with IQ4_XS downs (2026-10-09, 49 of 64 layers): gate on 16 window
 NPU FFN block with Q4_K downs (2026-10-09, 52 of 64 layers): KL mean 8.1e-5, p99.9 1.4e-3, max 4.3e-3, 0 flips, PPL 6.69389. pp2048 ~3930 ms (one run, untuned).
 NPU FFN block with Q3_K gates (2026-10-09, 59 of 64 layers, the Q3_K decoder bit-exact): KL mean 9.7e-5, p99.9 3.1e-3, max 7.1e-3, 0 flips, PPL 6.69817. The 7 added layers (54-61) sit next to the output: the mean grew as before (~2e-6 per layer) but the tail doubled; still below the production NPU split (1.65e-4 / 3.9e-3). pp2048 ~4190 ms (one run, untuned).
 NPU FFN block with IQ2_XXS (2026-10-09, 62 of 64 layers; the IQ2_XXS decoder is IQ3_XXS's with 8-value grid entries as two table halves, bit-exact): KL mean 1.05e-4, p99.9 2.6e-3, max 5.5e-3, 0 flips, PPL 6.69427. pp2048 ~4320 ms (one run, untuned).
+NPU FFN block with IQ2_XS (2026-10-09, 63 of 64 layers: every layer but the last, whose FFN runs only the kept rows): KL mean 9.8e-5, p99.9 2.1e-3, max 5.2e-3, 0 flips, PPL 6.69812. pp2048 ~4360 ms (one run, untuned).
 
 NPU GEMM path pieces (2026-10-06; checks byte-exact against numpy oracles):
 
