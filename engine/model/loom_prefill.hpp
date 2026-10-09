@@ -197,7 +197,7 @@ class LoomPrefill {
     if (npu_on_) npu_->BeginChunk();
     flagged_.clear();
     predecoded_.clear();
-    npu_job_ = 0;
+    npu_job_ = 0, npu_cleared_ = 0;
     NewGraph();
     nodes_.clear();
     const bool calibrate = !npu_on_ && calib_ && calib_->BeginChunk(n_);
@@ -243,6 +243,7 @@ class LoomPrefill {
         while (((d = npu_->HostLoad(w.done)) & 0x7fffffffu) < w.gate) {
           if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(1)) break;
         }
+        npu_->HostStore(w.ready, 0), npu_->HostStore(w.done, 0);   // as NpuJoin's stores do
         if ((d & 0x7fffffffu) < w.gate || (d & 0x80000000u)) {
           std::fprintf(stderr, "npu cpu-driven: job %zu (%s) stalled or failed: done %08x gate %08x\n", i,
                        jobs[i].tag.c_str(), d, w.gate);
@@ -1447,6 +1448,11 @@ class LoomPrefill {
     npu_side.push_back(Ref(npu_->C()));
     Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1,
              {FlagWord(j.words.done), FlagWord(j.words.ready), FlagWord(NpuSplit::kFlagStatus)}, 4, &npu_side);
+    // decoder-column sets count jobs per chunk: the joined jobs' words read zero again before the next chunk reuses them
+    if (npu_dcol_)
+      for (; npu_cleared_ < flagged_.size(); ++npu_cleared_)
+        for (const std::uint32_t w : {flagged_[npu_cleared_].words.ready, flagged_[npu_cleared_].words.done})
+          graph_->AtomicStore(FlagWord(w), 0, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE, {}, {});
   }
 
   // af: the afrag form, input normt_ (fragment-major)
@@ -1866,6 +1872,7 @@ class LoomPrefill {
   bool npu_dcol_ = false;          // the set's NPU decodes raw weight rows itself (dispatch.txt "npudcol")
   static constexpr std::size_t kDcolRecordRow = 576;   // a decoder record's row bytes (gen_npu_dec.RECROW)
   std::uint32_t npu_job_ = 0;      // NPU jobs of this chunk so far (W slot = job % 2)
+  std::size_t npu_cleared_ = 0;    // flagged_ jobs whose flag words NpuJoin cleared
   std::vector<NpuSplit::Queued> flagged_;  // this chunk's NPU jobs (index = job), queued after the launch
   std::vector<std::vector<PlannedDecode>> planned_dq_;  // per job: its weight decodes (planning pass)
   std::vector<PlannedDecode> predecoded_;               // the next job's, dispatched at the last Join

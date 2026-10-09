@@ -987,16 +987,9 @@ class LoomNpuSplit : public NpuSplit {
     j.gate = ++seq_ * plan_.gate_calls + static_cast<std::uint32_t>(calls.size());
     return j;
   }
+  // The chunk's graph clears each job's words after joining it (LoomPrefill::NpuJoin), so they read zero here.
   void BeginChunk() override {
-    if (!plan_.dcol) return;
-    // the previous chunk's jobs are done (their words are reused); then every gate word reads zero again
-    npu_.Drain();
-    auto* w = static_cast<volatile std::uint32_t*>(flags_.host);
-    for (std::size_t b = kGateBase; b < flags_.bytes; b += 4) w[b / 4] = 0;
-    for (std::size_t b = kGateBase; b < flags_.bytes; b += 64)
-      __builtin_ia32_clflush(const_cast<std::uint32_t*>(w + b / 4));
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    job_family_ = nullptr, fresh_ = true;
+    if (plan_.dcol) job_family_ = nullptr, fresh_ = true;
   }
   void Enqueue(const std::vector<Queued>& jobs) override {
     std::size_t queued = 0;
