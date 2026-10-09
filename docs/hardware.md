@@ -151,3 +151,5 @@ Measured with small Loom array programs on the NPU (yah-scratch/npu/waitp):
 - A queued shim task repeats its descriptor (or chain) at most 256 times; the BD iteration dimension adds an address offset per execution and does not multiply the count. A chain of identical BDs repeated 256 times gives chain x 256 transfers per task.
 - Core stream reads (`mov.ss`) and writes (`mov.ms`) work in locked leaves. Do not use `mov.ss.nb` with `mov.ss.status`: a count of status-3 reads went wrong and the job hung (TDR).
 - Private storage of a core is not cleared between images: a new image starts on the old image's tile memory.
+- NPU command memory is small (~64 MB per process, shared with the images' storage): ~25 cached commands of ~4 MB failed in `memory_create` (errno 11). (2026-10-09)
+- A shim descriptor's step and wrap fields address at most 1023 words per dimension and ~4 MB per step; a chain of descriptors (one per index of an axis, any byte offset each) and the BD iteration (at most 64 steps) add two axes. (2026-10-09)

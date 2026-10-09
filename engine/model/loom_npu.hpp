@@ -81,6 +81,10 @@ class LoomNpu {
     const void* family = nullptr;
     int dec = -1;
     const Kernel* swap = nullptr;
+    // a second instance of the image whose first (the array setup and one ungated call, the state the gate expects
+    // before its first job) writes a scratch C; spliced in where a job's family differs from the array's
+    // (FusedCommand); nullptr: none
+    const Kernel* setup = nullptr;
     amdf_xdna_kernel_command_t first{};
     // first sets the array up and runs one whole call (any data). gate opens a job once its ready word reaches the
     // job's gate value; done writes the done word after the job's last C (gen_npu_gemm GATE).
@@ -93,6 +97,7 @@ class LoomNpu {
     std::vector<amdf_host_mapping_t*> storage_maps;
     std::vector<iree_hal_buffer_t*> buffers;
   };
+  static const void* FamilyOf(const Kernel* k) { return k->family ? k->family : k->image_key; }
   // One call: its kernel instance's invocation bytes as bound for it (an instance serves many calls: Rebind).
   struct Call {
     const Kernel* k = nullptr;
@@ -122,12 +127,23 @@ class LoomNpu {
   LoomNpu(const LoomNpu&) = delete;
   LoomNpu& operator=(const LoomNpu&) = delete;
   ~LoomNpu() {
+    // no GPU work may still read the shared buffers (flag words, C) once they are freed: on this GPU a read of freed
+    // memory hangs the shader and the GPU's scheduler
+    try {
+      gpu_.Synchronize();
+    } catch (...) {
+    }
     {
       std::lock_guard<std::mutex> lock(mu_);
       stop_ = true;
     }
     reap_cv_.notify_all();
     if (reaper_.joinable()) reaper_.join();
+    // the array first: after its last job a gated image's head keeps polling its flag words (and writing its tick
+    // scratch) for the rest of its supply, and streamed fills stay armed; with the IOMMU in passthrough a page freed
+    // under a live context is written by the NPU after the kernel reused it (the GPU wedged after runs, 2026-10-09)
+    if (queue_) api_->kernel_queue_destroy(queue_), queue_ = nullptr;
+    if (context_) xdna_->context_destroy(context_), context_ = nullptr;
     for (auto& a : arenas_) {
       api_->host_mapping_destroy(a.map);
       api_->memory_destroy(a.storage.memory);
@@ -367,7 +383,9 @@ class LoomNpu {
   // as its own command (one ungated call, any data; the host waits for it once), after which the gate waits for job 1.
   // After a failure the reaper stores gate | kGateFailed to the done words of this and every later command's jobs, so
   // the GPU's waits end and report it.
-  void EnqueueGated(std::vector<GatedJob> jobs) {
+  // fresh: set the first job's image up even if its family is resident (a chunk's first command: the gate's job
+  // sequence restarts there, NpuSplit::BeginChunk).
+  void EnqueueGated(std::vector<GatedJob> jobs, bool fresh = false) {
     CheckHealth();
     const auto t0 = std::chrono::steady_clock::now();
     const Kernel* k = jobs[0].calls[0]->k;
@@ -379,7 +397,11 @@ class LoomNpu {
       resident = resident_ == family;
       dec = resident_dec_;
     }
-    if (!resident) {
+    if ((!resident || fresh) && k->setup) {
+      // FusedCommand splices the setup twin in front of the first job
+      std::lock_guard<std::mutex> lock(mu_);
+      family = nullptr;
+    } else if (!resident) {
       YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k->first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
       std::lock_guard<std::mutex> lock(mu_);
       resident_ = family;
@@ -387,11 +409,13 @@ class LoomNpu {
     }
     std::vector<std::vector<const Call*>> runs;
     for (const GatedJob& g : jobs) runs.push_back(g.calls);
-    // commands run in submission order: the next one starts with this one's last decoder
-    const auto& [command, end_dec] = FusedCommand(runs, dec);
+    // commands run in submission order: the next one starts with this one's last family and decoder
+    const Fused fused = FusedCommand(runs, dec, family);
+    const amdf_xdna_kernel_command_t command = fused.command;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      resident_dec_ = end_dec;
+      resident_dec_ = fused.dec;
+      resident_ = fused.family;
     }
     const std::uint64_t submission = Submit(command);
     {
@@ -439,25 +463,31 @@ class LoomNpu {
   // call's DMA work is in flight (that hung the NPU firmware under DRAM contention). The bodies of the calls' own
   // relocated commands go under one transaction header (libamdf's public format 0.1,
   // AMDF_XDNA_TRANSACTION_FORMAT_VERSION_0_1: operation count at byte 8, byte length at 12).
-  // Built once per list of runs into command arenas (allocating per command cost ~1 ms).
+  // Built per command into a ring of command arenas (allocating per command cost ~1 ms); an arena is reused once its
+  // commands retired (family switches splice whole array setups: commands of several MB, and the NPU's command memory
+  // is small).
   struct Arena {
     iree_hal_amd_xdna_executable_storage_t storage{};
     amdf_host_mapping_t* map = nullptr;
     std::size_t used = 0;
+    std::uint64_t last = 0;   // the last command built into it (its submission count)
   };
-  static constexpr std::size_t kArenaBytes = 8u << 20, kCommandAlign = 32768;
+  static constexpr std::size_t kArenaBytes = 8u << 20, kCommandAlign = 32768, kArenas = 3;
   static const std::uint8_t* CommandBytes(const Kernel& k, const amdf_xdna_kernel_command_t& c) {
     for (const auto& st : k.storage)
       if (st.memory == c.memory) return static_cast<const std::uint8_t*>(st.mapping.data) + (c.byte_offset - st.memory_byte_offset);
     throw LoomError("npu: command outside its kernel storage");
   }
   // Decoder-column images: where a call's decoder format differs from the one set up, the queued calls drain, the
-  // format's swap setup follows and the call starts like a job's first (lead; the parity restarts there).
-  // Returns the command and the decoder format set up at its end.
-  const std::pair<amdf_xdna_kernel_command_t, int>& FusedCommand(const std::vector<std::vector<const Call*>>& runs,
-                                                                 int dec) {
-    const auto key = std::make_pair(runs, dec);
-    if (const auto it = fused_.find(key); it != fused_.end()) return it->second;
+  // format's swap setup follows and the call starts like a job's first (lead; the parity restarts there). Where a job's
+  // family differs from the one set up (the previous job has drained by its done), its image's setup twin runs first.
+  // Returns the command and the family and decoder format set up at its end.
+  struct Fused {
+    amdf_xdna_kernel_command_t command{};
+    int dec = -1;
+    const void* family = nullptr;
+  };
+  Fused FusedCommand(const std::vector<std::vector<const Call*>>& runs, int dec, const void* fam) {
     std::vector<std::uint8_t> bytes;
     std::uint32_t ops = 0;
     auto append_raw = [&](const std::uint8_t* src, std::size_t length) {
@@ -471,6 +501,11 @@ class LoomNpu {
     auto append = [&](const std::vector<std::uint8_t>& b) { append_raw(b.data(), b.size()); };
     for (const auto& calls : runs) {
       int queued = 0, since = 0;
+      if (const Kernel* k0 = calls[0]->k; FamilyOf(k0) != fam) {
+        if (!k0->setup) throw LoomError("npu: a job switches image families without a setup twin");
+        append_raw(CommandBytes(*k0->setup, k0->setup->first), k0->setup->first.byte_length);
+        fam = FamilyOf(k0), dec = k0->dec;
+      }
       append(calls[0]->gate);
       if (!calls[0]->k->streamed) {
         for (const Call* c : calls) append(c->call);
@@ -494,15 +529,27 @@ class LoomNpu {
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
     if (size > kArenaBytes) throw LoomError("npu: fused command exceeds its arena");
-    if (arenas_.empty() || arenas_.back().used + size > kArenaBytes) {
-      arenas_.emplace_back();
-      iree_xdna_elf_allocation_record_t req{};
-      req.domain = IREE_XDNA_ELF_ALLOCATION_DOMAIN_COMMAND;
-      req.byte_length = kArenaBytes;
-      req.alignment = kCommandAlign;
-      AllocateStorage(req, &arenas_.back().storage, &arenas_.back().map);
+    if (arenas_.empty() || arenas_[arena_].used + size > kArenaBytes) {
+      if (arenas_.size() < kArenas) {
+        arenas_.emplace_back();
+        iree_xdna_elf_allocation_record_t req{};
+        req.domain = IREE_XDNA_ELF_ALLOCATION_DOMAIN_COMMAND;
+        req.byte_length = kArenaBytes;
+        req.alignment = kCommandAlign;
+        AllocateStorage(req, &arenas_.back().storage, &arenas_.back().map);
+        arena_ = arenas_.size() - 1;
+      } else {   // the next arena, once the commands in it retired
+        arena_ = (arena_ + 1) % kArenas;
+        std::unique_lock<std::mutex> lock(mu_);
+        retired_cv_.wait(lock, [&] { return retired_ >= arenas_[arena_].last; });
+        arenas_[arena_].used = 0;
+      }
     }
-    Arena& a = arenas_.back();
+    Arena& a = arenas_[arena_];
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      a.last = submitted_ + 1;   // the command about to be submitted (EnqueueGated)
+    }
     std::memcpy(static_cast<std::uint8_t*>(a.storage.mapping.data) + a.used, bytes.data(), size);
     YAH_AMDF(api_->host_mapping_cache_control(a.map, AMDF_HOST_CACHE_OPERATION_FLUSH, a.used, size),
              "host_mapping_cache_control(fused)");
@@ -512,10 +559,10 @@ class LoomNpu {
     c.byte_offset = a.storage.memory_byte_offset + a.used;
     c.byte_length = size;
     a.used += (size + kCommandAlign - 1) / kCommandAlign * kCommandAlign;
-    return fused_[key] = {c, dec};
+    return {c, dec, fam};
   }
-  std::map<std::pair<std::vector<std::vector<const Call*>>, int>, std::pair<amdf_xdna_kernel_command_t, int>> fused_;
   std::deque<Arena> arenas_;
+  std::size_t arena_ = 0;   // the arena being filled
 
   static constexpr std::uint32_t kGateFailed = NpuSplit::kGateFailed;
   static void Fail(const std::vector<GatedJob>& jobs) {
@@ -826,6 +873,7 @@ class LoomNpuSplit : public NpuSplit {
         w_(npu_.CreateShared(plan.w_bytes)),
         c_(npu_.CreateShared(plan.c_bytes, true)),  // the NPU writes C (see CreateShared)
         flags_(npu_.CreateShared(plan.dcol ? kDcolFlagBytes : 65536, true)),
+        cscratch_(npu_.CreateShared(plan.dcol ? plan.c_bytes : 4096, true)),
         plan_(plan) {
     if (!plan.gate_calls) throw LoomError("npu: the set has no gate protocol (dispatch.txt npugate; re-emit it)");
     if (!GpuPinnedHigh())
@@ -867,9 +915,10 @@ class LoomNpuSplit : public NpuSplit {
     raw_.push_back({b, e, &s});
   }
   std::uint32_t BindRaw(const std::string& image, const std::string& swap, int dec, NpuView a, const void* raw,
-                        std::size_t raw_bytes, NpuView c) override {
+                        std::size_t raw_bytes, NpuView c, const std::string& family) override {
     const auto r0 = reinterpret_cast<std::uintptr_t>(raw);
-    const auto key = std::make_tuple(image, a.offset, a.length, std::size_t{r0}, raw_bytes, c.offset, c.length);
+    const auto key = std::make_tuple(image, a.offset + (a.in_c ? std::size_t{1} << 62 : 0), a.length, std::size_t{r0},
+                                     raw_bytes, c.offset, c.length);
     if (const auto it = ids_.find(key); it != ids_.end()) return it->second;
     const Raw* r = nullptr;
     for (const Raw& x : raw_)
@@ -877,7 +926,7 @@ class LoomNpuSplit : public NpuSplit {
     if (!r) throw LoomError("npu: raw weights outside the registered ranges");
     const std::size_t slot = GateSlot();
     // bindings: A, the panel (not read), C, the gate's flag / tick / signal, the fill sink (not written), raw rows
-    const std::vector<LoomNpu::View> views = {{&a_, a.offset, a.length},
+    const std::vector<LoomNpu::View> views = {{a.in_c ? &c_ : &a_, a.offset, a.length},
                                               {&w_, 0, plan_.w_bytes},
                                               {&c_, c.offset, c.length},
                                               {&flags_, slot, plan_.gate_record},
@@ -891,7 +940,10 @@ class LoomNpuSplit : public NpuSplit {
       k = &npu_.Load(image, "npu_gemm", views);
       LoomNpu::Kernel*& sw = instances_[swap];
       if (!sw) sw = &npu_.Load(swap, "npu_gemm", views);   // only its setup runs
-      k->family = &dcol_family_, k->dec = dec, k->swap = sw;
+      k->family = &families_[family], k->dec = dec, k->swap = sw;
+      std::vector<LoomNpu::View> scratch = views;   // the setup instance: its call writes the scratch C
+      scratch[2] = {&cscratch_, 0, c.length};
+      k->setup = &npu_.Load(image, "npu_gemm", scratch);
     } else {
       npu_.Rebind(*k, views);
     }
@@ -899,13 +951,13 @@ class LoomNpuSplit : public NpuSplit {
     return ids_[key] = static_cast<std::uint32_t>(calls_.size() - 1);
   }
   // A flag word from / to the host, through memory (the NPU does not snoop CPU caches).
-  void HostStore(std::uint32_t word, std::uint32_t value) {
+  void HostStore(std::uint32_t word, std::uint32_t value) override {
     auto* w = static_cast<volatile std::uint32_t*>(flags_.host) + word;
     __atomic_store_n(w, value, __ATOMIC_RELEASE);
     __builtin_ia32_clflush(const_cast<std::uint32_t*>(w));
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
   }
-  std::uint32_t HostLoad(std::uint32_t word) {
+  std::uint32_t HostLoad(std::uint32_t word) override {
     auto* w = static_cast<volatile std::uint32_t*>(flags_.host) + word;
     __builtin_ia32_clflush(const_cast<std::uint32_t*>(w));
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -926,8 +978,25 @@ class LoomNpuSplit : public NpuSplit {
     Job j;
     j.ready = static_cast<std::uint32_t>((kGateBase + kGateSlot * calls.front()) / 4);
     j.done = static_cast<std::uint32_t>((kGateBase + kGateSlot * calls.back() + kSignal + plan_.gate_record) / 4);
+    // decoder-column sets: the gate counts jobs from 1 after each image setup, which precedes every family switch and
+    // every chunk's first job (BeginChunk, FusedCommand)
+    if (plan_.dcol) {
+      const void* fam = LoomNpu::FamilyOf(calls_.at(calls.front()).k);
+      if (fam != job_family_) job_family_ = fam, seq_ = 0;
+    }
     j.gate = ++seq_ * plan_.gate_calls + static_cast<std::uint32_t>(calls.size());
     return j;
+  }
+  void BeginChunk() override {
+    if (!plan_.dcol) return;
+    // the previous chunk's jobs are done (their words are reused); then every gate word reads zero again
+    npu_.Drain();
+    auto* w = static_cast<volatile std::uint32_t*>(flags_.host);
+    for (std::size_t b = kGateBase; b < flags_.bytes; b += 4) w[b / 4] = 0;
+    for (std::size_t b = kGateBase; b < flags_.bytes; b += 64)
+      __builtin_ia32_clflush(const_cast<std::uint32_t*>(w + b / 4));
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    job_family_ = nullptr, fresh_ = true;
   }
   void Enqueue(const std::vector<Queued>& jobs) override {
     std::size_t queued = 0;
@@ -937,7 +1006,8 @@ class LoomNpuSplit : public NpuSplit {
       while (queued < jobs.size()) {
         std::vector<LoomNpu::GatedJob> command;
         std::size_t calls = 0;
-        for (std::size_t i = queued + command.size(); i < jobs.size() && command.size() < kJobsPerCommand; ++i) {
+        const std::size_t per = plan_.dcol ? kDcolJobsPerCommand : kJobsPerCommand;
+        for (std::size_t i = queued + command.size(); i < jobs.size() && command.size() < per; ++i) {
           if (!command.empty() && calls + jobs[i].calls.size() > kCallsPerCommand) break;
           LoomNpu::GatedJob g;
           for (const std::uint32_t id : jobs[i].calls) g.calls.push_back(&calls_.at(id));
@@ -948,7 +1018,8 @@ class LoomNpuSplit : public NpuSplit {
           command.push_back(std::move(g));
         }
         const std::size_t n = command.size();
-        npu_.EnqueueGated(std::move(command));
+        npu_.EnqueueGated(std::move(command), fresh_);
+        fresh_ = false;
         queued += n;
       }
     } catch (...) {
@@ -984,6 +1055,8 @@ class LoomNpuSplit : public NpuSplit {
   // Jobs per NPU command: few commands, while the longest (its waits for the GPU included) stays far below the driver's
   // 2000 ms command limit.
   static constexpr std::size_t kJobsPerCommand = 16, kCallsPerCommand = 256;
+  // decoder-column sets: layers without NPU work leave longer waits between jobs (up to the gate's ~400 ms supply)
+  static constexpr std::size_t kDcolJobsPerCommand = 8;
   // Decoder-column sets bind a few thousand calls (a gate slot each).
   static constexpr std::size_t kDcolFlagBytes = 2u << 20;
   std::size_t GateSlot() const {
@@ -997,12 +1070,15 @@ class LoomNpuSplit : public NpuSplit {
   };
   LoomNpu npu_;
   LoomNpu::Shared &a_, &w_, &c_, &flags_;
+  LoomNpu::Shared& cscratch_;   // the setup instances' C (BindRaw)
   NpuPlan plan_;
   std::uint32_t seq_ = 0;
+  const void* job_family_ = nullptr;   // NewJob's current family run (decoder-column sets)
+  bool fresh_ = false;                 // the next command starts a chunk (BeginChunk)
   std::deque<LoomNpu::Call> calls_;   // stable addresses (LoomNpu::GatedJob)
   std::vector<Raw> raw_;
   std::map<std::string, LoomNpu::Kernel*> instances_;
-  const char dcol_family_ = 0;
+  std::map<std::string, char> families_;   // the decoder-column image families (BindRaw), by name
   std::map<std::tuple<std::string, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t>,
            std::uint32_t>
       ids_;

@@ -24,9 +24,12 @@ and fills paced a few columns at a time so they do not starve the activation str
 first call, fills unpaced; LoomNpu submits the pushes one call ahead of the waits).
 Needs HRX patch 0013; compile with LOOM_ENV. Config.gate > 0 adds the NPU-side gate (GATE below; HRX patch 0016).
 """
+import contextlib
 import dataclasses
 import importlib
+import math
 import os
+import struct
 import sys
 
 import gen_bfp16_encode as GE
@@ -59,6 +62,15 @@ class Config:
     frec: int = 2304    # fill record bytes
     fmt: str = "IQ4_XS"  # dcol 2: the raw weights' GGUF format
     kraw: int = 0       # dcol 2: the raw rows' K (row stride; the call reads K = 1024 * passes of it), 0: the call's K
+    swiglu: bool = False  # one replay group: a column's first NP / 2 slabs are gate rows, the rest the up rows of the
+                          # same features; the tail writes silu(gate) * up as bfp16ebs8 fragments (convert_swiglu) into
+                          # H (hpass), the next GEMM's activations (ain = "h")
+    ain: str = ""         # "h": the activations are read from H (a swiglu call's output) instead of the encoder's stream
+    dgu: int = 0          # swiglu dcol 2: bytes from a gate row to its up row (the raw stream per pass: [gate / up][32 rows])
+    hpass: int = 0        # H as [M block][pass hpass][16-token slab][128 k-blocks] (the FFN block's swiglu output, down's
+                          # input): swiglu (cols = hpass): column c writes pass c; ain "h": records [M block][pass, slab]
+    swcol: int = 0        # swiglu dcol 2: raw rows between columns' first gate rows (0: TN / 2)
+    gord: str = "P4"      # dcol 2: the grid decoders' k-block order (gen_npu_dec DQ_GORD; "N": natural)
     ofeat: int = 0      # final f32 output, fragment-major into [token / 16][ofeat / 16][16][16]: column c's 80 features are
                         # fragments 5c .. 5c + 4; needs one replay group (GE.GROUPS = (passes,)) and
                         # LOOM_EXP_LS_SEND_PITCH=1 (the whole f32 slot is sent)
@@ -69,14 +81,15 @@ class Config:
 # (write; go at byte 0, done at byte 16). After its last firing of a job the head polls request-driven
 # (constrain.request: one fresh flag read per tick) until ready >= (its job count + 1) * GATE_CALLS (jobs count from 1 after the
 # setup call; jobs sharing a ready word store theirs in order, after the GPU joined the earlier ones), backing off (pace =
-# GP0 + GPS * max(0, polls - 64) delay iterations; a supply of 1024 polls lasts ~100 ms). It hands [seq, status, polls,
+# GP0 + GPS * max(0, polls - 64) delay iterations; a supply of 1024 polls lasts ~400 ms: decoder-column sets leave layers
+# without NPU work; the tick stream takes one record per poll, so the supply cannot grow). It hands [seq, status, polls,
 # ncalls] to the mid over a leaf-synchronized neighbor channel and ticks / reads out the rest of the supply GB records per
 # firing of the next job. The mid emits go and done (constrain.signal + constrain.gate): the control program's gate
 # invocation waits for go before any data moves; its done invocation queues done after the job's egress, so done lands
 # after C. done = the job's ready value, with GATE_FAILED set if the head gave up (status 2). Job state (firings done, firings per job, leftover
 # supply, pending reads, sequence) lives in private storage, which the array setup of a core stream plan zeroes; a job of
 # N calls is N * nb * passes firings, and before the first gated job (state zero) it is one call: the setup call's.
-GP0, GPS, GB = 650, 26, 8
+GP0, GPS, GB = 650, 104, 8
 # The protocol the host follows (dispatch.txt "npugate <GATE_SUPPLY> <GATE_CALLS> <GATE_RECORD>"): a job's gate value is
 # sequence * GATE_CALLS + its calls (jobs of 1 .. GATE_CALLS - 1 calls); done lands GATE_RECORD bytes into the signal
 # binding. GATE_FAILED in done: the head gave up (the host sets it too for a failed command; gen_npu_unpack.GATED_LOOP).
@@ -86,11 +99,12 @@ GATE_SUPPLY, GATE_CALLS, GATE_RECORD, GATE_FAILED = 1024, 64, 16, 1 << 31
 _LEAVES = {}
 
 
-def decoder(fmt):
-    """gen_npu_dec for fmt (its constants follow DQ_FMT at import)."""
+def decoder(fmt, gord="P4"):
+    """gen_npu_dec for fmt (its constants follow DQ_FMT and DQ_GORD at import)."""
     import gen_npu_dec
-    if gen_npu_dec.FMT != fmt:
+    if gen_npu_dec.FMT != fmt or os.environ.get("DQ_GORD", "P4") != gord:
         os.environ["DQ_FMT"] = fmt
+        os.environ["DQ_GORD"] = gord
         gen_npu_dec = importlib.reload(gen_npu_dec)
     return gen_npu_dec
 
@@ -103,6 +117,14 @@ def loom_env(cfg, swap=False):
     if cfg.dcol == 2:
         env["LOOM_EXP_PANEL_INTERLEAVE"] = str(NP)
         env["LOOM_EXP_LS_SEND_PITCH_RECORD"] = str(NP * 4 * 256 // 8 * 4)
+    if not groups(cfg):
+        env["LOOM_EXP_PANEL_GROUPS"] = str(cfg.passes)
+        if cfg.dcol == 2:   # one group, still streamed from the decoder column (HRX patch 0019)
+            env["LOOM_EXP_PANEL_STREAM_SINGLE"] = "1"
+    if cfg.swiglu:
+        env["LOOM_EXP_LS_SEND_PITCH"] = str(SW_PITCH)
+        env["LOOM_EXP_LS_SEND_PITCH_RECORD"] = str(SW_REC)
+        env["LOOM_EXP_PANEL_GROUPS"] = str(cfg.passes)
     if swap:
         env["LOOM_EXP_SETUP_ONLY"] = "1"
         env["LOOM_EXP_SETUP_TILES"] = ",".join(f"{cfg.cols}:{2 + f}" for f in range(fill_workers(cfg)))
@@ -111,9 +133,48 @@ def loom_env(cfg, swap=False):
 
 def groups(cfg):
     """The call's replay groups of passes, () for a single group."""
+    if cfg.swiglu or cfg.ain:
+        return ()
     g = GE.pass_groups(cfg.passes)
     assert len(g) <= 2
     return g if len(g) > 1 else ()
+
+
+def bf16_round(x):
+    """x rounded to bf16 (nearest even), as a float."""
+    u = struct.unpack("<I", struct.pack("<f", x))[0]
+    u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
+    return struct.unpack("<f", struct.pack("<I", u))[0]
+
+
+def bf16_bits(x):
+    return struct.unpack("<I", struct.pack("<f", bf16_round(x)))[0] >> 16
+
+
+def f32_bits(x):
+    v = struct.unpack("<i", struct.pack("<f", x))[0]
+    return v
+
+
+SW_REC = NP * 2 * 72      # swiglu: a segment's output record, NP k-blocks x 2 token halves of bfp16 fragments (720 B)
+SW_PITCH = 8              # its send pitch: a C slot of 8 records (5760 B) holds the segment's f32 C (5120 B)
+SW_SLOT = SW_PITCH * SW_REC
+
+
+@contextlib.contextmanager
+def np_override(n):
+    """Generate with n 16-row slabs per column (TN = 16 n) instead of NP (e.g. 4: a swiglu call's 32 features per
+    column, so its k-block units line up with 1024-feature passes)."""
+    global NP, TN, SW_REC, SW_SLOT
+    saved = NP, TN, SW_REC, SW_SLOT
+    NP, TN = n, 16 * n
+    SW_REC = NP * 2 * 72
+    SW_SLOT = SW_PITCH * SW_REC
+    assert SW_SLOT >= 1024 * NP
+    try:
+        yield
+    finally:
+        NP, TN, SW_REC, SW_SLOT = saved
 
 
 def slab(ks):
@@ -123,7 +184,14 @@ def slab(ks):
 def stream_bytes(cfg):
     """(activation, weight, C) binding sizes."""
     a = sum(cfg.nb * cfg.passes * MP * slab(k) for k in cfg.ks)
+    if cfg.ain == "h":   # the view's extent in H ([M block][pass][slab][128 k-blocks])
+        a = (144 * sum(cfg.ks[:-1]) + (cfg.nb - 1) * cfg.hpass * MP * 128 * 144 + (cfg.passes * MP - 1) * 128 * 144
+             + slab(cfg.ks[-1]))
     w = cfg.cols * sum(cfg.passes * NP * slab(k) for k in cfg.ks)
+    if cfg.swiglu:   # the receiver's extent in H: the last 16-token row's columns
+        # the last column's (pass's) last record in H
+        return a, w, ((cfg.nb - 1) * cfg.hpass * MP * 128 * 144 + (MP - 1) * 128 * 144
+                      + (cfg.cols - 1) * MP * 128 * 144 + SW_REC)
     return a, w, max(1, len(groups(cfg))) * cfg.cols * cfg.nb * MP * NP * 2 * 256
 
 
@@ -184,7 +252,14 @@ def array_program(L, cfg):
     seg = MP * NP * 4 * 256 // MP
     ng = max(1, len(groups(cfg)))   # C segments per M block and group
     e(f"  %nseg = constant.u32 {ng * nb * MP} : reg<aie2p.array.scalar : index>")
-    if cfg.ofeat:
+    if cfg.swiglu:
+        # column c's record (NP k-blocks of 16 tokens) at k-block NP c of its 16-token row in H
+        rec = f"{SW_REC // 4}"   # column c: pass c of H [M block][pass][slab][128 k-blocks]
+        assert cols == cfg.hpass
+        e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nb}x{MP}x{rec}xi32, "
+          f"#encoding.layout.strided<strides=[{MP * 128 * 36}, {cfg.hpass * MP * 128 * 36}, {128 * 36}, 1]>>>")
+        stype = f"tile<{rec}xi32>"
+    elif cfg.ofeat:
         # a segment is [sub-tile 5][16 tokens][16 f32] (the tail's convert_f32)
         # the tail's slot is [sub-tile][16 tokens][16 f32] (convert_f32): NP consecutive fragments of one 16-token row
         # (the 1280 contiguous words as 5 x 256: a shim DMA wrap holds at most 1023)
@@ -224,15 +299,25 @@ def array_program(L, cfg):
     for r in range(rows):
         fa = slab(cfg.ks[r])
         a_off = sum(nb * P * MP * slab(k) for k in cfg.ks[:r])
-        e(f"  %ao{r} = constant.u64 {a_off} : reg<aie2p.array.offset : offset>")
-        e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{nb * P * MP}x{fa // 4}xi32>>")
-        e(f"  %a{r} = view.sender %as{r}, %ao{r} : reg<aie2p.array.sender : tile<{fa // 4}xi32>>")
+        arec = f"{fa // 4}xi32"
+        if cfg.ain == "h":   # H [M block][pass][slab][128 k-blocks]: records [M block][pass, slab]
+            a_off = 144 * sum(cfg.ks[:r])
+            e(f"  %ao{r} = constant.u64 {a_off} : reg<aie2p.array.offset : offset>")
+            rw = fa // 4
+            sp = next(k for k in range(1, 9) if rw % k == 0 and rw // k <= 1023)
+            arec = f"{sp}x{rw // sp}xi32"
+            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{nb}x{P * MP}x{sp}x{rw // sp}xi32, "
+              f"#encoding.layout.strided<strides=[{cfg.hpass * MP * 128 * 36}, {128 * 36}, {rw // sp}, 1]>>>")
+        else:
+            e(f"  %ao{r} = constant.u64 {a_off} : reg<aie2p.array.offset : offset>")
+            e(f"  %as{r} = sender %ab, 0 : reg<aie2p.array.sender : tile<{nb * P * MP}x{fa // 4}xi32>>")
+        e(f"  %a{r} = view.sender %as{r}, %ao{r} : reg<aie2p.array.sender : tile<{arec}>>")
         e(f"  %arec{r} = constant.u32 {nb * P * MP} : reg<aie2p.array.scalar : index>")
         for j in range(cols):
             c = (2 * r + j) % cols
             acap = cfg.acap_t if roles[r] == "tail" else cfg.acap
-            e(f"  %ra{c}_{r} = receiver %k{c}_{r}, 0 : reg<aie2p.array.receiver : tile<{fa // 4}xi32>>")
-            e(f"  %cha{c}_{r} = channel %a{r}, %ra{c}_{r}, %n{acap}, %arec{r} : reg<aie2p.array.channel : tile<{fa // 4}xi32>>")
+            e(f"  %ra{c}_{r} = receiver %k{c}_{r}, 0 : reg<aie2p.array.receiver : tile<{arec}>>")
+            e(f"  %cha{c}_{r} = channel %a{r}, %ra{c}_{r}, %n{acap}, %arec{r} : reg<aie2p.array.channel : tile<{arec}>>")
             e(f"  constrain.leaf_sync %cha{c}_{r}")
             e(f"  constrain.stage %cha{c}_{r}, %n{(2 * r) % cols if cols > 1 else 2}")
     if cfg.gate:
@@ -278,8 +363,8 @@ def fill_channels(e, cfg, panel):
     """Fill workers in column cols (rows 2..): worker f takes columns 2 f, 2 f + 1, each a contiguous panel of %wb in
     frec-byte records (in port j, out port 2 + j), into the dummy write binding %fsb (lane c)."""
     cols, rows = cfg.cols, len(cfg.ks)
-    assert cols <= 7 and panel % cfg.frec == 0
     frec = 2304 if cfg.dcol == 2 else cfg.frec
+    assert cols <= 7 and panel % frec == 0
     nrec = panel // frec
     fw = frec // 4
     e(f"  %fcol = constant.u32 {cols} : reg<aie2p.array.scalar : index>")
@@ -306,7 +391,7 @@ def fill_inputs(e, cfg, panel):
     nrec, fw = panel // cfg.frec, cfg.frec // 4 // FILL_DIV
     if cfg.dcol == 2:
         # raw rows [N][kraw / 256][BLK]: per column 25 (pass, slab) units of [16 rows][4 super-blocks]
-        D = decoder(cfg.fmt)
+        D = decoder(cfg.fmt, cfg.gord)
         P_, NS_ = cfg.passes, NP
         RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * D.BLK // 4   # row stride in words
         RW = D.ROWB // 4                                  # record row words (fixed for every format)
@@ -315,9 +400,15 @@ def fill_inputs(e, cfg, panel):
         e(f"  %funits = constant.u32 {P_ * NS_} : reg<aie2p.array.scalar : index>")
         for c in range(cfg.cols):
             f, j = c // FILL_PER, c % FILL_PER
-            e(f"  %fo{c} = constant.u64 {c * TN * RS * 4} : reg<aie2p.array.offset : offset>")
-            e(f"  %fi_all{c} = sender %rwb, 0 : reg<aie2p.array.sender : tile<{P_}x{NS_}x16x{RW}xi32, "
-              f"#encoding.layout.strided<strides=[{D.BLK}, {16 * RS}, {RS}, 1]>>>")
+            if cfg.swiglu:   # column c: gate rows swcol c .. (its features), then the same up rows dgu bytes on
+                assert cfg.dgu % 4 == 0 and NS_ % 2 == 0
+                e(f"  %fo{c} = constant.u64 {c * (cfg.swcol or TN // 2) * RS * 4} : reg<aie2p.array.offset : offset>")
+                e(f"  %fi_all{c} = sender %rwb, 0 : reg<aie2p.array.sender : tile<{P_}x2x{NS_ // 2}x16x{RW}xi32, "
+                  f"#encoding.layout.strided<strides=[{D.BLK}, {cfg.dgu // 4}, {16 * RS}, {RS}, 1]>>>")
+            else:
+                e(f"  %fo{c} = constant.u64 {c * TN * RS * 4} : reg<aie2p.array.offset : offset>")
+                e(f"  %fi_all{c} = sender %rwb, 0 : reg<aie2p.array.sender : tile<{P_}x{NS_}x16x{RW}xi32, "
+                  f"#encoding.layout.strided<strides=[{D.BLK}, {16 * RS}, {RS}, 1]>>>")
             e(f"  %fiv{c} = view.sender %fi_all{c}, %fo{c} : reg<aie2p.array.sender : tile<16x{RW}xi32>>")
             e(f"  %fir{c} = receiver %kf{f}, {j} : reg<aie2p.array.receiver : tile<16x{RW}xi32>>")
             e(f"  %chfi{c} = channel %fiv{c}, %fir{c}, %one, %funits : reg<aie2p.array.channel : tile<16x{RW}xi32>>")
@@ -643,6 +734,10 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
     tail = role == "tail"
     mid = role == "mid"
     NT = NP * cfg.mu      # sub-tiles per iteration, M-slab major
+    # swiglu tail: the A pointer is loop-carried as a scalar, a short-lived pointer per sub-tile. Its store fifo pins
+    # p2; a pointer live across the loop would otherwise be pushed into p0 / p1, which the operand load fifos need.
+    spa = tail and cfg.swiglu
+    pat = "reg<aie2p.er>" if spa else "reg<aie2p.ep>"
     e("  %lo_a = vlda.load-fifo.low512 %a, 0")
     e("  %lo_w = vlda.load-fifo.low512 %w, 0")
     e("  %fa0 = vlda.load-fifo.high512 %a, %lo_a, 64")
@@ -655,12 +750,21 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
         e("  %nf = lt %zero, %cnt")
         e("  %lstep = mul %cstep, %nf")
         e("  %mls = mov.modifier %lstep")
+        if cfg.swiglu:   # a segment's C slot is SW_SLOT bytes: the pointers skip its tail past the f32 segment
+            e(f"  %swgap = mov.i32 {SW_SLOT - 1024 * NP}")
+            e("  %lgap = mul %swgap, %nf")
+            e("  %mlb = mov.modifier %lgap")
+            e("  %mcb = mov.modifier %swgap")
         pla, plp = ", %plb: reg<aie2p.ep>", ", %pl: reg<aie2p.ep>"
     else:
         po0, pct = "%zero", "reg<aie2p.er>"
         pla = plp = ""
-    e(f"  low.br ^outer(%zero: reg<aie2p.er>, %a: reg<aie2p.ep>, {po0}: {pct}, %fa0: reg<aie2p.eldfiforeg>, %fw0: reg<aie2p.eldfiforeg>{pla})")
-    e(f"^outer(%mp: reg<aie2p.er>, %pa: reg<aie2p.ep>, %po: {pct}, %fa: reg<aie2p.eldfiforeg>, %fw: reg<aie2p.eldfiforeg>{plp}):")
+    a0 = "%a"
+    if spa:
+        e("  %as0 = mov.address-to-scalar %a")
+        a0 = "%as0"
+    e(f"  low.br ^outer(%zero: reg<aie2p.er>, {a0}: {pat}, {po0}: {pct}, %fa0: reg<aie2p.eldfiforeg>, %fw0: reg<aie2p.eldfiforeg>{pla})")
+    e(f"^outer(%mp: reg<aie2p.er>, %pa: {pat}, %po: {pct}, %fa: reg<aie2p.eldfiforeg>, %fw: reg<aie2p.eldfiforeg>{plp}):")
     e("  %omore = lt %mp, %nmp")
     e("  low.cond_br %omore, ^obody, ^exit : reg<aie2p.er>")
     e("^obody:")
@@ -679,9 +783,14 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
                 wp.append(f"  %{x}w{j + 1} = padds.modifier %{x}w{j}, %mf")
             wsrc = f"%{x}w{tw}"
         asrc, ap = "%pa", []
+        # spa: a distinct opaque zero per sub-tile (outer counter >> 8 + t) keeps the conversions from being merged
+        # into one long-lived pointer
+        zs = [f"  %{x}kz = mova.i32 {-(8 + t)}", f"  %{x}oz = lshl %mp, %{x}kz", f"  %{x}pas = add.rr %pa, %{x}oz"] if spa else []
+        if spa:
+            ap, asrc = zs + [f"  %{x}pae = mov.scalar-to-address %{x}pas"], f"%{x}pae"
         sm = tm if a_adv else tm % acap
         if sm:
-            ap = [f"  %{x}am0 = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>"]
+            ap = zs + [f"  %{x}am0 = mov.scalar-to-address %{x}pas"] if spa else [f"  %{x}am0 = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>"]
             for j in range(sm):
                 ap.append(f"  %{x}am{j + 1} = padds.modifier %{x}am{j}, %mf")
             asrc = f"%{x}am{sm}"
@@ -812,7 +921,11 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
             e(f"  acq.cond %am1, %cqa{t + 1}, 2")
         if nxt:   # loads go through pl, so pc steps after the stores (one fewer live pointer)
             e(f"  %plc{t + 1} = copy {pl[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
-            e(f"  %pl{t + 1} = padds.modifier %plc{t + 1}, %mls")
+            if cfg.swiglu and row_end:
+                e(f"  %pl{t + 1}g = padds.modifier %plc{t + 1}, %mls")
+                e(f"  %pl{t + 1} = padds.modifier %pl{t + 1}g, %mlb")
+            else:
+                e(f"  %pl{t + 1} = padds.modifier %plc{t + 1}, %mls")
         late = row_end and nxt   # the convert runs between the stores and the next C loads
         for c in range(4):
             for q in range(4):
@@ -890,15 +1003,227 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
             e(f"  %cqr{t} = copy %clast : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
             e(f"  rel.cond %one, %cqr{t}, 2")
             return f"%cj{t}p", f"%cj{t}l"
+        def convert_swiglu(base, lp, back, segs=1):
+            """Last pass (cfg.swiglu): slabs 0 .. NP / 2 - 1 of a segment are gate rows, the rest up rows of the same
+            features. Per 8 x 8 block pair (8 tokens, 8 features) h = silu(g) * u through bf16 products with f32
+            results (sigmoid below); a segment's 2 NP h blocks ([feature block][token half] in push order) go out as
+            bfp16ebs8 fragments (SW_REC) at its slot start, in place (every block is read before the store fifo reaches
+            it). A loop over the iteration's segs segments (the earlier ones deferred to here; the 16 KB program memory
+            holds one block's code). Returns the join's (base, lp)."""
+            e(f"  low.cond_br %clast, ^cv{t}, ^nc{t} : reg<aie2p.er>")
+            e(f"^nc{t}:")
+            e(f"  low.br ^cj{t}({base}: reg<aie2p.ep>, {lp}: reg<aie2p.ep>)")
+            e(f"^cv{t}:")
+            d, k, rest = base, 0, back + 512 + SW_SLOT * (segs - 1)   # the first deferred segment's slot
+            while rest > 0:
+                step = min(rest, 448)
+                rest -= step
+                e(f"  %cvb{t}_{k} = padda {d}, {-step}")
+                d, k = f"%cvb{t}_{k}", k + 1
+            p = f"%sw{t}_"
+            V1, V2 = "reg<aie2p.vec256>", "reg<aie2p.vec256 x2>"
+            M1, M2, M4 = "reg<aie2p.mbms>", "reg<aie2p.mbms x2>", "reg<aie2p.mbms x4>"
+            ER = "reg<aie2p.er>"
+            e(f"  {p}ds = mov.address-to-scalar {d}")
+            e(f"  {p}k0 = mova.i32 0")
+            e(f"  {p}nseg = mova.i32 {segs}")
+            e(f"  {p}kslot = mov.i32 {SW_SLOT}")
+            e(f"  low.br ^swl{t}({p}k0: {ER})")
+            e(f"^swl{t}({p}k: {ER}):")
+            e(f"  {p}more = lt {p}k, {p}nseg")
+            e(f"  low.cond_br {p}more, ^swb{t}, ^swx{t} : {ER}")
+            e(f"^swb{t}:")
+            e(f"  {p}so = mul {p}k, {p}kslot")
+            e(f"  {p}ss = add.rr {p}ds, {p}so")
+            e(f"  {p}c = mova.i32 60")
+
+            kn = [0]
+
+            def kbf(x):                                         # a bf16 constant in 32 lanes, made at its use
+                kn[0] += 1
+                e(f"  {p}kc{kn[0]} = mov.i32 {bf16_bits(x)}")
+                e(f"  {p}kv{kn[0]} = vbcst.16 {p}kc{kn[0]}")
+                return f"{p}kv{kn[0]}"
+
+            def kacc(x):                                        # an f32 constant (exact in bf16) in 32 accumulator lanes
+                kn[0] += 1
+                nm, one_, x_ = f"{p}ka{kn[0]}", kbf(1.0), kbf(x)
+                e(f"  {nm} = vmul.bf16x32 {one_}, {x_}, {p}c")
+                return nm
+            L2E = 1 / math.log(2)
+            e(f"  {p}amk = mov.i32 32767")                      # bf16 |x| mask
+            e(f"  {p}amv = vbcst.16 {p}amk")
+            C2, C1, C3 = bf16_round(math.log(2) ** 2 / 2), bf16_round(math.log(2)), math.log(2) ** 3 / 6
+            e(f"  {p}sp = mov.scalar-to-address {p}ss")
+            e(f"  {p}sl = vlda.store-fifo.low512 {p}sp, 0")
+            e(f"  {p}f0 = vlda.store-fifo.high512 {p}sp, {p}sl, 64")
+            e(f"  {p}op = copy {p}sp : reg<aie2p.ep> -> reg<aie2p.mpfs>")
+            e(f"  {p}ps = mova.fifo.store.position 0")
+            fifo = (f"{p}f0", f"{p}op", f"{p}ps")
+            ptrn = [0]
+
+            def ptr(sub):                                       # this block's sub-tile: offsets -512 .. 448 around its middle
+                ptrn[0] += 1                                    # short-lived (the tail's ep budget is 8)
+                q_ = f"{p}pp{ptrn[0]}"
+                e(f"  {q_} = mov.scalar-to-address {sub}")
+                return q_
+            nf = 0
+            MF, MP_, MS = "reg<aie2p.mstfifo>", "reg<aie2p.mpfs>", "reg<aie2p.mr26_fifo_st>"
+            e(f"  {p}i0 = mova.i32 0")
+            e(f"  {p}k1024 = mov.i32 1024")
+            # outer loop j over the gate slabs, inner i over their two 8-row halves
+            e(f"  {p}nj = mova.i32 {NP // 2}")
+            e(f"  low.br ^swj{t}({p}i0: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
+            e(f"^swj{t}({p}j: {ER}, {p}JF: {MF}, {p}JO: {MP_}, {p}JP: {MS}):")
+            e(f"  {p}jm = lt {p}j, {p}nj")
+            e(f"  low.cond_br {p}jm, ^swjb{t}, ^swjx{t} : {ER}")
+            e(f"^swjb{t}:")
+            e(f"  {p}ji0 = mova.i32 0")
+            e(f"  low.br ^swi{t}({p}ji0: {ER}, {p}JF: {MF}, {p}JO: {MP_}, {p}JP: {MS})")
+            e(f"^swi{t}({p}i: {ER}, {p}F: {MF}, {p}O: {MP_}, {p}P: {MS}):")
+            e(f"  {p}nbk = mova.i32 2")
+            e(f"  {p}im = lt {p}i, {p}nbk")
+            e(f"  low.cond_br {p}im, ^swib{t}, ^swix{t} : {ER}")
+            e(f"^swib{t}:")
+            # gate rows: slab j, half i (sub-tiles at 256 i, 512 + 256 i); up: NP / 2 slabs on
+            e(f"  {p}jo = mul {p}j, {p}k1024")
+            e(f"  {p}k256 = mov.i32 256")
+            e(f"  {p}io = mul {p}i, {p}k256")
+            e(f"  {p}ja = add.rr {p}ss, {p}jo")
+            e(f"  {p}ia = add.rr {p}ja, {p}io")
+            e(f"  {p}k512 = mov.i32 512")
+            e(f"  {p}gib = add.rr {p}ia, {p}k512")
+            e(f"  {p}kup = mov.i32 {1024 * NP // 2}")
+            e(f"  {p}uib = add.rr {p}gib, {p}kup")
+            fifo = (f"{p}F", f"{p}O", f"{p}P")
+            for i in (0,):                                  # one 8-feature block per loop body
+                for r in range(2):                              # token half: chain row bit
+                    n = f"{p}b{r}"
+
+                    def load(sub, tag):
+                        pp = ptr(sub)
+                        q4 = []
+                        for q in range(4):
+                            x = f"{n}{tag}l{q}"
+                            e(f"  {x} = vlda.acc {pp}, {512 * r + 64 * q - 512}")
+                            q4.append(x)
+                        return q4
+                    g4, u4 = load(f"{p}gib", "g"), load(f"{p}uib", "u")
+                    hs = []
+                    for h in range(2):
+                        g2, u2 = f"{n}g2{h}", f"{n}u2{h}"
+                        e(f"  {g2} = concat({g4[2 * h]}, {g4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
+                        e(f"  {u2} = concat({u4[2 * h]}, {u4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
+                        e(f"  {n}gb{h} = vconv.bf16.fp32 {g2}")
+                        e(f"  {n}ub{h} = vconv.bf16.fp32 {u2}")
+
+                        # vmul / vmac.bf16x32: 32 f32 lanes in the first two units of the x4 accumulator
+                        def lo32(v, tag):
+                            q0, q1, r2 = f"{n}{tag}0", f"{n}{tag}1", f"{n}{tag}2"
+                            e(f"  {q0} = slice {v}[0] : {M4} -> {M1}")
+                            e(f"  {q1} = slice {v}[1] : {M4} -> {M1}")
+                            e(f"  {r2} = concat({q0}, {q1}) : ({M1}, {M1}) -> {M2}")
+                            return q0, q1, r2
+                        # sigmoid(g): e = e^-|g| = 2^n 2^r (n = round(-|g| log2 e); vexp2 is Mitchell's 2^floor(z)
+                        # (1 + frac(z)), exact only at integers; 2^r by a cubic), y = 1 / (1 + e) by two Newton steps
+                        # from 1.5 - d / 2, sigmoid = y for g >= 0, e y for g < 0
+                        def bf(v, tag):                         # the 32 f32 lanes of an x4 accumulator as bf16
+                            return f"{n}{tag}b{h}", e(f"  {n}{tag}b{h} = vconv.bf16.fp32 {lo32(v, f'{tag}q{h}')[2]}")
+                        e(f"  {n}ga{h} = vband {n}gb{h}, {p}amv")                     # |g|
+                        e(f"  {n}z0{h} = vmul.bf16x32 {n}ga{h}, {kbf(-bf16_round(L2E))}, {p}c")
+                        e(f"  {n}z{h} = vmac.bf16x32 {n}z0{h}, {n}ga{h}, {kbf(-(L2E - bf16_round(L2E)))}, {p}c")   # z = -|g| log2 e (f32)
+                        e(f"  {n}t1{h} = vadd.f32x64 {n}z{h}, {kacc(12582912.0)}, {p}c")
+                        e(f"  {n}nf{h} = vsub.f32x64 {n}t1{h}, {kacc(12582912.0)}, {p}c")    # n = round(z)
+                        e(f"  {n}r{h} = vsub.f32x64 {n}z{h}, {n}nf{h}, {p}c")     # r = z - n, |r| <= 1/2
+                        rb = bf(f"{n}r{h}", "r")[0]
+                        n0, n1, _ = lo32(f"{n}nf{h}", f"nq{h}")
+                        e(f"  {n}x{h}0 = vexp2.bf16x16 {n0}")                    # 2^n, exact
+                        e(f"  {n}x{h}1 = vexp2.bf16x16 {n1}")
+                        e(f"  {n}xx{h} = concat({n}x{h}0, {n}x{h}1) : ({V1}, {V1}) -> {V2}")
+                        e(f"  {n}h0{h} = vmac.bf16x32 {kacc(C2)}, {rb}, {kbf(C3)}, {p}c")
+                        hb = bf(f"{n}h0{h}", "hh0")[0]
+                        e(f"  {n}h1{h} = vmac.bf16x32 {kacc(C1)}, {rb}, {hb}, {p}c")
+                        hb = bf(f"{n}h1{h}", "hh1")[0]
+                        e(f"  {n}h2{h} = vmac.bf16x32 {kacc(1.0)}, {rb}, {hb}, {p}c")    # 2^r
+                        pb = bf(f"{n}h2{h}", "hh2")[0]
+                        e(f"  {n}ee{h} = vmul.bf16x32 {n}xx{h}, {pb}, {p}c")       # e = e^-|g|
+                        eb = bf(f"{n}ee{h}", "e")[0]
+                        e(f"  {n}d{h} = vmac.bf16x32 {kacc(1.0)}, {eb}, {kbf(1.0)}, {p}c")  # d = 1 + e
+                        db = bf(f"{n}d{h}", "dd")[0]
+                        e(f"  {n}y0{h} = vmac.bf16x32 {kacc(1.5)}, {db}, {kbf(-0.5)}, {p}c")  # y0 = 1.5 - d / 2
+                        yb = bf(f"{n}y0{h}", "y0")[0]
+                        e(f"  {n}nd{h} = vneg.f32x64 {n}d{h}, {p}c")
+                        ndb = bf(f"{n}nd{h}", "nd")[0]
+                        for it in range(2):                     # y <- y (2 - d y)
+                            e(f"  {n}w{it}{h} = vmac.bf16x32 {kacc(2.0)}, {ndb}, {yb}, {p}c")
+                            wb = bf(f"{n}w{it}{h}", f"w{it}")[0]
+                            e(f"  {n}y{it + 1}{h} = vmul.bf16x32 {yb}, {wb}, {p}c")
+                            yb = bf(f"{n}y{it + 1}{h}", f"y{it + 1}")[0]
+                        e(f"  {n}sn{h} = vmul.bf16x32 {eb}, {yb}, {p}c")           # e y: sigmoid(g) for g < 0
+                        snb = bf(f"{n}sn{h}", "sn")[0]
+                        e(f"  {n}lt{h} = vlt.s16x32.el.low32 {n}gb{h}, {kbf(0.0)}")      # g < 0 (sign bit)
+                        e(f"  {n}sgb{h} = vsel.16.mask64 {yb}, {snb}, {n}lt{h}")
+                        e(f"  {n}si{h} = vmul.bf16x32 {n}gb{h}, {n}sgb{h}, {p}c")      # silu(g)
+                        e(f"  {n}sib{h} = vconv.bf16.fp32 {lo32(f'{n}si{h}', f'siq{h}')[2]}")
+                        e(f"  {n}h{h} = vmul.bf16x32 {n}sib{h}, {n}ub{h}, {p}c")       # silu(g) * u
+                        q0, q1, _ = lo32(f"{n}h{h}", f"hq{h}")
+                        hs += [q0, q1]
+                    e(f"  {n}H = concat({hs[0]}, {hs[1]}, {hs[2]}, {hs[3]}) : ({M1}, {M1}, {M1}, {M1}) -> {M4}")
+                    nf += 1
+                    nxt = (f"{p}xf{nf}", f"{p}xp{nf}", f"{p}xq{nf}")
+                    e(f"  {nxt[0]}, {nxt[1]}, {nxt[2]} = vst.push.bfp16ebs8.from.fp32 {fifo[0]}, {n}H, {fifo[1]}, {fifo[2]}")
+                    fifo = nxt
+            e(f"  {p}i1 = add.rr {p}i, %one")
+            e(f"  low.br ^swi{t}({p}i1: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
+            e(f"^swix{t}:")
+            fifo = (f"{p}F", f"{p}O", f"{p}P")
+            e(f"  {p}j1 = add.rr {p}j, %one")
+            e(f"  low.br ^swj{t}({p}j1: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
+            e(f"^swjx{t}:")
+            fifo = (f"{p}JF", f"{p}JO", f"{p}JP")
+            if True:
+                # the flush writes whole 64-byte lines only: pad the 2 NP fragments (72 B each) to a multiple of 8
+                # with zeros (the slot's bytes below 1152 have all been read by now)
+                e(f"  {p}zc = acc.clear.f32x64")
+                for z in range(-2 * NP % 8):
+                    nf += 1
+                    nxt = (f"{p}xf{nf}", f"{p}xp{nf}", f"{p}xq{nf}")
+                    e(f"  {nxt[0]}, {nxt[1]}, {nxt[2]} = vst.push.bfp16ebs8.from.fp32 {fifo[0]}, {p}zc, {fifo[1]}, {fifo[2]}")
+                    fifo = nxt
+                e(f"  {p}yf, {p}yp, {p}yq = vst.flush.512 {fifo[0]}, {fifo[1]}, {fifo[2]}")
+            e(f"  {p}k1 = add.rr {p}k, %one")
+            e(f"  low.br ^swl{t}({p}k1: {ER})")
+            e(f"^swx{t}:")
+            e(f"  {p}rb = mov.i32 {back + 512 + SW_SLOT * (segs - 1)}")
+            e(f"  {p}ra = add.rr {p}ds, {p}rb")
+            e(f"  %cvr{t} = mov.scalar-to-address {p}ra")
+            e(f"  %cvq{t} = copy %cvr{t} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            e(f"  low.br ^cj{t}(%cvr{t}: reg<aie2p.ep>, %cvq{t}: reg<aie2p.ep>)")
+            e(f"^cj{t}(%cj{t}p: reg<aie2p.ep>, %cj{t}l: reg<aie2p.ep>):")
+            for j in range(segs):
+                e(f"  %cqr{t}_{j} = copy %clast : reg<aie2p.er> -> reg<aie2p.mr26_lock>")
+                e(f"  rel.cond %one, %cqr{t}_{j}, 2")
+            return f"%cj{t}p", f"%cj{t}l"
+        if cfg.swiglu:
+            assert not cfg.ofeat and not groups(cfg), "swiglu needs the full sum: one replay group, bf16-slot C"
+            convert = convert_swiglu
         if cfg.ofeat:
             convert = convert_f32
         if row_end and not nxt:
-            pc[t], pl[t] = convert(pc[t], pl[t], 1024 * (NP - 1))
+            if cfg.swiglu:   # the iteration's segments (mu), the earlier ones deferred to here
+                pc[t], pl[t] = convert(pc[t], pl[t], 1024 * (NP - 1), segs=NT // NP)
+            else:
+                pc[t], pl[t] = convert(pc[t], pl[t], 1024 * (NP - 1))
         if nxt:
             e(f"  %pcc{t + 1} = copy {pc[t]} : reg<aie2p.ep> -> reg<aie2p.ep>")
-            e(f"  %pc{t + 1} = padds.modifier %pcc{t + 1}, %mcs")
+            if cfg.swiglu and row_end:
+                e(f"  %pc{t + 1}g = padds.modifier %pcc{t + 1}, %mcs")
+                e(f"  %pc{t + 1} = padds.modifier %pc{t + 1}g, %mcb")
+            else:
+                e(f"  %pc{t + 1} = padds.modifier %pcc{t + 1}, %mcs")
             if late:   # from the next store pointer, so this one is dead
-                pc[t + 1], pl[t + 1] = convert(pc[t + 1], pl[t + 1], 1024 * NP)
+                if not cfg.swiglu:   # swiglu: deferred to the iteration end
+                    pc[t + 1], pl[t + 1] = convert(pc[t + 1], pl[t + 1], 1024 * NP)
                 for c in range(4):
                     for q in range(4):
                         e(f"  %l{t + 1}_{c}_{q} = vlda.acc {pl[t + 1]}, {256 * c + 64 * q - 512}")
@@ -906,23 +1231,36 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
                 e(f"  %z{t + 1}_{c} = concat(%l{t + 1}_{c}_0, %l{t + 1}_{c}_1, %l{t + 1}_{c}_2, %l{t + 1}_{c}_3) : {MBMS4}")
                 cur[c] = f"%z{t + 1}_{c}"
     e("  rel %one, 0")
-    e("  %pac = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>")
-    e(f"  %pan0 = padds.modifier %pac, {'%mf' if a_adv else '%mz'}")
     steps = cfg.mu if a_adv else 1
-    for j in range(1, steps):
-        e(f"  %pan{j}c = copy %pan{j - 1} : reg<aie2p.ep> -> reg<aie2p.ep>")
-        e(f"  %pan{j} = padds.modifier %pan{j}c, %mf")
-    e(f"  %pan = copy %pan{steps - 1} : reg<aie2p.ep> -> reg<aie2p.ep>")
+    if spa:   # scalar A pointer: advance by steps slab strides
+        e(f"  %kpst = mova.i32 {steps if a_adv else 0}")
+        e("  %pastep = mul %fstep, %kpst")
+        e("  %pan = add.rr %pa, %pastep")
+    else:
+        e("  %pac = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>")
+        e(f"  %pan0 = padds.modifier %pac, {'%mf' if a_adv else '%mz'}")
+        for j in range(1, steps):
+            e(f"  %pan{j}c = copy %pan{j - 1} : reg<aie2p.ep> -> reg<aie2p.ep>")
+            e(f"  %pan{j} = padds.modifier %pan{j}c, %mf")
+        e(f"  %pan = copy %pan{steps - 1} : reg<aie2p.ep> -> reg<aie2p.ep>")
     if tail:
         e(f"  %pcl = copy {pc[-1]} : reg<aie2p.ep> -> reg<aie2p.ep>")
-        e("  %pon = padds.modifier %pcl, %mcs")
+        if cfg.swiglu:
+            e("  %pong = padds.modifier %pcl, %mcs")
+            e("  %pon = padds.modifier %pong, %mcb")
+        else:
+            e("  %pon = padds.modifier %pcl, %mcs")
         e(f"  %plx = copy {pl[-1]} : reg<aie2p.ep> -> reg<aie2p.ep>")
-        e("  %pln = padds.modifier %plx, %mls")
+        if cfg.swiglu:
+            e("  %plng = padds.modifier %plx, %mls")
+            e("  %pln = padds.modifier %plng, %mlb")
+        else:
+            e("  %pln = padds.modifier %plx, %mls")
     else:
         e("  %pon = copy %po : reg<aie2p.er> -> reg<aie2p.er>")
     e("  %mpn = add.rr %mp, %one")
     pln = ", %pln: reg<aie2p.ep>" if tail else ""
-    e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: reg<aie2p.ep>, %pon: {pct}, {fifo['a']}: reg<aie2p.eldfiforeg>, {fifo['w']}: reg<aie2p.eldfiforeg>{pln})")
+    e(f"  low.br ^outer(%mpn: reg<aie2p.er>, %pan: {pat}, %pon: {pct}, {fifo['a']}: reg<aie2p.eldfiforeg>, {fifo['w']}: reg<aie2p.eldfiforeg>{pln})")
     e("^exit:")
     if gate:
         gate_epilogue(L, cfg, gate)
@@ -942,9 +1280,9 @@ def gen(cfg):
     if cfg.dcol:
         for n in sorted({min(FILL_PER, cfg.cols - FILL_PER * f) for f in range(fill_workers(cfg))}):
             if cfg.dcol == 2:
-                if (cfg.fmt, n) not in _LEAVES:   # scheduled in Python (gen_npu_dec, npu_lsched): once per process
-                    _LEAVES[(cfg.fmt, n)] = decoder(cfg.fmt).leaf(f"fill{n}", n)
-                L.append(_LEAVES[(cfg.fmt, n)])
+                if (cfg.fmt, cfg.gord, n) not in _LEAVES:   # scheduled in Python (gen_npu_dec, npu_lsched): once
+                    _LEAVES[(cfg.fmt, cfg.gord, n)] = decoder(cfg.fmt, cfg.gord).leaf(f"fill{n}", n)
+                L.append(_LEAVES[(cfg.fmt, cfg.gord, n)])
                 L.append("")
             else:
                 fill_leaf(L, cfg, n)

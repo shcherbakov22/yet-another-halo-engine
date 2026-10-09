@@ -9,6 +9,8 @@ rounding: the kernel's exp / reciprocal are not numpy's), UNP_TILED=1 (fragment-
 rows: <stride> is the q / gate row count, <off> the first NPU row of heads x [256 q | 256 gate]), UNP_REM=1 (with
 UNP_RESID: plus the GPU's K-remainder partial, f32 [tokens][TN * cols]), UNP_BFP=1 (with UNP_SWIGLU: also the next GEMM's
 BFP16 stream in K chunks of 5120 over <stride> columns, checked per row block against bfp16_check.reference of the f16 out).
+UNP_DUP=<col0>,<base> (with UNP_RESID and UNP_REM, off 0: the FFN block's down, the last call overlapping, rem [tokens][stride];
+the overlapped columns get equal C, as the NPU writes them), UNP_CG=<n>: C partials per call (default: gen_npu_unpack.CG).
 """
 import os
 import subprocess
@@ -30,6 +32,9 @@ def main():
     model, work = sys.argv[1], sys.argv[2]
     tokens, cols, stride, off = (int(v) for v in sys.argv[3:7])
     parts = int(os.environ.get("UNP_PARTS", "1"))
+    if os.environ.get("UNP_CG"):
+        G.CG = int(os.environ["UNP_CG"])
+    dup = tuple(int(v) for v in os.environ["UNP_DUP"].split(",")) if os.environ.get("UNP_DUP") else None
     resid, swiglu, tiled, qg, rem, bfp = (os.environ.get(k) == "1" for k in ("UNP_RESID", "UNP_SWIGLU", "UNP_TILED", "UNP_QG",
                                                                               "UNP_REM", "UNP_BFP"))
     KS, CK, TN = list(GN.KS), 5120, GN.TN
@@ -41,12 +46,21 @@ def main():
     c = np.random.default_rng(3).standard_normal(nblk * tokens * cols * TN * G.CG).astype(np.float32) * 3
     cb = ((c.view(np.uint32) + 0x7FFF + ((c.view(np.uint32) >> 16) & 1)) >> 16).astype(np.uint16)   # C is bf16 (RNE)
     c = (cb.astype(np.uint32) << 16).view(np.float32)
+    if dup:   # the overlapped output columns: the last call's C equals the one before it there
+        pe = tokens * cols * TN * G.CG
+        pos = N.unpack_c(np.arange(pe, dtype=np.float64), cols, tokens // 64, G.CG).astype(np.int64)   # [tok][C col] -> element
+        for i in range(nblk):
+            for j in range(dup[0] * TN, cols * TN):
+                o = dup[1] + j - dup[0] * TN
+                if o < dup[0] * TN:
+                    cb[i * pe + pos[:, j]] = cb[i * pe + pos[:, o]]
+        c = (cb.astype(np.uint32) << 16).view(np.float32)
     cf, of, sf = (os.path.join(work, n) for n in ("c.f32", "out.f32", "nan.f32"))
     cb.tofile(cf)
     np.full(tokens * stride, np.nan, dt).tofile(sf)
     src = os.path.join(work, "unpack.loom")
     open(src, "w").write(G.gen(tokens, cols, stride, off, out16 and not (swiglu or tiled), resid, parts, swiglu, tiled, qg,
-                               rem, bfpc))
+                               rem, bfpc, dup=dup))
     r = subprocess.run([sys.executable, B.EMIT, src, os.path.join(work, "unpack"), "nop=0"], capture_output=True, text=True)
     if r.returncode:
         sys.exit(f"emit failed\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
@@ -56,7 +70,7 @@ def main():
     if resid:
         r_in.tofile(rf)
     mf = os.path.join(work, "rem.f32")
-    m_in = np.random.default_rng(6).standard_normal(tokens * cols * TN).astype(np.float32)
+    m_in = np.random.default_rng(6).standard_normal(tokens * (stride if dup else cols * TN)).astype(np.float32)
     if rem:
         m_in.tofile(mf)
     obytes = tokens * stride * np.dtype(dt).itemsize
@@ -104,12 +118,19 @@ def main():
         want = blk[0]
         for b in blk[1:]:
             want = want + b
+        if dup:   # C column j -> output column j, or base + j - col0 TN for the last call
+            o = np.arange(cols * TN)
+            o = np.where(o < dup[0] * TN, o, dup[1] + o - dup[0] * TN)
+            w2 = np.empty((tokens, stride), np.float32)
+            w2[:, o] = want
+            want = w2
+            cols_out = stride
         if rem:
-            want = want + m_in.reshape(tokens, TN * cols)
+            want = want + m_in.reshape(tokens, stride if dup else TN * cols)
         if resid:
-            want = r_in.reshape(tokens, stride)[:, off:off + TN * cols] + want
+            want = r_in.reshape(tokens, stride)[:, off:off + (stride if dup else TN * cols)] + want
     want = want.astype(dt)
-    sl = got[:, off:off + TN * cols]
+    sl = got[:, off:off + (stride if dup else TN * cols)]
     if swiglu:   # within one f16 ulp
         ulp = np.abs(sl.view(np.int16).astype(np.int32) - want.view(np.int16).astype(np.int32))
         ok = bool(np.isfinite(sl).all() and ulp.max() <= 1)
@@ -131,8 +152,8 @@ def main():
         print(f"  bfp: {badb} of {tot} stream bytes differ")
         ok = ok and badb == 0
         os.remove(abf)
-    rest = np.delete(got, np.s_[off:off + TN * cols], axis=1)
-    kept = bool(np.isnan(rest).all())
+    rest = np.delete(got, np.s_[off:off + (stride if dup else TN * cols)], axis=1)
+    kept = bool(np.isnan(rest).all()) if rest.size else True
     mode = "".join(f" {k}" for k, v in (("f16", out16), ("resid", resid), ("rem", rem), ("swiglu", swiglu), ("tiled", tiled)) if v)
     print(f"unpack tokens={tokens} cols={cols} stride={stride} off={off}{mode}{f' parts={parts}' if parts > 1 else ''}: slice {'exact' if ok else 'DIFFERS'}, "
           f"other columns {'untouched' if kept else 'WRITTEN'}")

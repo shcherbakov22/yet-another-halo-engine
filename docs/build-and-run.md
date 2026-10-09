@@ -63,6 +63,7 @@ Emitters run on the CPU and take a few minutes. Paths below are relative to `eng
 | prefill, chunked, context T | `YAH_CTX=32768 python3 tools/emit_prefill_pp.py <gguf> <dir> 2048` (chunk 2048, pools for 32768 tokens; T a multiple of B) |
 | prefill with kv8a16 / kv4a16 | add `YAH_KV=kv8` or `YAH_KV=kv4` (or mixed `k8v4`, `k4v8`; `k8` / `v4` alone quantize one side, prefill only) |
 | prefill with the NPU column split | add `YAH_NPU_SPLIT=qkv=4480,gate=2560,q=5120,out=2560,down=2560,ffn=7680` (NPU rows per site, multiples of 640, q of 2560; any subset; see `emit_prefill_pp.npu_split`); run `loom_forward_pp` with `YAH_NPU=1` (full 2048-token chunks; AC power and `power_dpm_force_performance_level=high`, see results.md) |
+| prefill with the NPU FFN block | `YAH_NPU_DCOL=1 YAH_NPU_FFNBLK=7168` (with `YAH_NPU_SPLIT` sites other than ffn; architecture.md) |
 | decode | `python3 tools/emit_decode.py <gguf> <dir> <max_context>` (multiple of 256, default 4096) |
 | decode after a prefill | same, with `max_context` = the prefill set's context and the same `YAH_KV` |
 
@@ -214,6 +215,9 @@ Rules:
 6. Rebuild drivers with `engine/build_hrx.sh` after every source change, and do not edit `engine/run/*.cc` during a measuring round (`gpu_run.sh` will then refuse the remaining runs).
 7. Run every GPU job through `engine/run/gpu_run.sh`. It snapshots and follows the kernel log into `~/yah-scratch/gpu-<tag>-<time>.dmesg.log` and flags timeout / reset lines.
 8. A launched chunk graph waits on NPU done words (~2 s bound each). Never leave it waiting on jobs that will not run: when queueing them fails, release the waits (`NpuSplit::Release`); a failed wait sets a sticky status that ends every later wait at once. A graph of ~250 unreleased waits (before the sticky status) spun for minutes, starved the display ring and needed a reset. Test new NPU host paths CPU-driven first (no GPU kernels), then end to end.
+
+9. New NPU work goes through the safe tools first: the kernels' oracle checks (`split_gemm_check.py`, `npu_rem_check.py` with `REM_LEAD`, `npu_unpack_check.py` with `UNP_DUP`, footprint gates), then the NPU host path CPU-driven: `YAH_NPU_CPU=1 loom_forward_pp ...` records the chunk, launches no GPU work, stores each job's ready word from the host and reports the first job that stalls or fails. Only then end to end.
+10. Never free memory the GPU or the NPU may still touch. `~LoomNpu` waits for the GPU, then destroys the NPU context, then frees the shared pages; a failed `Enqueue` waits for the launched graph before it throws. With the IOMMU in passthrough an NPU write to a freed page lands in whatever the kernel reused it for; a GPU read of a freed page hangs the shader and MES.
 
 After a hang and reboot, read the previous boot's kernel log:
 

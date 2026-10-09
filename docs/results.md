@@ -17,6 +17,8 @@ Prefill, default set (FA attention, chunked DeltaNet, paged KV; HRX pin a02a5ab9
 | 65536 | chunked (2048), fp16 / kv8a16 / kv4a16 | 232.8 / 242.1 / 234.7 s | - | 2026-10-02 |
 | 131072 | chunked (2048), kv4a16, 128K pools | 379.8 s (345 tok/s); its first 65536 tokens 141.2 s | - | 2026-10-05, Bleak House (pg1023) prompt, dispatch timestamps; per chunk 779 -> 245 tok/s, attention 43% of the run and 61% of the last chunk at ~60% of its WMMA floor (63% in counter cycles; L2 hit ~70%, ~2 GB/s past L2); GPU clock 2360 -> ~1600 MHz at 96 C (chassis heat soak). yah-scratch/long128k |
 
+NPU FFN block (2026-10-09, set with YAH_NPU_DCOL + YAH_NPU_SPLIT=qkv=2240,gate=2240 + YAH_NPU_FFNBLK=7168, 32 layers): gate on 16 windows vs golden5 KL mean 6.2e-5, p99.9 1.7e-3, 0 flips, PPL 6.69516 (golden 6.69503; production NPU split 1.65e-4 / 3.9e-3 / 6.69644). pp2048 3347 ms, not yet tuned: the NPU is the critical path (3.3 s busy): the swiglu epilogue takes ~1.24M cycles per call against ~0.63M for the GEMM, and every family switch runs an image setup and an ungated call.
+
 NPU GEMM path pieces (2026-10-06; checks byte-exact against numpy oracles):
 
 | piece | measured |

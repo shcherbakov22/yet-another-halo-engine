@@ -8,6 +8,7 @@ The NPU computes K columns [0, 256 * kb_start) of its trailing <npu_rows> rows; 
 offset), its input the whole fragment-major [B][K] activation. Compared with the float64 product of the f16 dequant
 (gguf-py, the GPU decode's values) and the f16 input over the window: the error is f32 accumulation order only.
 act.f16: a [B][K] input (default: random, B = 2048). HAL_RUN_ITERS=N times it. Needs PYTHONPATH with llama.cpp's gguf-py.
+REM_LEAD=1: the leading window [0, 256 * kb_start) instead (the FFN block's down over the GPU's features, npuffnrem_<fmt>).
 """
 import dataclasses
 import os
@@ -34,7 +35,8 @@ def main():
     fmt = DQ.FMT[tn.tensor_type.name]
     K, N = int(tn.shape[0]), int(tn.shape[1])
     kbt = K // 256
-    kbw = kbt - kb0
+    lead = os.environ.get("REM_LEAD") == "1"
+    kbw = kb0 if lead else kbt - kb0
     assert TG.G.FMTS[fmt].get("kdiv", 1) == 1 and 0 < kb0 < kbt and nn % 128 == 0
     if len(sys.argv) > 6:
         x = np.fromfile(sys.argv[6], np.float16).reshape(-1, K)
@@ -48,7 +50,7 @@ def main():
     act_t = os.path.join(work, "act_t.f16")
     x.reshape(B // 16, 16, K // 16, 16).transpose(0, 2, 1, 3).tofile(act_t)
     t = EP.npu_rem_tile(fmt, kbw, kbt)
-    TG.KWIN = (kb0, kbt)
+    TG.KWIN = (0 if lead else kb0, kbt)
     try:
         text = TG.gen(fmt, "kstore", t, False)
     finally:
@@ -80,9 +82,10 @@ def main():
     ms = [ln.strip() for ln in r.stdout.splitlines() if "ms per dispatch" in ln]
     got = np.fromfile(out, np.float32).reshape(B, nn).astype(np.float64)
     k0 = 256 * kb0
-    ref = x[:, k0:].astype(np.float64) @ w16[:, k0:].astype(np.float64).T
+    kw = slice(0, k0) if lead else slice(k0, K)
+    ref = x[:, kw].astype(np.float64) @ w16[:, kw].astype(np.float64).T
     err = np.abs(got - ref).max() / np.abs(ref).max()
-    print(f"{name} ({fmt}) rows [{N - nn}, {N}) K window [{k0}, {K}) B={B}: max |err| / max |ref| {err:.2e}"
+    print(f"{name} ({fmt}) rows [{N - nn}, {N}) K window [{kw.start}, {kw.stop}) B={B}: max |err| / max |ref| {err:.2e}"
           + (f" | {ms[0]}" if ms else ""))
     for f in (wf, act_t, out):
         os.remove(f)

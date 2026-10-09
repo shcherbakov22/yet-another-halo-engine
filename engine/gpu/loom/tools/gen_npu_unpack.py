@@ -21,14 +21,14 @@ CG = len(GE.GROUPS)   # C partials per NPU call, one per replay group, summed he
 
 
 def wg(cols):
-    """Workgroup size of an unpack over cols NPU columns: 8 tokens x 32 column chunks, 16 or 8 where 32 do not divide
-    them (7-column calls: gen_npu_gemm dcol 2)."""
+    """Workgroup size of an unpack over cols NPU columns: 8 tokens x 32 column chunks, 16, 8 or 4 where 32 do not divide
+    them (7-column calls: gen_npu_gemm dcol 2; the FFN block's 70)."""
     nch = cols * GN.TN // 8
-    return 8 * next(c for c in (32, 16, 8) if nch % c == 0)
+    return 8 * next(c for c in (32, 16, 8, 4) if nch % c == 0)
 
 
 def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=False, tiled=False, qg=False, rem=False,
-        bfp=None, last8=False):
+        bfp=None, last8=False, dup=None):
     """resid: out = resid + C (f32; bindings c, resid, out), the kres GEMMs. parts: C is that many consecutive partial C
     blocks (the K chunks of one GEMM), summed in order. swiglu: C is the gate block then the up block; out =
     f16(silu(gate) * up) with the swiglu epilogue's scalar ops. tiled: f16 out fragment-major ([token / 16][column / 16]
@@ -40,13 +40,17 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     the columns in its K chunks (chunk_k columns each, gen_bfp16_encode "act" layout, one stream per chunk back to back;
     binding a after out): an item's 8 columns of one token are one bfp16ebs8 row block, encoded from the f16 values
     (stage_bfp: a workgroup takes 8 tokens x its column chunks, so each chunk's row blocks are one stream fragment).
-    last8: only the last 8 tokens (the conv ring of a qkv split whose conv reads C itself, gen_conv_kq.gen_c)."""
+    last8: only the last 8 tokens (the conv ring of a qkv split whose conv reads C itself, gen_conv_kq.gen_c).
+    dup = (col0, base) with resid and rem (the NPU's FFN block, whose down calls cover all rows): C columns from col0 on
+    (the last call, which overlaps the one before it) go to out column base + (col - col0) * TN + 8 j (the overlapped
+    columns are written twice with equal values), and rem is the GPU's f32 [token][stride] partial over the other K."""
     assert not (resid and (swiglu or tiled or out16)) and not (swiglu and parts > 1) and (resid or not rem)
     assert not bfp or swiglu
     assert not qg or not (resid or swiglu or tiled or out16)
     out16 = out16 or swiglu or tiled
     TN, NJ = GN.TN, GN.TN // 8
-    assert tokens % 64 == 0 and off + TN * cols <= (2 if qg else 1) * stride
+    assert not dup or (resid and rem and off == 0 and dup[0] <= cols < 2 * dup[0] and dup[1] + (cols - dup[0]) * TN == stride)
+    assert tokens % 64 == 0 and (dup or off + TN * cols <= (2 if qg else 1) * stride)
     items = (8 if last8 else tokens) * cols * NJ
     c_elems = tokens * cols * TN * CG   # one call's C: per column [group][M block][...]
     L = []
@@ -82,7 +86,7 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     if resid and rem:
         e("  %c_na, %res_na, %rem_na, %out_na = buffer.assume.noalias %c, %resid, %rem, %out : buffer, buffer, buffer, buffer")
         e("  %rv = buffer.view %res_na[%base] : buffer -> view<[%no]xf32>")
-        e(f"  %nrem = index.constant {tokens * cols * TN} : index")
+        e(f"  %nrem = index.constant {tokens * (stride if dup else cols * TN)} : index")
         e("  %remv = buffer.view %rem_na[%base] : buffer -> view<[%nrem]xf32>")
     elif resid:
         e("  %c_na, %res_na, %out_na = buffer.assume.noalias %c, %resid, %out : buffer, buffer, buffer")
@@ -163,7 +167,19 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
     e("  %j0 = index.mul %col, %ctn : index")
     e("  %j1 = index.mul %j, %c8 : index")
     e("  %j2 = index.add %j0, %j1 : index")
-    e("  %jo = index.add %j2, %coff : index")
+    if dup:   # col < col0: col * TN + 8 j; else base + (col - col0) * TN + 8 j
+        e(f"  %cdup0 = index.constant {dup[0]} : index")
+        e(f"  %cdupb = index.constant {dup[1]} : index")
+        e("  %dupi = index.div %col, %cdup0 : index")
+        e("  %dupc = index.rem %col, %cdup0 : index")
+        e("  %dupj0 = index.mul %dupc, %ctn : index")
+        e("  %dupj1 = index.add %dupj0, %j1 : index")
+        e("  %dupb = index.mul %dupi, %cdupb : index")
+        e("  %jo0 = index.add %dupj1, %dupb : index")
+        e(f"  %cjlast = index.constant {stride - 8} : index")
+        e("  %jo = index.min %jo0, %cjlast : index")   # always in range; for the bound proof
+    else:
+        e("  %jo = index.add %j2, %coff : index")
     if tiled:   # 8 columns of one 16-column tile: contiguous inside the tile
         e(f"  %ctc = index.constant {stride // 16} : index")
         e("  %ot0 = index.div %tok, %c16 : index")
@@ -201,10 +217,10 @@ def gen(tokens, cols, stride, off, out16=False, resid=False, parts=1, swiglu=Fal
         load_cg(e, f"%cp{p}", f"%cpa{p}")
         e(f"  %cs{p} = vector.addf {val}, %cp{p} : vector<8xf32>")
         val = f"%cs{p}"
-    if rem:   # token tok, NPU column j2 of the [tokens][TN * cols] partial
-        e(f"  %cremw = index.constant {cols * TN} : index")
+    if rem:   # token tok, NPU column j2 of the [tokens][TN * cols] partial (dup: output column jo of [tokens][stride])
+        e(f"  %cremw = index.constant {stride if dup else cols * TN} : index")
         e("  %rmb = index.mul %tok, %cremw : index")
-        e("  %rma = index.add %rmb, %j2 : index")
+        e(f"  %rma = index.add %rmb, {'%jo' if dup else '%j2'} : index")
         e("  %rmv = vector.load %remv[%rma] : view<[%nrem]xf32> -> vector<8xf32>")
         e(f"  %rms = vector.addf {val}, %rmv : vector<8xf32>")
         val = "%rms"

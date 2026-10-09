@@ -649,6 +649,18 @@ NPU_ROWS = NPU_COLS * GN.TN   # output rows per NPU call
 NPU_SITES = {"qkv": ("kstore", 640, 20), "gate": ("kstore", 384, 20), "q": ("kqg", 768, 20), "out": ("kres", 320, 24),
              "down": ("kres", 320, 68), "ffn": ("ffn", 1088, 20)}
 NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
+# YAH_NPU_FFNBLK=<F> (decoder-column sets, F = 7168): the NPU owns the FFN's last F features of every layer whose
+# ffn_gate and ffn_up share a p4 decoder format (and ffn_up follows ffn_gate) and whose ffn_down has a grid decoder
+# (natural k-block order). Its gate / up calls (gen_npu_gemm swiglu, NP 4, raw rows straight from the model; call j's
+# column c computes features 8 (128 c + 4 j) + [0, 32) of F) apply swiglu and write H into C: bfp16 fragments as
+# [M block][pass 7][16-token slab][128 k-blocks] (hpass). Its down calls (ain "h": 4 + 3 passes, 560 rows each, the 10th
+# call overlapping the 9th) write their partials. The GPU runs the other features through the fused ffn's split
+# (".npu.hal", nn = F) and down over them ("npuffnrem_<fmt>.hal", a K window); npu_unpack_ffnblk.hal adds hidden + both.
+# A command switches image families at job boundaries (LoomNpu FusedCommand: the image's setup and one ungated call).
+NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
+FFNBLK_FMTS = ("iq4xs", "iq3s", "iq3xxs")
+FFNBLK_DOWN_FMTS = ("iq3s", "iq3xxs")
+FFNBLK_DOWN = ((0, 4), (4, 3))   # (first pass, passes) of down's K slice F, per call
 
 
 def npu_chunks(site):
@@ -835,6 +847,8 @@ def npu_split(rows, combos, B, outdir):
         chunked = len(chunks) > 1 or npu_rem(site)
         for ci, chunk in enumerate(chunks):
             encs.add((K, ci if chunked else None, chunk))
+    if NPU_FFNBLK:   # the FFN block's gate / up activations
+        encs.add((5120, None, (0, NPU_PASSES)))
     # the ffn unpack writes down's BFP16 input for its columns (gen_npu_unpack bfp): down's chunks there need only their
     # leading k-blocks encoded ("npu_enc_17408_c<i>p")
     ffn_bfp = "ffn" in NPU_SPLIT and "down" in NPU_SPLIT
@@ -923,7 +937,8 @@ def npu_split(rows, combos, B, outdir):
     out.append(("npu_flag_wait.hal", 1, 32, 0))
     out.append(("npugate", GN.GATE_SUPPLY, GN.GATE_CALLS, GN.GATE_RECORD))
     if NPU_DCOL:
-        out.extend(npu_dcol_images(dcol_images, B, tmp, outdir))
+        extra = npu_ffnblk(rows, B, tmp, outdir, out, split) if NPU_FFNBLK else []
+        out.extend(npu_dcol_images(dcol_images, B, tmp, outdir, extra))
         GE.ACT_PERM = None
         return out
     # NPU images, one per pass count
@@ -944,37 +959,118 @@ def npu_split(rows, combos, B, outdir):
     return out
 
 
-def npu_dcol_images(images, B, tmp, outdir):
+def npu_dcol_images(images, B, tmp, outdir, extra=()):
     """The decoder-column images (NPU_DCOL): per (format, site K) the gated GEMM reading raw rows of that K, per format
-    its decoder swap image; dispatch.txt "npudcol <cols>", "npubytes_5120" and "npurows"."""
+    its decoder swap image; dispatch.txt "npudcol <cols>", "npubytes_5120" and "npurows". extra: more (cfg, name, np)
+    images (npu_ffnblk; np: their gen_npu_gemm NP)."""
     import concurrent.futures
     sys.path.insert(0, os.path.dirname(HERE))
     import hrx_paths
     jobs = []
     for fmt, K in sorted(images):
         cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0], kraw=K)
-        jobs.append((cfg, "npu_dcol_%s_%d" % (fmt, K), False))
+        jobs.append((cfg, "npu_dcol_%s_%d" % (fmt, K), None, GN.NP))
     for fmt in sorted({f for f, _ in images}):
         cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0])
-        jobs.append((cfg, "npu_dcol_%s.swap" % fmt, True))
-    srcs = []
-    for cfg, name, swap in jobs:
-        src = os.path.join(tmp, name + ".loom")
-        open(src, "w").write(GN.gen(cfg))
-        srcs.append(src)
+        jobs.append((cfg, "npu_dcol_%s.swap" % fmt, "swap", GN.NP))
+    jobs += [(cfg, name, mode, np_) for cfg, name, mode, np_ in extra]
+    # sources and environments first (gen_npu_gemm's NP is module state), then the compiles in parallel
+    built = []
+    for cfg, name, mode, np_ in jobs:
+        with GN.np_override(np_):
+            src = os.path.join(tmp, name + ".loom")
+            open(src, "w").write(GN.gen(cfg))
+            env = dict(hrx_paths.env(), **GN.loom_env(cfg, mode == "swap"))
+        built.append((cfg, name, src, env))
 
-    def compile_one(job, src):
-        cfg, name, swap = job
+    def compile_one(b):
+        cfg, name, src, env = b
         r = subprocess.run([hrx_paths.LOOM_COMPILE, src, "--root=@" + cfg.entry,
                             "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
-                            "--output=" + os.path.join(outdir, name + ".xdna")], capture_output=True, text=True,
-                           env=dict(hrx_paths.env(), **GN.loom_env(cfg, swap)))
+                            "--output=" + os.path.join(outdir, name + ".xdna")], capture_output=True, text=True, env=env)
         if r.returncode:
             raise SystemExit("NPU decoder-column compile failed (%s): %s" % (name, r.stderr[-800:]))
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-        list(ex.map(compile_one, jobs, srcs))
+        list(ex.map(compile_one, built))
     cfg = jobs[0][0]
     return [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(cfg)), ("npurows", NPU_ROWS, 0, 0)]
+
+
+def npu_ffnblk(rows, B, tmp, outdir, out, split):
+    """NPU_FFNBLK: the GPU's kernels of the FFN block (appended to out, split: npu_split's) and its NPU images (returned
+    as npu_dcol_images extra jobs); dispatch.txt "npuffnblk <F>", "npubytes_ffnsw" / "npubytes_ffndn<passes>"."""
+    import gen_bfp16_encode as GE
+    import gen_gemm_tile as TG
+    import gen_npu_unpack as GU
+    F = NPU_FFNBLK
+    assert NPU_DCOL and F == 7168 and "ffn" not in NPU_SPLIT and AFRAG and B % AF_TILE["bn"] == 0
+    by = {}
+    for nm, dims, ty in rows:
+        p = nm.split(".")
+        if len(p) > 2 and p[0] == "blk" and p[2] in ("ffn_gate", "ffn_up", "ffn_down") and E.FMT.get(ty):
+            by.setdefault(p[1], {})[p[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
+    ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in FFNBLK_FMTS
+          and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in FFNBLK_DOWN_FMTS]
+    jobs = []
+    for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
+        t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
+        for sfx, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
+            split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), F)
+        blk = GN.decoder(DCOL_FMTS[fmt][0]).BLK
+        jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
+                               swiglu=True, dgu=mt * 16 * kb * blk, swcol=1024, hpass=F // 1024),
+                     "npu_ffnsw_%s" % fmt, None, 4))
+        jobs.append((jobs[-1][0], "npu_ffnsw_%s.swap" % fmt, "swap", 4))
+    for fmt, mt, kb in sorted({l["ffn_down"] for l in ok}):
+        kbw = (kb * 256 - F) // 256   # the GPU's K window [0, 17408 - F)
+        tr = fit_rowgrp(npu_rem_tile(fmt, kbw, kb), mt)
+
+        def gen_rem(f, k, tr=tr, kb=kb):
+            TG.KWIN = (0, kb)
+            try:
+                return TG.gen(f, "kstore", tr, False)
+            finally:
+                TG.KWIN = None
+        assert mt not in O16_MT, "the window writes f32"
+        out.append(_emit_gen(gen_rem, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s.hal" % fmt, outdir, "kstore", tr.rowgrp,
+                             kfull=kb))
+        for p0, passes in FFNBLK_DOWN:
+            jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
+                                   kraw=kb * 256, ain="h", hpass=F // 1024, gord="N"), "npu_ffndn%d_%s" % (passes, fmt),
+                         None, GN.NP))
+            jobs.append((jobs[-1][0], "npu_ffndn%d_%s.swap" % (passes, fmt), "swap", GN.NP))
+    # hidden + the GPU's window + the NPU's down partials (two K chunks of ten 560-row calls, one replay group each)
+    N, calls = 5120, -(-5120 // NPU_ROWS)
+    cg = GU.CG
+    GU.CG = 1
+    try:
+        text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(FFNBLK_DOWN), rem=True,
+                      dup=((calls - 1) * NPU_COLS, N - NPU_ROWS))
+    finally:
+        GU.CG = cg
+    src = os.path.join(tmp, "npu_unpack_ffnblk.loom")
+    open(src, "w").write(text)
+    E.emit(src, ["nop=0"], "npu_unpack_ffnblk.hal", outdir)
+    out.append(("npu_unpack_ffnblk.hal", B * calls * NPU_COLS * (GN.TN // 8) // GU.wg(calls * NPU_COLS),
+                GU.wg(calls * NPU_COLS), 0))
+    # gate / up read their activations in one replay group: the encoder of that stream layout (fragment-major input)
+    groups = GE.GROUPS
+    GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
+    try:
+        src = os.path.join(tmp, "npu_enc_5120_g1_t.loom")
+        open(src, "w").write(GE.gen("act", B, list(NPU_KS), NPU_PASSES, tiled=True, k_off=0, k_src=None))
+    finally:
+        GE.GROUPS = groups
+    E.emit(src, ["nop=0"], "npu_enc_5120_g1_t.hal", outdir)
+    out.append(("npu_enc_5120_g1_t.hal", B // 8 * (NPU_PASSES * sum(NPU_KS)) // GE.WG, GE.WG, 0))
+    out.append(("npuffnblk", F, 0, 0))
+    sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
+    with GN.np_override(4):
+        out.append(("npubytes_ffnsw",) + tuple(GN.stream_bytes(sw[0])))
+    for _, passes in FFNBLK_DOWN:
+        dn = next(j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes))
+        out.append(("npubytes_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
+    return jobs
 
 
 def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
@@ -1106,7 +1202,7 @@ def main():
         n += 1
 
     geom.extend(ffn_fused(rows, B, outdir))
-    if NPU_SPLIT:
+    if NPU_SPLIT or NPU_FFNBLK:
         geom.extend(npu_split(rows, combos, B, outdir))
 
     # The calibration menu (calibration_menu, for engine/model/prefill_calib.hpp) is shelved with the calibration;
