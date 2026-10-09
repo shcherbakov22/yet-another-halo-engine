@@ -69,6 +69,7 @@ SCR2_B = GT2 + 2048 + 64        # storage B (gather addresses, T parts, the tabl
 TABV, BASEV = [TAB], ["%sp"]
 KV = I.KV if FMT == "IQ4_XS" else [float(v) for v in range(16)]
 OUTCAP = 2
+INLINE = [0]                    # leaf_inline: super-blocks per input record (0: a standalone leaf)
 TC_IQ4 = (("su", 0x380), ("sv", 0), ("u", 0xC6A0), ("v", 0xC320), ("s", 0xC681), ("1", 0x4A01), ("1", 0x4901))
 TC_Q4K = (("su", 0x380), ("sv", 0), ("u", 0xC680), ("v", 0xC300), ("s", 0xC681), ("1", 0x4A01))   # T = d sc
 NPARTS = 4 if FMT in ("Q4_K", "Q3_K", "IQ2_XS") else 2   # bf16 parts per scale line (T hi / lo; Q4_K adds -M hi / lo, Q3_K
@@ -317,11 +318,14 @@ def leaf(name="dec", nports=1):
             e(f"%{t_}c = lshl %{t_}a, {k(-12)}")
     elif not Q3K:
         # ---- table (once per invocation of the program: a flag in private storage)
-        stp = P(e, "%spa", STATE)
-        e(f"%tflag = lda {stp}, 0")
         tb_, tdone = label("tbuild"), label("tdone")
-        e(f"%tx = xor %tflag, {k(0x5A5A1234)}")              # private storage starts undefined: a magic marks the table
-        e(f"low.cond_br %tx, ^{tb_}, ^{tdone} : reg<aie2p.er>")
+        if INLINE[0]:                                        # the storages are scratch: build the table every time
+            e(f"low.br ^{tb_}")
+        else:
+            stp = P(e, "%spa", STATE)
+            e(f"%tflag = lda {stp}, 0")
+            e(f"%tx = xor %tflag, {k(0x5A5A1234)}")          # private storage starts undefined: a magic marks the table
+            e(f"low.cond_br %tx, ^{tb_}, ^{tdone} : reg<aie2p.er>")
         e.L.append(f"^{tb_}:")
         for i in range(8):
             w_ = (I.bf16_bits(KV[2 * i + 1]) << 16) | I.bf16_bits(KV[2 * i])
@@ -330,22 +334,44 @@ def leaf(name="dec", nports=1):
             e(f"st %kw{i}, {pp}, 0")
         pk = P(e, "%spa", KVS)
         e(f"%kvv = vlda.512.bf16x32 {pk}, 0")
-        for m in range(16):
-            e(f"%kb{m} = mov.i32 {I.bf16_bits(KV[m])}")
+
+        def tline(m, kb, pa_, pb_):
             sp_, r_, h0, h1 = e.t("ks"), e.t("kr"), e.t("kh"), e.t("kh")
-            e(f"{sp_} = vbcst.16 %kb{m}")
+            e(f"{sp_} = vbcst.16 {kb}")
             e(f"{r_} = vshuffle %kvv, {sp_}, {m18}")
             e(f"{h0} = slice {r_}[0] : {V2} -> {V1}")
             e(f"{h1} = slice {r_}[1] : {V2} -> {V1}")
             # two copies in different banks (storages A and B): a gather (vldb.4x32) costs one stall cycle unless its
             # address lanes 0 / 2 and 1 / 3 hit different banks (measured, gbench.py) -> lanes 4 q + 2, 4 q + 3 use copy 2
-            for base, off in (("%spa", GT), ("%spb", GT2)):
-                pg = P(e, base, off + 128 * m)
+            for pg in (pa_, pb_) if m is None else (P(e, b_, o_ + 128 * m) for b_, o_ in (("%spa", GT), ("%spb", GT2))):
                 for blk, hv_ in ((0, h0), (1, h1)):
                     for half in range(2):
                         e(f"vst.256.i16x16 {hv_}, {pg}, {64 * blk + 32 * half}")
-        stp2 = P(e, "%spa", STATE)
-        e(f"st {k(0x5A5A1234)}, {stp2}, 0")
+        if INLINE[0] or os.environ.get("DQ_TROLL") == "1":   # rolled (program memory; DQ_TROLL=1: standalone test)
+            e(f"%tla0 = add.rr %spa, {k(GT)}")
+            e(f"%tlb0 = add.rr %spb, {k(GT2)}")
+            e(f"low.br ^tlh({k(0)}: reg<aie2p.er>, %tla0: reg<aie2p.er>, %tlb0: reg<aie2p.er>)")
+            e.L.append("^tlh(%tl_i: reg<aie2p.er>, %tla: reg<aie2p.er>, %tlb: reg<aie2p.er>):")
+            e(f"%tl_m = lt %tl_i, {k(16)}")
+            e("low.cond_br %tl_m, ^tlb, ^tlx : reg<aie2p.er>")
+            e.L.append("^tlb:")
+            e.L.append("// LOOP-BEGIN")
+            e("%tlkb = vextract.16.reg %kvv, %tl_i")       # (not a load: the KV words were just stored)
+            e("%tlpa = mov.scalar-to-address %tla")
+            e("%tlpb = mov.scalar-to-address %tlb")
+            tline(None, "%tlkb", "%tlpa", "%tlpb")
+            e(f"%tla1 = add.rr %tla, {k(128)}")
+            e(f"%tlb1 = add.rr %tlb, {k(128)}")
+            e("%tl_n = add %tl_i, 1")
+            e("low.br ^tlh(%tl_n: reg<aie2p.er>, %tla1: reg<aie2p.er>, %tlb1: reg<aie2p.er>)")
+            e.L.append("// LOOP-END")
+            e.L.append("^tlx:")
+        else:
+            for m in range(16):
+                e(f"%kb{m} = mov.i32 {I.bf16_bits(KV[m])}")
+                tline(m, f"%kb{m}", None, None)
+            stp2 = P(e, "%spa", STATE)
+            e(f"st {k(0x5A5A1234)}, {stp2}, 0")
         e(f"low.br ^{tdone}")
         e.L.append(f"^{tdone}:")
 
@@ -452,6 +478,8 @@ def leaf(name="dec", nports=1):
 
     def lockop(op, val):
         """acq / rel on the output ring of the current port (immediate port index: a branch per port in PLOOP)."""
+        if INLINE[0]:                                   # leaf_inline: the output is plain memory
+            return
         if not PLOOP:
             e(f"{op} {val}, {nports}")
             return
@@ -479,7 +507,7 @@ def leaf(name="dec", nports=1):
         e("%pouta = add.rr %outa, %plmo")
         INA[0], OUTA[0] = "%pina", "%pouta"
     sec0 = len(e.L)
-    j, _ = loop_begin("jl", 4)
+    j, _ = loop_begin("jl", INLINE[0] or 4)
     e(f"%j136 = mul {j}, {k(BLK)}")
     e(f"%jin = add.rr {INA[0]}, %j136")
     # -- halves: straight-line, one stream each (the scale path is one long dependency chain per half: the two
@@ -1296,7 +1324,12 @@ def leaf(name="dec", nports=1):
     e("%qp0 = mov.scalar-to-address %qp0a")
     rq = "%qp0"
     e(f"%jso = mul {r_}, {k(OUT_B)}")
-    e(f"%osa = add.rr {OUTA[0]}, %jso")
+    if INLINE[0]:                               # no output ring: super-block j's records at 2 j + r
+        e(f"%jsj = mul {j}, {k(2 * OUT_B)}")
+        e("%jsr = add.rr %jso, %jsj")
+        e(f"%osa = add.rr {OUTA[0]}, %jsr")
+    else:
+        e(f"%osa = add.rr {OUTA[0]}, %jso")
     e("%osp = mov.scalar-to-address %osa")
     lockop("acq", "%km1o")
     e.pre.append("  %km1o = mov.i32 -1")
@@ -1635,7 +1668,7 @@ def leaf(name="dec", nports=1):
       e("%spn0 = padda %spc0, 64")
       loop_end("sl", [("%yf", "reg<aie2p.mstfifo>"), ("%yp", "reg<aie2p.mpfs>"), ("%yq", "reg<aie2p.mr26_fifo_st>"),
                       ("%sqn", "reg<aie2p.ep>"), ("%spn0", "reg<aie2p.ep>")])
-      e(f"rel %k1r, {nports}")
+      lockop("rel", "%k1r")
       loop_end("rl", [(sp0, "reg<aie2p.ep>")])
     e.pre.append("  %k1r = mova.i32 1")
     e.consts["%k1r"] = True
@@ -1649,6 +1682,26 @@ def leaf(name="dec", nports=1):
     e.L.append("}")
     pre_ = grid_rodata(name) if GRID else []
     return "\n".join(pre_ + e.L[:hdr_end] + place_consts(e.pre, e.L[hdr_end:]))
+
+
+def leaf_inline(nsb):
+    """The IQ4_XS leaf's body for inlining into another core function: decodes nsb super-blocks of an input record
+    ([16 rows][RECROW]) at %in into OUT_B records at %out (2 per super-block, no output ring), storages at %sp
+    (SCR_B, 2048-aligned) and %sp2 (SCR2_B), all defined by the caller (the table is rebuilt each call). Returns the
+    lines (not renamed; the caller prefixes its values and labels)."""
+    assert FMT == "IQ4_XS"
+    INLINE[0] = nsb
+    try:
+        txt = leaf("inl", 1)
+    finally:
+        INLINE[0] = 0
+    out = []
+    for ln in txt.split("\n")[1:]:
+        t = ln.strip()
+        if (" = resource<" in t or " = storage " in t or " = storage_address " in t or t in ("return", "}")):
+            continue
+        out.append(ln)
+    return out
 
 
 def place_consts(pre, body):
@@ -1688,7 +1741,7 @@ def place_consts(pre, body):
     first, cond, region_of = {}, None, {}
     for n_, l in enumerate(body):
         t_ = l.strip()
-        if t_.startswith("^tbuild"):
+        if t_.startswith("^tbuild") and not INLINE[0]:          # inline: the table build is unconditional
             cond = (max(i for i in range(n_) if body[i].strip().startswith("low.cond_br")), "^tdone")
         elif cond and t_.startswith(cond[1]):
             cond = None

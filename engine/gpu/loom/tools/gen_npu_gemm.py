@@ -29,6 +29,7 @@ import dataclasses
 import importlib
 import math
 import os
+import re
 import struct
 import sys
 
@@ -80,7 +81,8 @@ class Config:
     fuse: int = 0       # 1: every GEMM core fills its own weight panel slice at each replay group's first firing
                         # (pass-through: its column's raw stream multicast to its core stream, its slice through a
                         # leaf-synced egress ring into its memory-tile panel, constrain.fill; HRX patch 0020); W is
-                        # leaf-synchronized
+                        # leaf-synchronized. 2: the raw stream is IQ4_XS (fuse_raw_dec): every filling core decodes
+                        # the super-blocks covering its slice (gen_npu_dec.leaf_inline, in its idle W ring)
     ofeat: int = 0      # final f32 output, fragment-major into [token / 16][ofeat / 16][16][16]: column c's 80 features are
                         # fragments 5c .. 5c + 4; needs one replay group (GE.GROUPS = (passes,)) and
                         # LOOM_EXP_LS_SEND_PITCH=1 (the whole f32 slot is sent)
@@ -541,9 +543,40 @@ def fuse_record(cfg, r):
     group's fill."""
     rows = len(cfg.ks)
     unit = NP * sum(slab(k) for k in (cfg.ks[r:] if r == rows - 2 else cfg.ks[r:r + 1])) // 4
+    if cfg.fuse == 2:   # whole 64-byte copies, whole records per slab
+        fw = max(w for w in range(16, FUSE_REC + 1, 16) if all(sw % w == 0 for _, sw in fuse_pieces(cfg, r)))
+        return fw, cfg.passes * unit // fw
     g = math.gcd(*(len(p) * unit for p in fuse_groups(cfg)))
     fw = max(w for w in range(4, FUSE_REC + 1, 4) if g % w == 0)
     return fw, cfg.passes * unit // fw
+
+
+FUSE_SB, FUSE_BLK = 4, 136       # fuse 2: IQ4_XS super-blocks per row of a unit (a pass: 1024 k), bytes per super-block
+FUSE_UNIT_RAW = 16 * FUSE_SB * FUSE_BLK   # a (pass, slab) unit's raw bytes: [16 rows][4 super-blocks]
+
+
+def fuse_span(cfg, r):
+    """fuse 2, filling row r: (k-block range k0, k1 of a pass; first super-block, super-block count)."""
+    rows = len(cfg.ks)
+    k0 = sum(cfg.ks[:r])
+    k1 = sum(cfg.ks) if r == rows - 2 else k0 + cfg.ks[r]
+    s0, s1 = k0 // 32, -(-k1 // 32)
+    return k0, k1, s0, s1 - s0
+
+
+def fuse_pieces(cfg, r):
+    """fuse 2, filling row r: per slice of its panel unit, (first k-block, padded slab words)."""
+    rows = len(cfg.ks)
+    out = [(sum(cfg.ks[:j]), slab(cfg.ks[j]) // 4) for j in ((r, rows - 1) if r == rows - 2 else (r,))]
+    assert all(sw % 16 == 0 for _, sw in out), "fuse 2: slabs of whole 64-byte copies"
+    return out
+
+
+def fuse_raw_dec(raw, cfg):
+    """fuse 2: the raw binding from IQ4_XS blocks raw [cols 80 rows][K / 256 super-blocks][136] (u8): per column, per
+    (pass, slab) unit, [16 rows][4 super-blocks of the pass]."""
+    r = raw.reshape(cfg.cols, NP, 16, cfg.passes, FUSE_SB, FUSE_BLK)
+    return r.transpose(0, 3, 1, 2, 4, 5).reshape(-1)
 
 
 def fuse_raw(w, cfg):
@@ -571,7 +604,7 @@ def fuse_channels(e, cfg, panel):
     write binding, a lane per worker, is never transferred), and its column's raw stream, multicast over the column's
     filling core streams."""
     rows, cols = len(cfg.ks), cfg.cols
-    uw = sum(slab(k) for k in cfg.ks) // 4
+    uw = FUSE_UNIT_RAW // 4 if cfg.fuse == 2 else sum(slab(k) for k in cfg.ks) // 4
     units = cfg.passes * NP
     e(f"  %fdb = binding {6 if cfg.gate else 3}, \"write\"")
     e(f"  %frb = binding {7 if cfg.gate else 4}, \"read\"")
@@ -711,6 +744,9 @@ def fuse_prologue(L, cfg, role, ks, r):
     e("  %fzs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e("  %fzp = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     e("  %fzjs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+    if cfg.fuse == 2:
+        fuse2_entry(L, cfg, dp, r, wrec)
+        return
     e("  %fzjp = storage_address %fzjs : low.storage<private> -> reg<aie2p.ep>")
     e("  %fzc = lda %fzp, 0")
     e("  %fzc1 = add.rr %fzc, %one")
@@ -734,22 +770,7 @@ def fuse_prologue(L, cfg, role, ks, r):
     e("  %fzfour = mova.i32 4")
     e("  %fz16 = mova.i32 16")
     e("  %fzm16 = mov.modifier %fz16")
-    starts, s0 = [], 0
-    for g in fuse_groups(cfg):
-        starts.append(s0)
-        s0 += cfg.nb * len(g)
-    for i, st in enumerate(starts):   # firing == st: group i's fill (firings below st were checked before)
-        last = i + 1 == len(starts)
-        if st:
-            e(f"  %fzbl{i} = mov.i32 {st}")
-            e(f"  %fzml{i} = lt %fzc, %fzbl{i}")
-            e(f"  low.cond_br %fzml{i}, ^fzgemm, ^fzck{i} : reg<aie2p.er>")
-            e(f"^fzck{i}:")
-        e(f"  %fzbh{i} = mov.i32 {st + 1}")
-        e(f"  %fzmh{i} = lt %fzc, %fzbh{i}")
-        e(f"  low.cond_br %fzmh{i}, ^fzgo{i}, {'^fzgemm' if last else f'^fzne{i}'} : reg<aie2p.er>")
-        if not last:
-            e(f"^fzne{i}:")
+    fuse_dispatch(e, cfg)
     f = _Fill(e, dp)
     for i, g in enumerate(fuse_groups(cfg)):
         n = len(g) * NP
@@ -769,6 +790,249 @@ def fuse_prologue(L, cfg, role, ks, r):
         e("  low.br ^fzgemm")
     e("^fzgemm:")
     e("  acq %am1, 1")
+
+
+def fuse2_entry(L, cfg, dp, r, wrec):
+    """fuse 2's entry: the firing counter and W slot parity, the leaf's pointers and the W slot offset parked in
+    private storage (nothing lives across the decoding fill: it needs every register), the group dispatch, the fill
+    (fuse_decode), then ^fzgemm rebuilds the pointers (W is acquired after the GEMM's constants)."""
+    e = L.append
+    e("  %fzc = lda %fzp, 0")
+    e("  %fzc1 = add %fzc, 1")
+    e(f"  %fzcl = mov.i32 {cfg.nb * cfg.passes}")
+    e("  %fzcw = lt %fzc1, %fzcl")
+    e("  %fzcn = mul %fzc1, %fzcw")
+    e("  st %fzcn, %fzp, 0")
+    e("  %fzc1o = sub %fzc1, %fzc")                     # 1, not a constant
+    e("  %fzpar = and %fzc, %fzc1o")
+    e(f"  %fzwr = mov.i32 {wrec}")
+    e("  %fzwo = mul %fzpar, %fzwr")
+    for o, nm in ((20, "%a_r"), (24, "%w0_r"), (28, "%fzd_r")):
+        e(f"  %fzps{o} = mov.address-to-scalar {nm}")
+        e(f"  st %fzps{o}, %fzp, {o}")
+    e("  st %fzwo, %fzp, 4")   # (fuse 1's in-record word count slot)
+    e("  %fzcf = mov.i32 780")                         # the GEMM's MMA config, loaded after the fill: as a constant,
+    e("  st %fzcf, %fzp, 16")                          # the allocator's pressure repairs (for the decoder) cloned it at
+                                                       # each of its 720 MMA uses (+2.3 KB of program)
+    starts, s0 = [], 0
+    for g in fuse_groups(cfg):
+        starts.append(s0)
+        s0 += cfg.nb * len(g)
+    for i, st in enumerate(starts):   # firing == st: group i's fill
+        last = i + 1 == len(starts)
+        if st:
+            e(f"  %fzbl{i} = mov.i32 {st}")
+            e(f"  %fzml{i} = lt %fzc, %fzbl{i}")
+            e(f"  low.cond_br %fzml{i}, ^fzgemm, ^fzck{i} : reg<aie2p.er>")
+            e(f"^fzck{i}:")
+            e(f"  %fzbh{i} = add %fzbl{i}, 1")
+            e(f"  %fzmh{i} = lt %fzc, %fzbh{i}")
+        else:
+            e(f"  %fzmh{i} = eqz %fzc")
+        e(f"  low.cond_br %fzmh{i}, ^fzgo{i}, {'^fzgemm' if last else f'^fzne{i}'} : reg<aie2p.er>")
+        if not last:
+            e(f"^fzne{i}:")
+    for i, g in enumerate(fuse_groups(cfg)):
+        e(f"^fzgo{i}:")
+        e(f"  %fzgn{i} = mov.i32 {len(g) * NP}")
+        e(f"  low.br ^fzdq(%fzgn{i}: reg<aie2p.er>)")
+    fuse_decode(L, cfg, dp, r)
+    e("^fzgemm:")
+    e("  %fzpG = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    for o, nm in ((20, "a"), (24, "w0"), (28, "fzd")):
+        e(f"  %fzpl{o} = lda %fzpG, {o}")
+        e(f"  %{nm} = mov.scalar-to-address %fzpl{o}")
+    e("  %fzwo2 = lda %fzpG, 4")
+    e("  %fzwm = mov.modifier %fzwo2")
+    e("  %fzw0c = copy %w0 : reg<aie2p.ep> -> reg<aie2p.ep>")
+    e("  %w = padds.modifier %fzw0c, %fzwm")
+
+
+def fuse_dispatch(e, cfg):
+    """Branches to ^fzgo{i} at replay group i's first firing (%fzc: the firing number), else to ^fzgemm."""
+    starts, s0 = [], 0
+    for g in fuse_groups(cfg):
+        starts.append(s0)
+        s0 += cfg.nb * len(g)
+    for i, st in enumerate(starts):   # firing == st: group i's fill (firings below st were checked before)
+        last = i + 1 == len(starts)
+        if st:
+            e(f"  %fzbl{i} = mov.i32 {st}")
+            e(f"  %fzml{i} = lt %fzc, %fzbl{i}")
+            e(f"  low.cond_br %fzml{i}, ^fzgemm, ^fzck{i} : reg<aie2p.er>")
+            e(f"^fzck{i}:")
+        e(f"  %fzbh{i} = mov.i32 {st + 1}")
+        e(f"  %fzmh{i} = lt %fzc, %fzbh{i}")
+        e(f"  low.cond_br %fzmh{i}, ^fzgo{i}, {'^fzgemm' if last else f'^fzne{i}'} : reg<aie2p.er>")
+        if not last:
+            e(f"^fzne{i}:")
+
+
+FZ_SP, FZ_IN, FZ_SP2, FZ_OUT = 0, 3264, 16384, 23616   # fuse 2 scratch (from the W ring's first 2048-aligned byte):
+# decoder storage A (SCR_B), its input record ([16][RECROW]), storage B (SCR2_B, another bank: the table's second
+# copy), its output (2 OUT_B records a super-block)
+
+
+def fuse_decode(L, cfg, dp, r):
+    """fuse 2: a replay group's fill (^fzdq(units)): per (pass, slab) unit, the raw stream's [16 rows][4 super-blocks]
+    -> this row's super-blocks into the decoder's input record (the rest popped), the inlined IQ4_XS decoder, then the
+    row's k-blocks (panel order [kb][h]) copied record by record into the egress ring. Scratch is the W ring (idle
+    until this panel's drain, which starts after the last record). Unit index and count live in private storage
+    (the decoder needs every register)."""
+    e = L.append
+    D = decoder("IQ4_XS")
+    k0, k1, s0, nsb = fuse_span(cfg, r)
+    fw, _ = fuse_record(cfg, r)
+    W = FUSE_BLK // 4                                  # words per super-block
+    pieces = fuse_pieces(cfg, r)
+    assert FZ_SP + D.SCR_B <= FZ_IN and FZ_IN + 16 * D.RECROW <= FZ_SP2 and FZ_SP2 + D.SCR2_B <= FZ_OUT
+    assert FZ_OUT + nsb * 2 * D.OUT_B + 2047 <= 2 * NP * slab(cfg.ks[r]) and fw % 16 == 0
+    e("^fzdq(%fzN: reg<aie2p.er>):")
+    e("  %fzpD = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  st %fzN, %fzpD, 12")                       # the units left
+    e("  low.br ^fzu")
+    e("^fzu:")
+    e("  %fzpU = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzu = lda %fzpU, 12")
+    e("  %fzum = eqz %fzu")
+    e("  low.cond_br %fzum, ^fzux, ^fzub : reg<aie2p.er>")
+    e("^fzub:")
+    e("  %fzR1 = mova.i32 1")
+    e("  %fzR0 = mova.i32 0")
+    # scratch pointers (re-derived each unit: nothing lives across the decoder)
+    e("  %fzk2047 = mov.i32 2047")
+    e("  %fzw0l = lda %fzpU, 24")
+    e("  %fzwb = add.rr %fzw0l, %fzk2047")
+    e("  %fzkm2048 = mov.i32 -2048")
+    e("  %fzsb = and %fzwb, %fzkm2048")
+    for nm, off in (("sp", FZ_SP), ("in", FZ_IN), ("sp2", FZ_SP2), ("out", FZ_OUT)):
+        e(f"  %fzo_{nm} = mov.i32 {off}")
+        e(f"  %fza_{nm} = add.rr %fzsb, %fzo_{nm}")
+    e("  %fzjpR = storage_address %fzjs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzinp = mov.scalar-to-address %fza_in")
+    # the raw unit: per row, skip / take / skip words (pairs)
+    e("  %fz2 = mova.i32 2")
+    e("  %fz8 = mova.i32 8")
+    e("  %fzm8 = mov.modifier %fz8")
+    e(f"  %fzrr = mov.i32 {D.RECROW}")
+    e("  %fz16r = mova.i32 16")
+    e("  low.br ^fzrw(%fzR0: reg<aie2p.er>, %fzinp: reg<aie2p.ep>)")
+    e("^fzrw(%fzri: reg<aie2p.er>, %fzrp: reg<aie2p.ep>):")
+    e("  %fzrm = lt %fzri, %fz16r")
+    e("  low.cond_br %fzrm, ^fzrb, ^fzrx : reg<aie2p.er>")
+    e("^fzrb:")
+
+    def pairs(tag, n, take):
+        """n words from the stream, as pairs: stored at %fzrp (take) or into the junk block."""
+        if n == 0:
+            return
+        assert n % 2 == 0
+        e(f"  %fzk{tag} = mov.i32 {n // 2}")
+        if take:
+            e(f"  low.br ^fz{tag}(%fzR0: reg<aie2p.er>, %fzrp: reg<aie2p.ep>)")
+            e(f"^fz{tag}(%fzi{tag}: reg<aie2p.er>, %fzq{tag}: reg<aie2p.ep>):")
+        else:
+            e(f"  low.br ^fz{tag}(%fzR0: reg<aie2p.er>)")
+            e(f"^fz{tag}(%fzi{tag}: reg<aie2p.er>):")
+        e(f"  %fzm{tag} = lt %fzi{tag}, %fzk{tag}")
+        e(f"  low.cond_br %fzm{tag}, ^fz{tag}b, ^fz{tag}x : reg<aie2p.er>")
+        e(f"^fz{tag}b:")
+        for w in range(2):
+            e(f"  %fzv{tag}{w} = mov.ss")
+            e(f"  st %fzv{tag}{w}, {f'%fzq{tag}' if take else '%fzjpR'}, {4 * w}")
+        e(f"  %fzi1{tag} = add.rr %fzi{tag}, %fzR1")
+        if take:
+            e(f"  %fzq1{tag} = padds.modifier %fzq{tag}, %fzm8")
+            e(f"  low.br ^fz{tag}(%fzi1{tag}: reg<aie2p.er>, %fzq1{tag}: reg<aie2p.ep>)")
+        else:
+            e(f"  low.br ^fz{tag}(%fzi1{tag}: reg<aie2p.er>)")
+        e(f"^fz{tag}x:")
+    pairs("pre", W * s0, False)
+    pairs("tk", W * nsb, True)
+    pairs("post", W * (FUSE_SB - s0 - nsb), False)
+    e("  %fzrpa = mov.address-to-scalar %fzrp")
+    e("  %fzrpb = add.rr %fzrpa, %fzrr")
+    e("  %fzrpn = mov.scalar-to-address %fzrpb")
+    e("  %fzri1 = add.rr %fzri, %fzR1")
+    e("  low.br ^fzrw(%fzri1: reg<aie2p.er>, %fzrpn: reg<aie2p.ep>)")
+    e("^fzrx:")
+    for nm in ("sp", "in", "sp2", "out"):
+        e(f"  %dq_{nm} = mov.scalar-to-address %fza_{nm}")
+    # the decoder (its values and labels prefixed)
+    ren = lambda m: m.group(1) + "dq_" + m.group(2)
+    for ln in D.leaf_inline(nsb):
+        ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
+        e(ln if ln.startswith("^") else "  " + ln.strip())
+    # the egress: per slice of this row's panel (rows - 2: its own and the last row's, interleaved per unit), its
+    # padded slab from the decoded super-blocks (the pad copies whatever follows), a record (fw words) at a time
+    e("  %fzE1 = mova.i32 1")
+    e("  %fzE0 = mova.i32 0")
+    e("  %fzEm1 = mova.i32 -1")
+    e("  %fzk2047b = mov.i32 2047")
+    e("  %fzpW = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzw0l2 = lda %fzpW, 24")
+    e("  %fzwb2 = add.rr %fzw0l2, %fzk2047b")
+    e("  %fzkm2048b = mov.i32 -2048")
+    e("  %fzsb2 = and %fzwb2, %fzkm2048b")
+    for i, (kb0, sw) in enumerate(pieces):
+        x = f"^fze{i + 1}" if i + 1 < len(pieces) else "^fzex"
+        e(f"  %fzoo{i} = mov.i32 {FZ_OUT + (kb0 - 32 * s0) * 144}")
+        e(f"  %fzsrc{i} = add.rr %fzsb2, %fzoo{i}")
+        e(f"  %fzsp{i} = mov.scalar-to-address %fzsrc{i}")
+        e(f"  %fznr{i} = mov.i32 {sw // fw}")
+        e(f"  low.br ^fze{i}h(%fzE0: reg<aie2p.er>, %fzsp{i}: reg<aie2p.ep>)")
+        e(f"^fze{i}h(%fzei{i}: reg<aie2p.er>, %fzes{i}: reg<aie2p.ep>):")
+        e(f"  %fzem{i} = lt %fzei{i}, %fznr{i}")
+        e(f"  low.cond_br %fzem{i}, ^fze{i}b, {x} : reg<aie2p.er>")
+        e(f"^fze{i}b:")
+        e(f"  acq %fzEm1, {dp}")
+        e(f"  %fzpE{i} = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+        e(f"  %fzen{i} = lda %fzpE{i}, 8")
+        e(f"  %fzekh{i} = mova.i32 -1")
+        e(f"  %fzeh{i} = lshl %fzen{i}, %fzekh{i}")
+        e(f"  %fzehh{i} = add.rr %fzeh{i}, %fzeh{i}")
+        e(f"  %fzer{i} = sub %fzen{i}, %fzehh{i}")
+        e(f"  %fzerb{i} = mov.i32 {4 * fw}")
+        e(f"  %fzeo{i} = mul %fzer{i}, %fzerb{i}")
+        e(f"  %fzdl{i} = lda %fzpE{i}, 28")
+        e(f"  %fzea{i} = add.rr %fzdl{i}, %fzeo{i}")
+        e(f"  %fzed{i} = mov.scalar-to-address %fzea{i}")
+        if fw == 16:   # one 64-byte copy, straight-line (as a one-trip loop the records came out scrambled: unexplained)
+            for q in range(4):
+                e(f"  %fzsv{i}_{q} = vlda.128.i32x4 %fzes{i}, {16 * q}")
+                e(f"  vst.128.i32x4 %fzsv{i}_{q}, %fzed{i}, {16 * q}")
+            e(f"  %fzcs{i} = padda %fzes{i}, 64")
+            e(f"  low.br ^fzc{i}x")
+        else:
+            e(f"  %fzck{i} = mov.i32 {fw // 16}")
+            e(f"  low.br ^fzc{i}(%fzE0: reg<aie2p.er>, %fzes{i}: reg<aie2p.ep>, %fzed{i}: reg<aie2p.ep>)")
+            e(f"^fzc{i}(%fzci{i}: reg<aie2p.er>, %fzcs{i}: reg<aie2p.ep>, %fzcd{i}: reg<aie2p.ep>):")
+            e(f"  %fzcm{i} = lt %fzci{i}, %fzck{i}")
+            e(f"  low.cond_br %fzcm{i}, ^fzc{i}b, ^fzc{i}x : reg<aie2p.er>")
+            e(f"^fzc{i}b:")
+            for q in range(4):
+                e(f"  %fzcv{i}_{q} = vlda.128.i32x4 %fzcs{i}, {16 * q}")
+                e(f"  vst.128.i32x4 %fzcv{i}_{q}, %fzcd{i}, {16 * q}")
+            e(f"  %fzcs1{i} = padda %fzcs{i}, 64")
+            e(f"  %fzcd1{i} = padda %fzcd{i}, 64")
+            e(f"  %fzci1{i} = add.rr %fzci{i}, %fzE1")
+            e(f"  low.br ^fzc{i}(%fzci1{i}: reg<aie2p.er>, %fzcs1{i}: reg<aie2p.ep>, %fzcd1{i}: reg<aie2p.ep>)")
+        e(f"^fzc{i}x:")
+        e(f"  rel %fzE1, {dp}")
+        e(f"  %fzen1{i} = add.rr %fzen{i}, %fzE1")
+        e(f"  st %fzen1{i}, %fzpE{i}, 8")
+        e(f"  %fzei1{i} = add.rr %fzei{i}, %fzE1")
+        e(f"  low.br ^fze{i}h(%fzei1{i}: reg<aie2p.er>, %fzcs{i}: reg<aie2p.ep>)")
+        if i + 1 < len(pieces):
+            e(f"^fze{i + 1}:")
+    e("^fzex:")
+    e("  %fzpX = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzu2 = lda %fzpX, 12")
+    e("  %fzu21 = add %fzu2, -1")
+    e("  st %fzu21, %fzpX, 12")
+    e("  low.br ^fzu")
+    e("^fzux:")
+    e("  low.br ^fzgemm")
 
 
 def cfg_row(cfg, role):
@@ -817,10 +1081,11 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, frow=None):
         if frow == len(cfg.ks) - 2 and frow > 1:
             name = "mid_l"
     e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{name}() asm {{")
-    e("  %a = resource<native_pointer> {index = 0, source_type = buffer} : reg<aie2p.ep>")
+    rs = "_r" if fills and cfg.fuse == 2 else ""   # fuse 2: parked as scalars across the decoding fill (^fzgemm)
+    e(f"  %a{rs} = resource<native_pointer> {{index = 0, source_type = buffer}} : reg<aie2p.ep>")
     if fills:   # the W ring's first slot and the fused fill's egress ring (fuse_prologue)
-        e("  %w0 = resource<native_pointer> {index = 1, source_type = buffer} : reg<aie2p.ep>")
-        e(f"  %fzd = resource<native_pointer> {{index = {fuse_ports(role)[0]}, source_type = buffer}} : reg<aie2p.ep>")
+        e(f"  %w0{rs} = resource<native_pointer> {{index = 1, source_type = buffer}} : reg<aie2p.ep>")
+        e(f"  %fzd{rs} = resource<native_pointer> {{index = {fuse_ports(role)[0]}, source_type = buffer}} : reg<aie2p.ep>")
     else:
         e("  %w = resource<native_pointer> {index = 1, source_type = buffer} : reg<aie2p.ep>")
     if gate:   # the neighbor channel to / from the relay (leaf-synchronized)
@@ -833,8 +1098,17 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, frow=None):
         e("  set.mcd-enable 1")
     else:
         e("  set.rounding 12")   # round to nearest even (the bf16 C)
-    e("  %conf = mova.i32 780")
+    early = fills and cfg.fuse == 2   # the decoding fill first: nothing of the GEMM's lives across the decoder
+    if early:
+        fuse_prologue(L, cfg, role, ks, frow)
+    if early:   # (fuse2_entry)
+        e("  %fzpL = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+        e("  %conf = lda %fzpL, 16")
+    else:
+        e("  %conf = mova.i32 780")
     e("  %am1 = mova.i32 -1")
+    if early:
+        e("  acq %am1, 1")
     e("  %addmode = mova.i32 60")
     if role != "head":
         e("  %qsel0 = mova.i32 0")
@@ -851,7 +1125,7 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, frow=None):
     e("  %cstep = mul %k512, %k2")
     e("  %mcs = mov.modifier %cstep")
     e("  %mz = mov.modifier %zero")
-    if fills:
+    if fills and not early:
         fuse_prologue(L, cfg, role, ks, frow)
     if tail:
         # pass counter in private storage; C segments are acquired on the first pass and released after the last

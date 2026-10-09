@@ -62,6 +62,22 @@ def main():
     cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse)
     M, Nn, K = N.TM * nb, N.TN * cols, 8 * passes * sum(ks)
     os.makedirs(work, exist_ok=True)
+    wq = None
+    if fuse == 2:   # real IQ4_XS rows (NPU_GGUF): the panels are decoded on the cores; W's value is the decoder's
+        sys.path.insert(0, os.path.expanduser("~/llama.cpp/gguf-py"))
+        import gguf
+        D = N.decoder("IQ4_XS")
+        rd = gguf.GGUFReader(os.path.expanduser(os.environ.get(
+            "NPU_GGUF", "~/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf")))
+        t = next(x for x in rd.tensors if x.tensor_type.name == "IQ4_XS" and len(x.shape) == 2
+                 and int(x.shape[0]) == K and int(x.shape[1]) >= Nn)
+        wraw = np.asarray(t.data).view(np.uint8).reshape(-1, K // 256, D.BLK)[:Nn].copy()
+        wf = D.weights(wraw).reshape(Nn, K)                        # the decoder's exact f32 weights
+        frag = wf.reshape(Nn // 8, 8, K // 8, 8).transpose(0, 2, 1, 3).reshape(-1, 8, 8)
+        bb = D.Q.bfp_hw(frag).reshape(-1, 8, 9)                    # per row [E][8 mantissas]
+        mq = bb[:, :, 1:].copy().view(np.int8).astype(np.float64)
+        wq = (mq * np.exp2(bb[:, :, 0].astype(np.float64) - 133)[..., None]).reshape(
+            Nn // 8, K // 8, 8, 8).transpose(0, 2, 1, 3).reshape(Nn, K)
     if len(sys.argv) > 7:
         a = np.fromfile(sys.argv[6], np.float16)[:M * K].reshape(M, K)
         w = np.fromfile(sys.argv[7], np.float16)[:Nn * K].reshape(Nn, K)
@@ -83,7 +99,11 @@ def main():
          f"--output={img}"], env, "loom-compile")
     a_b, w_b, c_b = (os.path.join(work, n) for n in ("a.bin", "w.bin", "c.bin"))
     sa, sw, sc = N.stream_bytes(cfg)
-    ra, _ = B.reference(a, "act", M, list(ks), passes, 64, True)
+    a_in = a
+    if fuse == 2:   # the decoders emit each pass's k-blocks in panel order (gen_npu_dec.KPERM): A follows
+        kperm = np.concatenate([128 * p + D.KPERM for p in range(passes)])
+        a_in = a.reshape(M, K // 8, 8)[:, kperm].reshape(M, K)
+    ra, _ = B.reference(a_in, "act", M, list(ks), passes, 64, True)
     rw, _ = B.reference(w, "wgt", Nn, list(ks), passes, N.TN, True)
     assert ra.size == sa and rw.size == sw
     ra.tofile(a_b)
@@ -96,7 +116,10 @@ def main():
         d_b, r_b = os.path.join(work, "d.bin"), os.path.join(work, "r.bin")
         words = max(fw * nrec for fw, nrec in (N.fuse_record(cfg, r) for r in range(len(ks) - 1)))
         np.zeros(len(ks) * cols * words, np.int32).tofile(d_b)
-        N.fuse_raw(np.frombuffer(rw.tobytes(), np.int32), cfg).tofile(r_b)
+        if fuse == 2:
+            np.concatenate([N.fuse_raw_dec(wraw, cfg), np.zeros(256, np.uint8)]).tofile(r_b)
+        else:
+            N.fuse_raw(np.frombuffer(rw.tobytes(), np.int32), cfg).tofile(r_b)
         base += ["--binding=" + d_b, "--binding=" + r_b]
     width = None
     for cand in range(cols, 9):   # memory-tile stages can need a wider context than the compute columns
@@ -115,12 +138,13 @@ def main():
     for g, gp in enumerate(grp):   # each group's partial: its K range
         k1 = k0 + 8 * gp * sum(ks)
         part = unpack_c(raw, cols, nb, len(grp), g)
-        ref = value(a[:, k0:k1]) @ value(w[:, k0:k1]).T
+        ref = value(a[:, k0:k1]) @ (value(w[:, k0:k1]) if wq is None else wq[:, k0:k1]).T
         ulp = np.exp2(np.floor(np.log2(np.maximum(np.abs(ref), 1e-30))) - 7)   # of bf16 at ref
-        err = max(err, (np.abs(part - ref) / ulp).max())
+        e = np.abs(part - ref) / ulp
+        err = max(err, float(np.where(np.isnan(e), np.inf, e).max()))   # (Python max drops NaN)
         k0 = k1
     got = unpack_c(raw, cols, nb, len(grp))
-    exact = a.astype(np.float64) @ w.astype(np.float64).T
+    exact = a.astype(np.float64) @ (w.astype(np.float64) if wq is None else wf).T
     rms = np.sqrt(np.mean((got - exact) ** 2) / np.mean(exact ** 2))
     print(f"npu gemm {M}x{Nn}x{K} ks={list(ks)} passes={passes} groups={list(grp)} (context {width} columns): max |err| "
           f"{err:.3f} bf16 ulp vs the bfp16 oracle; rel RMS {rms:.2e} vs unquantized f16")
