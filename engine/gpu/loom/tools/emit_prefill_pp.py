@@ -668,6 +668,9 @@ NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
 # (F / 256 of them) column c features 256 j + 32 c + [0, 32) of F (gen_npu_gemm swcol 32), down in 640-row calls.
 # Down's K parts (both kinds): F's passes in the fewest parts of at most 5 (a fused panel holds a part), sizes balanced.
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
+# YAH_NPU_FFNRES=0 (fused sets): the GPU window writes f32 and npu_unpack_ffnblk adds hidden + it + the NPU's partials
+# after the job, instead of its residual epilogue waiting for the NPU (npuffnres; slower while the NPU is the late one)
+NPU_FFNRES = os.environ.get("YAH_NPU_FFNRES", "1") == "1"
 FFNBLK_FMTS = ("iq4xs", "iq3s", "iq3xxs", "q3k", "iq2xxs", "iq2xs")
 FFNBLK_DOWN_FMTS = ("iq3s", "iq3xxs", "iq4xs", "q4k")
 # the down decoders' k-block order where it is not natural: their layers' gate / up images write H in it (_p4 / _q4k)
@@ -696,14 +699,14 @@ def npu_rem(site):
     return NPU_SITES[site][2] * 256 % (1024 * NPU_PASSES)
 
 
-def npu_rem_tile(fmt, kbw, kbt):
-    """The K remainder's tile (gen_gemm_tile.KWIN, kbw of kbt blocks): the afrag kstore with the knobs of the format's
-    K = kbt * 256 kres (emit_prefill_pp.AF; its residual and persistence knobs dropped)."""
+def npu_rem_tile(fmt, kbw, kbt, kind="kstore"):
+    """The K remainder's tile (gen_gemm_tile.KWIN, kbw of kbt blocks): the afrag kstore (or kres) with the knobs of the
+    format's K = kbt * 256 kres (emit_prefill_pp.AF; its residual and persistence knobs dropped)."""
     import gen_gemm_tile as TG
     knobs = dict(AF.get((fmt, "kres", 320, kbt)) or AF[(fmt, "kres", 320, 24)])
     knobs.pop("persist", None)
     knobs["respre"] = 0
-    return dataclasses.replace(TG.default_tile(fmt, "kstore", kbw), **AF_TILE, **knobs)
+    return dataclasses.replace(TG.default_tile(fmt, kind, kbw), **AF_TILE, **knobs)
 
 
 def fit_rowgrp(t, mt):
@@ -1065,8 +1068,27 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                                    fmt=DCOL_FMTS[fmt][0], swiglu=True, dgu=mt * 16 * kb * blk, swcol=1024,
                                    hpass=F // 1024, hord=hord), name, None, 4))
             jobs.append((jobs[-1][0], name + ".swap", "swap", 4))
+    parts = ffnblk_parts(F)
     for fmt, mt, kb, kbw in sorted({l["ffn_down"] + ((l["ffn_down"][2] * 256 - F) // 256,) for l in ok} |
                                    {l["ffn_down"] + ((l["ffn_down"][2] * 256 - FFNBLK_PAIR) // 256,) for l in pairs}):
+        if NPU_FUSE and NPU_FFNRES:   # the GPU's K window as the residual GEMM, adding the NPU's down partials
+            with GN.np_override(4):
+                dcfg = GN.Config(NPU_COLS, B // 64, NPU_KS, parts[0][1], mu=1, gate=GN.GATE_SUPPLY, fuse=2,
+                                 kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0])
+                cp, tn, calls = GN.stream_bytes(dcfg)[2], GN.TN, -(-5120 // rows)
+            assert rows == NPU_COLS * tn and 5120 % rows == 0
+            tr = fit_rowgrp(npu_rem_tile(fmt, kbw, kb, "kres"), mt)
+            add = dict(rows=rows, tn=tn, np=4, call=cp // 2, calls=calls, parts=len(parts), tokens=B)
+
+            def gen_res(f, k, tr=tr, kb=kb, add=add):
+                TG.KWIN, TG.NPUADD = (0, kb), add
+                try:
+                    return TG.gen(f, "kres", tr, False)
+                finally:
+                    TG.KWIN = TG.NPUADD = None
+            out.append(_emit_gen(gen_res, tr.bn, fmt, mt, kbw, B, "npuffnres_%s_%d.hal" % (fmt, kbw), outdir, "kres",
+                                 tr.rowgrp, kfull=kb, npuc=len(parts) * calls * cp))
+            continue
         # the GPU's K window [0, 17408 - F)
         tr = fit_rowgrp(npu_rem_tile(fmt, kbw, kb), mt)
 
@@ -1079,7 +1101,6 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         assert mt not in O16_MT, "the window writes f32"
         out.append(_emit_gen(gen_rem, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d.hal" % (fmt, kbw), outdir, "kstore",
                              tr.rowgrp, kfull=kb))
-    parts = ffnblk_parts(F)
     for fmt, mt, kb in sorted({l["ffn_down"] for l in ok} | {l["ffn_down"] for l in pairs}):
         for passes in sorted({p for _, p in parts + (ffnblk_parts(FFNBLK_PAIR) if pairs else ())}):
             if NPU_FUSE:
@@ -1101,22 +1122,24 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                                ufmt=DCOL_FMTS[uf][0], swiglu=True, swcol=2048, hpass=F // 1024, hord=hord),
                      name, None, (4, True)))
         jobs.append((jobs[-1][0], name + ".swap", "swap", (4, True)))
-    # hidden + the GPU's window + the NPU's down partials (per K part, calls of rows rows, one replay group each)
+    # hidden + the GPU's window + the NPU's down partials (per K part, calls of rows rows, one replay group each); fused
+    # sets add them in the GPU window's residual epilogue (npuffnres) unless NPU_FFNRES is off
     N, calls = 5120, -(-5120 // rows)
     assert not pairs or len(ffnblk_parts(FFNBLK_PAIR)) == len(parts)
-    cg = GU.CG
-    GU.CG = 1
-    try:
-        with GN.np_override(4 if NPU_FUSE else GN.NP):
-            text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
-                          dup=((calls - 1) * NPU_COLS, N - rows))
-            nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
-    finally:
-        GU.CG = cg
-    src = os.path.join(tmp, "npu_unpack_ffnblk.loom")
-    open(src, "w").write(text)
-    E.emit(src, ["nop=0"], "npu_unpack_ffnblk.hal", outdir)
-    out.append(("npu_unpack_ffnblk.hal", B * calls * NPU_COLS * nj // wg, wg, 0))
+    if not (NPU_FUSE and NPU_FFNRES):
+        cg = GU.CG
+        GU.CG = 1
+        try:
+            with GN.np_override(4 if NPU_FUSE else GN.NP):
+                text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
+                              dup=((calls - 1) * NPU_COLS, N - rows))
+                nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
+        finally:
+            GU.CG = cg
+        src = os.path.join(tmp, "npu_unpack_ffnblk.loom")
+        open(src, "w").write(text)
+        E.emit(src, ["nop=0"], "npu_unpack_ffnblk.hal", outdir)
+        out.append(("npu_unpack_ffnblk.hal", B * calls * NPU_COLS * nj // wg, wg, 0))
     # gate / up read their activations in one replay group: the norm before them writes that stream (fragment-major)
     import gen_half_norm
     groups, perm = GE.GROUPS, GE.ACT_PERM
@@ -1161,10 +1184,11 @@ def tile_kstore(fmt, mt, kb, B, out, outdir, kind, geom=None):
     return _emit_gen(lambda f, k: TG.gen(f, k, t, masked), t.bn, fmt, mt, kb, B, out, outdir, kind, t.rowgrp, masked)
 
 
-def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, sym=None, kfull=0):
+def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False, ostride=0, sym=None, kfull=0, npuc=0):
     """ostride: a GEMM over the leading mt * 16 rows of an ostride-row output (gen_gemm_tile.OSTRIDE, the NPU split);
     f16 output then follows the full shape (O16_MT). sym: the kernel symbol, if not the GEMM's or the dequant's.
-    kfull: a K-chunk dequant's whole-row k_blocks (gen_gemm_tile.DQ_BFP)."""
+    kfull: a K-chunk dequant's whole-row k_blocks (gen_gemm_tile.DQ_BFP). npuc: the bytes of NPU C a gen_gemm_tile.NPUADD
+    epilogue reads."""
     if B % tile and not masked:
         return None
     import gen_gemm_tile as _TG
@@ -1187,7 +1211,8 @@ def _emit_gen(gen, tile, fmt, mt, kb, B, out, outdir, kind, rowgrp, masked=False
     import subprocess
     gate = subprocess.run([sys.executable, os.path.join(HERE, "footprint_gate.py"), src, sym, fmt,
                            kind, str(mt), str(kb), str(tt), str(B)] + (["masked"] if masked else [])
-                          + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else []),
+                          + (["ostride=%d" % ostride] if ostride else []) + (["kfull=%d" % kfull] if kfull else [])
+                          + (["npuc=%d" % npuc] if npuc else []),
                           capture_output=True, text=True)
     if gate.returncode != 0:
         raise SystemExit("footprint gate refused %s: %s" % (out, (gate.stdout + gate.stderr).strip()[-400:]))

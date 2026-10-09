@@ -262,6 +262,12 @@ DQ_BFP_KSUB = 128
 # KWIN = (kb_start, kb_total): a K window of an afrag tiled kstore, k_blocks (config) 256-wide blocks from kb_start of
 # kb_total-block weight rows and kb_total * 256-column activations (the NPU split's K remainder, emit_prefill_pp).
 KWIN = None
+# NPUADD (kres in a KWIN, the NPU FFN block's GPU down): the epilogue also adds the NPU's down partials, the bf16 C of
+# gen_npu_gemm calls of one replay group (bindings npuc, done, ready, status after output), once the NPU job is done
+# (gen_npu_unpack.WAIT_LOOP: done reaches ready, bounded; status set on a timeout or a failed job).
+# dict(rows=output rows per call, tn=GN.TN, np=GN.NP, call=C elements per call, calls=calls per K part, parts=K parts):
+# the element of (token t, row n) in part p is (p * calls + n / rows) * call + gen_npu_unpack c_lane(n % rows) + c_tok(t).
+NPUADD = None
 
 
 def dq_wgs(m_tiles, k_blocks, t, fmt):
@@ -311,7 +317,8 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     ff = kind == "ffn"
     assert ff == t.ffn, "kind ffn needs Tile.ffn"
     bufs = (["weight"] + F["extra"] + (Fu["extra"] if MX else []) + ["input"] + (["gate"] if sw else []) + (["resid"] if kr else [])
-            + ["wstage", "ostage", "output"] + (["gate_out"] if qg else []))
+            + ["wstage", "ostage", "output"] + (["gate_out"] if qg else []) + (["npuc", "done", "ready", "status"] if NPUADD else []))
+    assert not NPUADD or (kr and KWIN and t.tallepi and t.ecoal and not masked and not t.respre)
     sym = (f"yah_ffn_gemm_{fmt}" + (f"_{fmt_up}" if MX else "") + ("_swiglu" if sw else "") + ("_kres" if kr else "") + ("_kqg" if qg else "")
            + ("_ffn" if ff else ""))
     if dq:
@@ -405,7 +412,7 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
         e(f"  %o_rows = index.constant {OSTRIDE} : index")
     dq_chunk = kind == "dequant" and DQ_BFP is not None and len(DQ_BFP) == 4
     if KWIN:
-        assert kind == "kstore" and AFRAG and t.atiled and F.get("kdiv", 1) == 1 and not (MX or OSTRIDE)
+        assert kind in ("kstore", "kres") and AFRAG and t.atiled and F.get("kdiv", 1) == 1 and not (MX or OSTRIDE)
     kwin = KWIN or (DQ_BFP[2:] if dq_chunk else None)
     if kwin:   # weight rows keep their full length; the window starts kb_start blocks in
         assert F.get("kdiv", 1) == 1
@@ -1242,6 +1249,89 @@ def _gen(fmt, kind, t, masked, fmt_up=None):
     return "\n".join(L) + "\n"
 
 
+def npu_wait(e):
+    """NPUADD: the views of the NPU's C and flag words, then gen_npu_unpack.WAIT_LOOP (its values prefixed nw_)."""
+    import re
+    import gen_npu_unpack as GU
+    A = NPUADD
+    nw = A["parts"] * A["calls"] * A["call"] // 2
+    e(f"  %nw_cn = index.constant {nw} : index")
+    e("  %npc_v = buffer.view %npuc_na[%base] : buffer -> view<[%nw_cn]xi32>")
+    e(f"  %nw_wlast = index.constant {nw - 2} : index")
+    e("  %nw_dv = buffer.view %done_na[%base] : buffer -> view<1xi32>")
+    e("  %nw_rv = buffer.view %ready_na[%base] : buffer -> view<1xi32>")
+    e("  %nw_sv = buffer.view %status_na[%base] : buffer -> view<1xi32>")
+    e("  %nw_c0 = index.constant 0 : index")
+    e("  %nw_want = view.atomic.load %nw_rv[%nw_c0] {ordering = acquire, scope = system} : view<1xi32> -> i32")
+    e("  %nw_zero = scalar.constant 0 : i32")
+    e("  %nw_one = scalar.constant 1 : i32")
+    e(f"  %nw_limit = scalar.constant {GU.FLAG_WAIT_POLLS} : i32")
+    e(re.sub(r"%(\w+)", r"%nw_\1", GU.WAIT_LOOP))
+    e("  %nw_c16i = scalar.constant 16 : i32")
+    e("  %nw_chii = scalar.constant -65536 : i32")
+    for nm, v in (("rows", A["rows"]), ("tn", A["tn"]), ("call", A["call"]), ("cs", A["tokens"] * A["tn"]), ("c8", 8),
+                  ("c2", 2), ("c4", 4), ("c16", 16), ("c64", 64), ("cbs", 64 * A["tn"]), ("cmp", A["np"] * 4 * 64)):
+        e(f"  %nw_{nm} = index.constant {v} : index")
+
+
+def npu_add(e, y, tok, row, val):
+    """NPUADD: val (vector<4xf32>, rows row .. row + 3 of token tok) plus the NPU's parts' values there."""
+    A = NPUADD
+    p = f"%nx{y}_"
+    e(f"  {p}call = index.div {row}, %nw_rows : index")
+    e(f"  {p}nc = index.rem {row}, %nw_rows : index")
+    e(f"  {p}col = index.div {p}nc, %nw_tn : index")
+    e(f"  {p}q = index.rem {p}nc, %nw_tn : index")
+    e(f"  {p}j = index.div {p}q, %nw_c8 : index")
+    e(f"  {p}jj = index.rem {p}q, %nw_c8 : index")
+    e(f"  {p}npi = index.div {p}j, %nw_c2 : index")
+    e(f"  {p}nh = index.rem {p}j, %nw_c2 : index")
+    e(f"  {p}a0 = index.mul {p}call, %nw_call : index")
+    e(f"  {p}a1 = index.mul {p}col, %nw_cs : index")
+    e(f"  {p}a2 = index.mul {p}npi, %nw_c4 : index")
+    e(f"  {p}a3 = index.add {p}a2, {p}nh : index")
+    e(f"  {p}a4 = index.mul {p}a3, %nw_c64 : index")
+    e(f"  {p}blk = index.div {tok}, %nw_c64 : index")
+    e(f"  {p}r = index.rem {tok}, %nw_c64 : index")
+    e(f"  {p}mp = index.div {p}r, %nw_c16 : index")
+    e(f"  {p}r16 = index.rem {p}r, %nw_c16 : index")
+    e(f"  {p}mh = index.div {p}r16, %nw_c8 : index")
+    e(f"  {p}rw = index.rem {p}r, %nw_c8 : index")
+    e(f"  {p}b0 = index.mul {p}blk, %nw_cbs : index")
+    e(f"  {p}b1 = index.mul {p}mp, %nw_cmp : index")
+    e(f"  {p}b2 = index.mul {p}mh, %nw_c2 : index")
+    e(f"  {p}b3 = index.mul {p}b2, %nw_c64 : index")
+    e(f"  {p}b4 = index.mul {p}rw, %nw_c8 : index")
+    acc = None
+    for i, nm in enumerate(("a0", "a1", "a4", "jj", "b0", "b1", "b3", "b4")):
+        if acc is None:
+            acc = f"{p}{nm}"
+            continue
+        e(f"  {p}s{i} = index.add {acc}, {p}{nm} : index")
+        acc = f"{p}s{i}"
+    e(f"  {p}w0 = index.div {acc}, %nw_c2 : index")
+    for pt in range(A["parts"]):
+        w = f"{p}w0"
+        if pt:
+            e(f"  {p}po{pt} = index.constant {pt * A['calls'] * A['call'] // 2} : index")
+            e(f"  {p}w{pt}u = index.add {p}w0, {p}po{pt} : index")
+            w = f"{p}w{pt}u"
+        e(f"  {p}wc{pt} = index.min {w}, %nw_wlast : index")   # always in range; for the bound proof
+        e(f"  {p}v{pt} = vector.load %npc_v[{p}wc{pt}] : view<[%nw_cn]xi32> -> vector<2xi32>")
+        fs = []
+        for wd in range(2):
+            e(f"  {p}e{pt}_{wd} = vector.extract {p}v{pt}[{wd}] : vector<2xi32> -> i32")
+            e(f"  {p}l{pt}_{wd} = scalar.shli {p}e{pt}_{wd}, %nw_c16i : i32")
+            e(f"  {p}h{pt}_{wd} = scalar.andi {p}e{pt}_{wd}, %nw_chii : i32")
+            for hl in ("l", "h"):
+                e(f"  {p}f{hl}{pt}_{wd} = scalar.bitcast {p}{hl}{pt}_{wd} : i32 to f32")
+                fs.append(f"{p}f{hl}{pt}_{wd}")
+        e(f"  {p}nv{pt} = vector.from_elements {', '.join(fs)} : vector<4xf32>")
+        e(f"  {p}sum{pt} = vector.addf {val}, {p}nv{pt} : vector<4xf32>")
+        val = f"{p}sum{pt}"
+    return val
+
+
 # swiglu through lds_epilogue: the gate loads of a 16-token column are issued this many columns before it is processed,
 # so their memory latency overlaps the column in between (0: each column loads its gate just before use). Measured
 # 2026-10-03: 1 is -1.2% IQ3_S / -0.7% IQ3_XXS swiglu cycles; 2 and 4 are slower (the epilogue is mostly a gate-stream
@@ -1424,6 +1514,8 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
         e(f"  %out_flat = buffer.view %output_na[%base] : buffer -> view<[%out_total]x{'f16' if OUT16 and not kr else 'f32'}>")
     if kr:
         e("  %res_flat = buffer.view %resid_na[%base] : buffer -> view<[%out_total]xf32>")
+    if NPUADD:
+        npu_wait(e)
     if masked:
         e("  %et_tok_last = index.sub %tokens, %c1 : index")
     e("  %et_lane = index.rem %tid, %c32 : index")
@@ -1536,6 +1628,9 @@ def _lds_epilogue_tall(e, t, kr, V8, masked=False, sr=16, qg=False):
                     e(f"  %et_rf{y} = vector.load %res_flat[%et_oi{y}] : view<[%out_total]xf32> -> vector<4xf32>")
                     e(f"  %et_rs{y} = vector.addf %et_rf{y}, %et_v{y} : vector<4xf32>")
                     val = f"%et_rs{y}"
+                if NPUADD:   # access q: token + tpa q (coalesced), rows et_row{g} .. + 3
+                    e(f"  %nt{y} = index.add {tka}, %et_qk{y} : index")
+                    val = npu_add(e, y, f"%nt{y}", f"%et_row{g}", val)
                 if qg:
                     # always in range; the clamp states it for the bound proof
                     e(f"  %qg_oi{y} = index.min %et_oi{y}, %qg_last4 : index")

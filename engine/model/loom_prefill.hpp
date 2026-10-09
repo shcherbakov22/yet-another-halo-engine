@@ -132,7 +132,7 @@ class LoomPrefill {
     for (const auto& [site, rows] : npu_rows_)
       if (NpuRem(site)) rem = std::max<std::size_t>(rem, std::size_t{B_} * rows * 4);
     if (rem) npurem_ = &Alloc(rem);
-    if (ffnblk_) ffnrem_ = &Alloc(std::size_t{B_} * kHidden * 4);
+    if (ffnblk_ && geom_.count("npu_unpack_ffnblk.hal")) ffnrem_ = &Alloc(std::size_t{B_} * kHidden * 4);   // (npuffnrem)
     // Bind every NPU call of a full chunk now (a pass of the layers that dispatches nothing): a first bind loads the
     // image's storage and patches it, milliseconds per call.
     LoomBuffer *h = hidden_, *h2 = hidden2_;
@@ -938,7 +938,10 @@ class LoomPrefill {
     const std::string gs = pair ? NpuHal(KstoreHal(pre + "ffn_gate.weight", true)) : "";
     const std::string us = pair ? NpuHal(SwigluHal(pre + "ffn_up.weight", true, true)) : "";
     const std::uint32_t kbw = static_cast<std::uint32_t>(td->dims[0] - F) / 256;
-    const std::string rem = "npuffnrem_" + std::string(fd.name) + "_" + std::to_string(kbw) + ".hal";
+    // the GPU's down over its features: f32 for npu_unpack_ffnblk, or (fused sets) the residual GEMM adding the NPU's
+    const std::string tail = std::string(fd.name) + "_" + std::to_string(kbw) + ".hal";
+    const bool res = geom_.count("npuffnres_" + tail) != 0;
+    const std::string rem = (res ? "npuffnres_" : "npuffnrem_") + tail;
     // gate / up write H in the down decoder's k-block order (emit_prefill_pp FFNBLK_HORD: IQ4_XS's P4, Q4_K's; fused sets
     // P4 but Q4_K's)
     const bool q4k = std::strcmp(fd.name, "q4k") == 0;
@@ -1036,6 +1039,23 @@ class LoomPrefill {
       const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(M) * 2}, g);
       Dispatch(Exe(sh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), (M - F) / 16 / GeomOf(sh).rowgrp, tt, 1,
                32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    }
+    if (res) {   // down over them as the residual GEMM, its epilogue adding the NPU's partials once the job is done
+      const Geom& gr = geom_.at(rem);
+      auto r = GemmWeights(*td, fd);
+      for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{ffnup_, hidden_, wstage_, ostage_, hidden2_})
+        r.push_back(Ref(*x));
+      const std::size_t out = r.size() - 1;
+      r.push_back({npu_->C().handle, doff, parts.size() * calls * cp});
+      if (!npu_planning_) {
+        const NpuWait w = NpuJoinBegin();
+        r.insert(r.end(), w.words.begin(), w.words.end());
+        Dispatch(Exe(rem), ("yah_ffn_gemm_" + std::string(fd.name) + "_kres").c_str(), MTiles(*td) / gr.rowgrp, gr.tt,
+                 1, 32, 1, 1, r, (std::uint64_t{1} << out) | (std::uint64_t{1} << (r.size() - 1)), &w.npu_side);
+        NpuJoinEnd();
+      }
+      std::swap(hidden_, hidden2_);
+      return true;
     }
     // down over them: f32 [tokens][5120]
     const Geom& gr = geom_.at(rem);
@@ -1543,6 +1563,17 @@ class LoomPrefill {
   // Queue the GPU work that runs beside the last enqueued job before this.
   void NpuJoin() {
     if (npu_planning_) return;
+    const NpuWait w = NpuJoinBegin();
+    Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1, w.words, 4, &w.npu_side);
+    NpuJoinEnd();
+  }
+  // NpuJoin's parts around the dispatch that waits for the last enqueued job (yah_npu_flag_wait, or a GEMM whose
+  // epilogue waits: gen_gemm_tile.NPUADD): the next job's weight decodes, then what that dispatch binds (the job's flag
+  // words done, ready, status; status is written) and orders (the NPU-side buffers, as also-writes).
+  struct NpuWait {
+    std::vector<hrx_buffer_ref_t> words, npu_side;
+  };
+  NpuWait NpuJoinBegin() {
     // the next job's weight decodes run beside this job's GPU work
     predecoded_.clear();
     const auto job = static_cast<std::uint32_t>(flagged_.size() - 1);   // this chunk's last job (NpuEnqueue)
@@ -1552,11 +1583,12 @@ class LoomPrefill {
         predecoded_.push_back(d);
       }
     const NpuSplit::Queued& j = flagged_.back();
-    std::vector<hrx_buffer_ref_t> npu_side{Ref(npu_->A())};
-    if (!npu_dcol_) npu_side.push_back(WSlot(job));
-    npu_side.push_back(Ref(npu_->C()));
-    Dispatch(Exe("npu_flag_wait.hal"), "yah_npu_flag_wait", 1, 1, 1, 32, 1, 1,
-             {FlagWord(j.words.done), FlagWord(j.words.ready), FlagWord(NpuSplit::kFlagStatus)}, 4, &npu_side);
+    NpuWait w{{FlagWord(j.words.done), FlagWord(j.words.ready), FlagWord(NpuSplit::kFlagStatus)}, {Ref(npu_->A())}};
+    if (!npu_dcol_) w.npu_side.push_back(WSlot(job));
+    w.npu_side.push_back(Ref(npu_->C()));
+    return w;
+  }
+  void NpuJoinEnd() {
     // decoder-column sets count jobs per chunk: the joined jobs' words read zero again before the next chunk reuses them
     if (npu_dcol_)
       for (; npu_cleared_ < flagged_.size(); ++npu_cleared_)

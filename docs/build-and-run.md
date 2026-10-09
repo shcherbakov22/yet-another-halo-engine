@@ -64,7 +64,7 @@ Emitters run on the CPU and take a few minutes. Paths below are relative to `eng
 | prefill with kv8a16 / kv4a16 | add `YAH_KV=kv8` or `YAH_KV=kv4` (or mixed `k8v4`, `k4v8`; `k8` / `v4` alone quantize one side, prefill only) |
 | prefill with the NPU column split | add `YAH_NPU_SPLIT=qkv=4480,gate=2560,q=5120,out=2560,down=2560,ffn=7680` (NPU rows per site, multiples of 640, q of 2560; any subset; see `emit_prefill_pp.npu_split`); run `loom_forward_pp` with `YAH_NPU=1` (full 2048-token chunks; AC power and `power_dpm_force_performance_level=high`, see results.md) |
 | prefill with the NPU FFN block | `YAH_NPU_DCOL=1 YAH_NPU_FFNBLK=7168` (with `YAH_NPU_SPLIT` sites other than ffn; architecture.md) |
-| prefill with fused NPU decode | `YAH_NPU_FUSE=1` with `YAH_NPU_SPLIT` (multiples of 640): 8 GEMM columns, each core decodes its own raw IQ4_XS rows; other formats stay on the GPU for now; add `YAH_NPU_FFNBLK=<F>` (F a multiple of 1024) for the NPU FFN block on layers whose gate and up share a format and down has one of IQ4_XS, IQ3_XXS, IQ3_S |
+| prefill with fused NPU decode | `YAH_NPU_FUSE=1` with `YAH_NPU_SPLIT` (multiples of 640): 8 GEMM columns, each core decodes its own raw IQ4_XS rows; other formats stay on the GPU for now; add `YAH_NPU_FFNBLK=<F>` (F a multiple of 1024) for the NPU FFN block on layers whose gate and up share a format and down has one of IQ4_XS, IQ3_XXS, IQ3_S (2048 balances today); the GPU's down adds the NPU's partials in its residual epilogue, `YAH_NPU_FFNRES=0` adds them in a separate pass after the NPU job instead |
 | decode | `python3 tools/emit_decode.py <gguf> <dir> <max_context>` (multiple of 256, default 4096) |
 | decode after a prefill | same, with `max_context` = the prefill set's context and the same `YAH_KV` |
 
