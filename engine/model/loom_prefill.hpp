@@ -103,7 +103,9 @@ class LoomPrefill {
     p.w_bytes *= 2;   // two slots: a job's weights are decoded while the previous job runs (NpuDecode)
     if (FfnBlkF()) {   // the FFN block: gate / up's activations; H and down's partials in C
       p.a_bytes = std::max(p.a_bytes, NpuK(5120).a);
-      p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + 2 * kFfnBlkCalls * NpuBytesOf("npubytes_ffndn4").c);
+      const auto parts = FfnBlkParts(FfnBlkF());
+      p.c_bytes = std::max(p.c_bytes, FfnBlkDown() + parts.size() * FfnBlkCalls() *
+                                                         NpuBytesOf("npubytes_ffndn" + std::to_string(parts[0].second)).c);
     }
     p.dcol = geom_.count("npudcol") != 0;
     if (p.dcol) {
@@ -875,16 +877,37 @@ class LoomPrefill {
   }
 
   // The NPU's FFN block (dispatch.txt "npuffnblk <F>", emit_prefill_pp NPU_FFNBLK): the NPU owns the FFN's last F
-  // features. Its gate / up calls (npu_ffnsw_<fmt>.xdna; call j's column c takes features 8 (128 c + 4 j) + [0, 32) of
-  // F, gate rows and the up rows one gate tensor further, straight from the model) write H = bfp16(silu(gate) * up)
-  // into C, [M block][pass][16-token slab][128 k-blocks]; its down calls (npu_ffndn<4|3>_<fmt>.xdna: passes 0-3 and
-  // 4-6 of F, 560 rows each, the 10th overlapping the 9th) read H and write their partials after it. Each is a job of one
-  // image family. The GPU runs the other features (the fused ffn's split) and down over them (npuffnrem_<fmt>.hal, f32),
-  // then npu_unpack_ffnblk.hal writes hidden + that + the partials. Returns false if the layer does not qualify.
-  static constexpr std::uint32_t kFfnBlkCalls = 10;   // down calls per K part: ceil(5120 / 560)
+  // features. Its gate / up calls (npu_ffnsw_<fmt>.xdna; decoder-column sets: 224 features a call, call j's column c
+  // takes features 8 (128 c + 4 j) + [0, 32) of F; fused sets: 256, column c features 256 j + 32 c + [0, 32); gate rows
+  // and the up rows one gate tensor further, straight from the model) write H = bfp16(silu(gate) * up) into C, [M block]
+  // [pass][16-token slab][128 k-blocks]; its down calls (npu_ffndn<passes>_<fmt>.xdna, per K part of F (FfnBlkParts),
+  // 560 / 640 rows each, a last 560-row call overlapping the one before) read H and write their partials after it. Each
+  // is a job of one image family. The GPU runs the other features (the fused ffn's split) and down over them
+  // (npuffnrem_<fmt>.hal, f32), then npu_unpack_ffnblk.hal writes hidden + that + the partials. Returns false if the
+  // layer does not qualify.
   std::uint32_t FfnBlkF() const {
     const auto it = geom_.find("npuffnblk");
     return it == geom_.end() ? 0 : it->second.tokens;
+  }
+  // dispatch.txt "npuffnblk <F> <gate / up features a call> <down rows a call>" (0: a decoder-column set's 224, 560)
+  bool FfnBlkFused() const { return geom_.at("npuffnblk").rowgrp == 256; }
+  std::uint32_t FfnBlkRows() const { return geom_.at("npuffnblk").tt ? geom_.at("npuffnblk").tt : 560; }
+  std::uint32_t FfnBlkCalls() const { return (kHidden + FfnBlkRows() - 1) / FfnBlkRows(); }   // down calls per K part
+  // (first pass, passes) of down's K parts over F features: the fewest parts of at most 5 passes (a fused panel holds a
+  // part), sizes balanced (emit_prefill_pp ffnblk_parts)
+  static std::vector<std::pair<std::uint32_t, std::uint32_t>> FfnBlkParts(std::uint32_t F) {
+    const std::uint32_t P = F / 1024, n = (P + 4) / 5;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> parts;
+    for (std::uint32_t i = 0, p0 = 0; i < n; ++i) {
+      parts.push_back({p0, P / n + (i < P % n)});
+      p0 += parts.back().second;
+    }
+    return parts;
+  }
+  // An image's decoder swap image, the image itself where there is none (fused sets)
+  static std::string SwapOf(const std::string& image) {
+    const std::string swap = image + ".swap.xdna";
+    return ::access(swap.c_str(), R_OK) == 0 ? swap : image + ".xdna";
   }
   // H's bytes in C (from 0), then down's partials from FfnBlkDown().
   std::size_t FfnBlkH() const { return std::size_t{B_ / 64} * (FfnBlkF() / 1024) * 4 * 128 * 144; }
@@ -921,13 +944,17 @@ class LoomPrefill {
     const std::string hord = std::strcmp(fd.name, "iq4xs") == 0 ? "_p4" : q4k ? "_q4k" : "";
     const std::string sw = dir_ + (pair ? "/npu_ffnsp_" + std::string(f.name) + "_" + fu.name : "/npu_ffnsw_" + std::string(f.name)) +
                            hord;
-    const std::string dn[2] = {dir_ + (pair ? "/npu_ffndn3_" : "/npu_ffndn4_") + fd.name, dir_ + "/npu_ffndn3_" + fd.name};
+    const auto parts = FfnBlkParts(F);
+    std::vector<std::string> dn;
+    for (const auto& [p0, passes] : parts) {
+      dn.push_back(dir_ + "/npu_ffndn" + std::to_string(passes) + "_" + fd.name);
+      if (::access((dn.back() + ".xdna").c_str(), R_OK)) return false;
+    }
     if ((pair ? gs.empty() || us.empty() || !Af("gemm_kstore", pre + "ffn_gate.weight") ||
                     !Af("gemm_swiglu", pre + "ffn_up.weight")
               : sh.empty()) ||
         !geom_.count(rem) || ::access((dir_ + "/norm_t_bfp_g1.hal").c_str(), R_OK) ||
-        ::access((sw + ".xdna").c_str(), R_OK) || ::access((dn[0] + ".xdna").c_str(), R_OK) ||
-        ::access((dn[1] + ".xdna").c_str(), R_OK))
+        ::access((sw + ".xdna").c_str(), R_OK))
       return false;
     // the norm also writes gate / up's activations (one replay group: that stream layout)
     RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, "ffnblk");
@@ -948,43 +975,54 @@ class LoomPrefill {
       }
       npu_->RegisterRaw(base + td->offset, std::min<std::size_t>(td->bytes + 4096, end - td->offset));
     }
-    std::vector<std::uint32_t> csw, cdn[2];
+    std::vector<std::uint32_t> csw;
+    std::vector<std::vector<std::uint32_t>> cdn(parts.size());
     if (pair) {   // 32 calls of 192 features: call j's up column u writes passes 2 u + j / 16, k-blocks 8 (j % 16) ..
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsp");
       for (std::uint32_t j = 0; j < F / 192; ++j) {
         const std::size_t r0 = f0 + 1024 * (j / 16) + 64 * (j % 16);
         csw.push_back(npu_->BindRawPair(
-            sw + ".xdna", sw + ".swap.xdna", 16 + 8 * DecoderId(f.name) + DecoderId(fu.name), ag,
+            sw + ".xdna", SwapOf(sw), 16 + 8 * DecoderId(f.name) + DecoderId(fu.name), ag,
             base + tg->offset + r0 * rb, (2 * 2048 + 63) * rb + 16 * blk + kDcolRecordRow,
             base + tu->offset + r0 * rbu, (2 * 2048 + 63) * rbu + 16 * blku + kDcolRecordRow,
             {(j / 16) * 4 * 128 * 144 + (j % 16) * 8 * 144, bs.c}, 3 * (B_ / 64) * 4 * 1152,
             "ffnsp_" + std::string(f.name) + "_" + fu.name + hord));
       }
+    } else if (FfnBlkFused()) {   // F / 256 calls: call j's column c takes features 256 j + 32 c + [0, 32), its records
+                                  // at H k-blocks 32 j + 4 c .. (gen_npu_gemm swcol 32)
+      const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
+      for (std::uint32_t j = 0; j < F / 256; ++j)
+        csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), DecoderId(f.name), ag,
+                                    base + tg->offset + (f0 + 256 * j) * rb, dgu + 255 * rb + 16 * blk + kDcolRecordRow,
+                                    {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, "ffnsw" + hord));
     } else {   // 32 calls of 224 features: call j's column c takes features 8 (128 c + 4 j) + [0, 32); Q4_K's order
                // (gen_npu_gemm hord): its two 16-row slabs 32 rows apart from 64 (j / 2) + 16 (j % 2)
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
       for (std::uint32_t j = 0; j < F / 224; ++j)
-        csw.push_back(npu_->BindRaw(sw + ".xdna", sw + ".swap.xdna", DecoderId(f.name), ag,
+        csw.push_back(npu_->BindRaw(sw + ".xdna", SwapOf(sw), DecoderId(f.name), ag,
                                     base + tg->offset + (f0 + (q4k ? 64 * (j / 2) + 16 * (j % 2) : 32 * j)) * rb,
                                     dgu + (6 * 1024 + (q4k ? 47 : 31)) * rb + 16 * blk + kDcolRecordRow, {4 * j * 144, bs.c},
                                     "ffnsw" + hord));
     }
-    // down: per K part (same format: passes 0-3, 4-6 of F; pairs: 0-2, 3-5) ten 560-row calls, the last at rows 4560..
-    const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf("npubytes_ffndn3").c;
-    const std::uint32_t p0[2] = {0, pair ? 3u : 4u};
-    for (int ci = 0; ci < 2; ++ci) {
-      const NpuBytes bd = NpuBytesOf(ci || pair ? "npubytes_ffndn3" : "npubytes_ffndn4");
-      for (std::uint32_t r = 0; r < kFfnBlkCalls; ++r) {
-        const std::size_t r0 = std::min<std::size_t>(r * 560, td->dims[1] - 560), k0 = f0 / 256 + 4 * p0[ci];
-        cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", dn[ci] + ".swap.xdna", DecoderId(fd.name),
-                                        {std::size_t{p0[ci]} * 4 * 128 * 144, bd.a, true},
-                                        base + td->offset + r0 * rbd + k0 * blkd, 559 * rbd + 16 * blkd + kDcolRecordRow,
-                                        {doff + (ci * kFfnBlkCalls + r) * cp, cp}, ci || pair ? "ffndn3" : "ffndn4"));
+    // down: per K part, FfnBlkCalls() calls of FfnBlkRows() rows (a last one ending at the last row)
+    const std::uint32_t rows = FfnBlkRows(), calls = FfnBlkCalls();
+    const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf("npubytes_ffndn" + std::to_string(parts[0].second)).c;
+    for (std::size_t ci = 0; ci < parts.size(); ++ci) {
+      const auto [p0, passes] = parts[ci];
+      const std::string fam = "ffndn" + std::to_string(passes);
+      const NpuBytes bd = NpuBytesOf("npubytes_" + fam);
+      if (bd.c != cp) throw LoomError("prefill: the FFN block's down parts differ in C bytes");
+      for (std::uint32_t r = 0; r < calls; ++r) {
+        const std::size_t r0 = std::min<std::size_t>(r * rows, td->dims[1] - rows), k0 = f0 / 256 + 4 * p0;
+        cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", SwapOf(dn[ci]), DecoderId(fd.name),
+                                        {std::size_t{p0} * 4 * 128 * 144, bd.a, true},
+                                        base + td->offset + r0 * rbd + k0 * blkd,
+                                        (rows - 1) * rbd + 16 * blkd + kDcolRecordRow,
+                                        {doff + (ci * calls + r) * cp, cp}, fam));
       }
     }
     NpuEnqueue(std::move(csw), pair ? "ffnsp" : "ffnsw");
-    NpuEnqueue(std::move(cdn[0]), pair ? "ffndn3" : "ffndn4");
-    NpuEnqueue(std::move(cdn[1]), "ffndn3");
+    for (std::size_t ci = 0; ci < parts.size(); ++ci) NpuEnqueue(std::move(cdn[ci]), "ffndn" + std::to_string(parts[ci].second));
     if (pair) {
       RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, true, gs, F);
       RunSwigluSplit(pre + "ffn_up.weight", true, us, F);
@@ -1006,7 +1044,7 @@ class LoomPrefill {
     Dispatch(Exe(rem), ("yah_ffn_gemm_" + std::string(fd.name)).c_str(), MTiles(*td) / gr.rowgrp, gr.tt, 1, 32, 1, 1, r,
              std::uint64_t{1} << (r.size() - 1));
     NpuJoin();
-    NpuUnpack("npu_unpack_ffnblk.hal", {doff, 2 * kFfnBlkCalls * cp},
+    NpuUnpack("npu_unpack_ffnblk.hal", {doff, parts.size() * calls * cp},
               {Ref(*hidden_), {ffnrem_->handle, 0, std::size_t{B_} * kHidden * 4}, Ref(*hidden2_)}, 8);
     std::swap(hidden_, hidden2_);
     return true;

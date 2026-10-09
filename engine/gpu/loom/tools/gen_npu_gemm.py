@@ -134,7 +134,7 @@ def loom_env(cfg, swap=False):
         env["LOOM_EXP_PANEL_INTERLEAVE"] = str(NP)   # together; uniform slots of KS (36, 36, 36, 20) would not fit)
     if not groups(cfg):
         env["LOOM_EXP_PANEL_GROUPS"] = str(cfg.passes)
-        if cfg.dcol == 2:   # one group, still streamed from the decoder column (HRX patch 0019)
+        if cfg.dcol == 2 or cfg.fuse == 2:   # one group, still streamed (HRX patch 0019): the panel's fill
             env["LOOM_EXP_PANEL_STREAM_SINGLE"] = "1"
     if cfg.swiglu:
         env["LOOM_EXP_LS_SEND_PITCH"] = str(SW_PITCH)
@@ -142,7 +142,7 @@ def loom_env(cfg, swap=False):
         env["LOOM_EXP_PANEL_GROUPS"] = str(cfg.passes)
     if cfg.ufmt:   # 6 GEMM columns + the fill column: admitted on the engine's 8-column context
         env["LOOM_EXP_PARTITION_COLUMNS"] = "8"
-    if cfg.dcol == 2 and not swap:   # images of other layouts share the context: their routes must not outlive them
+    if (cfg.dcol == 2 or cfg.fuse == 2) and not swap:   # other layouts share the context: routes must not outlive them
         env["LOOM_EXP_ROUTE_RESET"] = "1"
     if swap:
         env["LOOM_EXP_SETUP_ONLY"] = "1"
@@ -204,6 +204,17 @@ def np_override(n, pair=False):
         NP, TN, SW_REC, SW_PITCH, SW_SLOT = saved
 
 
+def h_col_stride(cfg):
+    """swiglu: bytes between columns' records in H ([M block][pass][slab][128 k-blocks]): swcol features apart, a
+    pass per 1024 (column c writes pass c) or swcol / 8 k-blocks within a pass (the columns' records side by side in a
+    call's window; swcol 32: 8 columns = 256 features, call j at feature 256 j)."""
+    if cfg.swcol >= 1024:
+        assert cfg.swcol % 1024 == 0 and cfg.hpass >= cfg.cols * cfg.swcol // 1024
+        return cfg.swcol // 1024 * MP * 128 * 144
+    assert 1024 % (cfg.swcol * cfg.cols) == 0 and cfg.swcol == 8 * NP
+    return cfg.swcol // 8 * 144
+
+
 def slab(ks):
     return (144 * ks + 63) // 64 * 64
 
@@ -217,9 +228,8 @@ def stream_bytes(cfg):
     w = cfg.cols * sum(cfg.passes * NP * slab(k) for k in cfg.ks)
     if cfg.swiglu:   # the receiver's extent in H: the last 16-token row's columns
         # the last column's (pass's) last record in H (column pairs: up column u writes passes 2 u, 2 u + 1)
-        last = 2 * (cfg.cols // 2 - 1) if cfg.ufmt else cfg.cols - 1
-        return a, w, ((cfg.nb - 1) * cfg.hpass * MP * 128 * 144 + (MP - 1) * 128 * 144
-                      + last * MP * 128 * 144 + SW_REC)
+        last = 2 * (cfg.cols // 2 - 1) * MP * 128 * 144 if cfg.ufmt else (cfg.cols - 1) * h_col_stride(cfg)
+        return a, w, ((cfg.nb - 1) * cfg.hpass * MP * 128 * 144 + (MP - 1) * 128 * 144 + last + SW_REC)
     return a, w, max(1, len(groups(cfg))) * cfg.cols * cfg.nb * MP * NP * 2 * 256
 
 
@@ -293,9 +303,8 @@ def array_program(L, cfg):
             e(f"  %j_all = receiver %jb, 0 : reg<aie2p.array.receiver : tile<{h}x{nb * MP}x{rec}xi32>>")
             e(f"  %nhalf = constant.u32 {h} : reg<aie2p.array.scalar : index>")
         else:
-            assert cols == cfg.hpass
             e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nb}x{MP}x{rec}xi32, "
-              f"#encoding.layout.strided<strides=[{MP * 128 * 36}, {cfg.hpass * MP * 128 * 36}, {128 * 36}, 1]>>>")
+              f"#encoding.layout.strided<strides=[{h_col_stride(cfg) // 4}, {cfg.hpass * MP * 128 * 36}, {128 * 36}, 1]>>>")
         stype = f"tile<{rec}xi32>"
     elif cfg.ofeat:
         # a segment is [sub-tile 5][16 tokens][16 f32] (the tail's convert_f32)
@@ -601,7 +610,9 @@ def fuse_record(cfg, cov):
     every replay group's fill."""
     unit = NP * sum(slab(cfg.ks[j]) for j in cov) // 4   # (fuse 1: cov in row order)
     if cfg.fuse == 2:   # whole 64-byte copies, whole records per slab
-        fw = max(w for w in range(16, FUSE_REC + 1, 16) if all(sw % w == 0 for _, sw in fuse_pieces(cfg, cov)))
+        # (swiglu: not C's record size, LOOM_EXP_LS_SEND_PITCH_RECORD would pitch the egress ring like C's)
+        fw = max(w for w in range(16, FUSE_REC + 1, 16) if all(sw % w == 0 for _, sw in fuse_pieces(cfg, cov))
+                 and not (cfg.swiglu and 4 * w == SW_REC))
         return fw, cfg.passes * unit // fw
     g = math.gcd(*(len(p) * unit for p in fuse_groups(cfg)))
     fw = max(w for w in range(4, FUSE_REC + 1, 4) if g % w == 0)
@@ -659,8 +670,13 @@ def fuse_channels(e, cfg, panel):
     e(f"  %fun = constant.u32 {units} : reg<aie2p.array.scalar : index>")
     if cfg.fuse == 2:   # raw rows [N][kraw / 256][136]: per column, per (pass, slab) unit [16 rows][4 super-blocks]
         RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * FUSE_BLK // 4   # row stride in words
-        e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x{NP}x16x{uw // 16}xi32, "
-          f"#encoding.layout.strided<strides=[{FUSE_SB * FUSE_BLK // 4}, {16 * RS}, {RS}, 1]>>>")
+        if cfg.swiglu:   # column c: gate rows swcol c .. (its NP / 2 slabs), then the same up rows dgu bytes on
+            assert cfg.dgu % 4 == 0 and NP % 2 == 0 and cfg.hord in ("", "P4")
+            e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x2x{NP // 2}x16x{uw // 16}xi32, "
+              f"#encoding.layout.strided<strides=[{FUSE_SB * FUSE_BLK // 4}, {cfg.dgu // 4}, {16 * RS}, {RS}, 1]>>>")
+        else:
+            e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x{NP}x16x{uw // 16}xi32, "
+              f"#encoding.layout.strided<strides=[{FUSE_SB * FUSE_BLK // 4}, {16 * RS}, {RS}, 1]>>>")
     else:
         e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cols}x{units}x{uw}xi32>>")
     covs = list(fuse_cover(cfg, -1).values())   # an ordinary column's covers, then any other column's
@@ -671,8 +687,8 @@ def fuse_channels(e, cfg, panel):
         e(f"  %fdn{tag(cov)} = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
         e(f"  %fd_all{tag(cov)} = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{rows * cols}x{nrec}x{fw}xi32>>")
     for c in range(cols):
-        if cfg.fuse == 2:   # column c: rows TN c ..
-            e(f"  %fro{c} = constant.u64 {c * TN * RS * 4} : reg<aie2p.array.offset : offset>")
+        if cfg.fuse == 2:   # column c: rows TN c .. (swiglu: gate rows swcol c ..)
+            e(f"  %fro{c} = constant.u64 {c * (cfg.swcol if cfg.swiglu else TN) * RS * 4} : reg<aie2p.array.offset : offset>")
             e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
         else:
             e(f"  %fru{c} = partition.sender %fru_all, %origin, %n{c}, %ncols : reg<aie2p.array.sender : tile<{uw}xi32>>")
@@ -793,7 +809,7 @@ def fuse_prologue(L, cfg, role, ks, cov):
     pass), that group's fill: per unit, skip the rows before its own, take its slab (row rows - 2 also the last
     row's: their panel is interleaved per unit), skip the rest (pass-through). A group's fill ends on a whole record;
     the record count runs on across groups and calls (the egress ring's slot parity)."""
-    assert len(groups(cfg)) > 1, "fuse: the interleaved last-two-rows panel needs streamed replay groups"
+    assert len(groups(cfg)) > 1 or cfg.fuse == 2, "fuse 1: the interleaved last-two-rows panel needs streamed groups"
     e = L.append
     rows = len(cfg.ks)
     dp, _ = fuse_ports(role)
@@ -932,6 +948,22 @@ def fuse_dispatch(e, cfg):
 FZ_SP, FZ_IN, FZ_SP2, FZ_OUT = 0, 3264, 16384, 23616   # fuse 2 scratch (from the W ring's first 2048-aligned byte):
 # decoder storage A (SCR_B), its input record ([16][RECROW]), storage B (SCR2_B, another bank: the table's second
 # copy), its output (2 OUT_B records a super-block)
+FZ_COMPACT = 0, 28992, 21760, 3264   # (SP, IN, SP2, OUT) where a ring is too small for that (NP 4, 4 super-blocks):
+# the output right after storage A, then B (still a bank apart from A) and the input record
+
+
+def fuse_scratch(cfg, cov):
+    """fuse 2: the filler's scratch offsets (SP, IN, SP2, OUT) in its W ring (its 2 NP slabs)."""
+    D = decoder("IQ4_XS")
+    _, _, _, nsb = fuse_span(cfg, cov)
+    ring = 2 * NP * slab(cfg.ks[cov[-1]]) - 2047   # (the scratch starts at the ring's first 2048-aligned byte)
+    sp, in_, sp2, out = FZ_SP, FZ_IN, FZ_SP2, FZ_OUT
+    if out + nsb * 2 * D.OUT_B > ring:
+        sp, in_, sp2, out = FZ_COMPACT
+        assert out + nsb * 2 * D.OUT_B <= sp2 and sp2 + D.SCR2_B <= in_ and in_ + 16 * D.RECROW <= ring
+        return sp, in_, sp2, out
+    assert sp + D.SCR_B <= in_ and in_ + 16 * D.RECROW <= sp2 and sp2 + D.SCR2_B <= out
+    return sp, in_, sp2, out
 
 
 def fuse_decode(L, cfg, dp, cov):
@@ -948,8 +980,8 @@ def fuse_decode(L, cfg, dp, cov):
     W = FUSE_BLK // 4                                  # words per super-block
     pieces = fuse_pieces(cfg, cov)
     assert FUSE_SB * FUSE_BLK <= D.RECROW and FUSE_SB * W % 16 <= 8
-    assert FZ_SP + D.SCR_B <= FZ_IN and FZ_IN + 16 * D.RECROW <= FZ_SP2 and FZ_SP2 + D.SCR2_B <= FZ_OUT
-    assert FZ_OUT + nsb * 2 * D.OUT_B + 2047 <= 2 * NP * slab(cfg.ks[cov[-1]]) and fw % 16 == 0   # (filler last)
+    SP, IN, SP2, OUT = fuse_scratch(cfg, cov)
+    assert fw % 16 == 0
     e("^fzdq(%fzN: reg<aie2p.er>):")
     e("  %fzpD = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     e("  st %fzN, %fzpD, 12")                       # the units left
@@ -968,7 +1000,7 @@ def fuse_decode(L, cfg, dp, cov):
     e("  %fzwb = add.rr %fzw0l, %fzk2047")
     e("  %fzkm2048 = mov.i32 -2048")
     e("  %fzsb = and %fzwb, %fzkm2048")
-    for nm, off in (("sp", FZ_SP), ("in", FZ_IN), ("sp2", FZ_SP2), ("out", FZ_OUT)):
+    for nm, off in (("sp", SP), ("in", IN), ("sp2", SP2), ("out", OUT)):
         v = "in0" if nm == "in" and s0 else nm
         e(f"  %fzo_{v} = mov.i32 {off}")
         e(f"  %fza_{v} = add.rr %fzsb, %fzo_{v}")
@@ -1031,7 +1063,7 @@ def fuse_decode(L, cfg, dp, cov):
     e("  %fzsb2 = and %fzwb2, %fzkm2048b")
     for i, (kb0, sw) in enumerate(pieces):
         x = f"^fze{i + 1}" if i + 1 < len(pieces) else "^fzex"
-        e(f"  %fzoo{i} = mov.i32 {FZ_OUT + (kb0 - 32 * s0) * 144}")
+        e(f"  %fzoo{i} = mov.i32 {OUT + (kb0 - 32 * s0) * 144}")
         e(f"  %fzsrc{i} = add.rr %fzsb2, %fzoo{i}")
         e(f"  %fzsp{i} = mov.scalar-to-address %fzsrc{i}")
         e(f"  %fznr{i} = mov.i32 {sw // fw}")

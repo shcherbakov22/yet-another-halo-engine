@@ -663,16 +663,25 @@ NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
 # call overlapping the 9th) write their partials. The GPU runs the other features through the fused ffn's split
 # (".npu.hal", nn = F) and down over them ("npuffnrem_<fmt>.hal", a K window); npu_unpack_ffnblk.hal adds hidden + both.
 # A command switches image families at job boundaries (LoomNpu FusedCommand: the image's setup and one ungated call).
+# With YAH_NPU_FUSE (any F = 1024 n; layers whose three tensors are in FUSE_FMTS): gate / up on 8 fused columns, call j
+# (F / 256 of them) column c features 256 j + 32 c + [0, 32) of F (gen_npu_gemm swcol 32), down in 640-row calls.
+# Down's K parts (both kinds): F's passes in the fewest parts of at most 5 (a fused panel holds a part), sizes balanced.
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
 FFNBLK_FMTS = ("iq4xs", "iq3s", "iq3xxs", "q3k", "iq2xxs", "iq2xs")
 FFNBLK_DOWN_FMTS = ("iq3s", "iq3xxs", "iq4xs", "q4k")
 # the down decoders' k-block order where it is not natural: their layers' gate / up images write H in it (_p4 / _q4k)
 FFNBLK_HORD = {"iq4xs": "P4", "q4k": "Q4K"}
-FFNBLK_DOWN = ((0, 4), (4, 3))   # (first pass, passes) of down's K slice F, per call
 # Layers whose gate and up formats differ: column pairs (gen_npu_gemm ufmt; 192 features per call), F = 6144 and down in
 # two 3-pass parts.
 FFNBLK_PAIR = 6144
-FFNBLK_PAIR_DOWN = ((0, 3), (3, 3))
+
+
+def ffnblk_parts(F):
+    """(first pass, passes) of down's K parts over F features (engine/model/loom_prefill.hpp FfnBlkParts)."""
+    P = F // 1024
+    n = -(-P // 5)
+    sizes = [P // n + (i < P % n) for i in range(n)]
+    return tuple((sum(sizes[:i]), sizes[i]) for i in range(n))
 
 
 def npu_chunks(site):
@@ -727,7 +736,6 @@ def npu_split(rows, combos, B, outdir):
     assert all(v % NPU_ROWS == 0 and 0 < v < NPU_SITES[k][1] * 16 for k, v in NPU_SPLIT.items()) and B % 512 == 0
     assert NPU_SPLIT.get("q", 0) % 512 == 0, "q: whole heads"
     assert not (NPU_COLS == 7 and "q" in NPU_SPLIT), "dcol: q's whole heads are not 560-row calls"
-    assert not (NPU_FUSE and NPU_FFNBLK), "fuse: no FFN block images yet"
     GE.ACT_PERM = "p4" if NPU_DCOL else None
     out = []
     tmp = os.path.join(outdir, ".emit_tmp")
@@ -1020,17 +1028,19 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     import gen_gemm_tile as TG
     import gen_npu_unpack as GU
     F = NPU_FFNBLK
-    assert NPU_DCOL and F == 7168 and "ffn" not in NPU_SPLIT and AFRAG and B % AF_TILE["bn"] == 0
+    assert NPU_DCOL and (F == 7168 or NPU_FUSE and F % 1024 == 0) and "ffn" not in NPU_SPLIT and AFRAG
+    assert B % AF_TILE["bn"] == 0
     by = {}
     for nm, dims, ty in rows:
         p = nm.split(".")
         if len(p) > 2 and p[0] == "blk" and p[2] in ("ffn_gate", "ffn_up", "ffn_down") and E.FMT.get(ty):
             by.setdefault(p[1], {})[p[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
-    ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in FFNBLK_FMTS
-          and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in FFNBLK_DOWN_FMTS]
+    fmts, dfmts = (FUSE_FMTS, FUSE_FMTS) if NPU_FUSE else (FFNBLK_FMTS, FFNBLK_DOWN_FMTS)
+    ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in fmts
+          and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in dfmts]
     pairs = [l for l in by.values() if l.get("ffn_gate") and l.get("ffn_up") and l["ffn_gate"][0] != l["ffn_up"][0]
              and l["ffn_gate"][0] in FFNBLK_FMTS and l["ffn_up"][0] in FFNBLK_FMTS
-             and l.get("ffn_down", ("",))[0] in FFNBLK_DOWN_FMTS]
+             and l.get("ffn_down", ("",))[0] in FFNBLK_DOWN_FMTS and not NPU_FUSE]
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
         hords = sorted({FFNBLK_HORD.get(l["ffn_down"][0], "") for l in ok if l["ffn_gate"] == (fmt, mt, kb)})
@@ -1041,6 +1051,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                     split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), F)
             blk = GN.decoder(DCOL_FMTS[fmt][0]).BLK
             name = "npu_ffnsw_%s%s" % (fmt, hord and "_" + hord.lower())
+            if NPU_FUSE:
+                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
+                                       swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024, hord=hord),
+                             name, None, 4))
+                continue
             jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2,
                                    fmt=DCOL_FMTS[fmt][0], swiglu=True, dgu=mt * 16 * kb * blk, swcol=1024,
                                    hpass=F // 1024, hord=hord), name, None, 4))
@@ -1059,8 +1074,14 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         assert mt not in O16_MT, "the window writes f32"
         out.append(_emit_gen(gen_rem, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d.hal" % (fmt, kbw), outdir, "kstore",
                              tr.rowgrp, kfull=kb))
+    parts = ffnblk_parts(F)
     for fmt, mt, kb in sorted({l["ffn_down"] for l in ok} | {l["ffn_down"] for l in pairs}):
-        for p0, passes in FFNBLK_DOWN:
+        for passes in sorted({p for _, p in parts + (ffnblk_parts(FFNBLK_PAIR) if pairs else ())}):
+            if NPU_FUSE:
+                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
+                                       kraw=kb * 256, ain="h", hpass=F // 1024), "npu_ffndn%d_%s" % (passes, fmt),
+                             None, GN.NP))
+                continue
             jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
                                    kraw=kb * 256, ain="h", hpass=F // 1024, gord="N"), "npu_ffndn%d_%s" % (passes, fmt),
                          None, GN.NP))
@@ -1075,12 +1096,13 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                                ufmt=DCOL_FMTS[uf][0], swiglu=True, swcol=2048, hpass=F // 1024, hord=hord),
                      name, None, (4, True)))
         jobs.append((jobs[-1][0], name + ".swap", "swap", (4, True)))
-    # hidden + the GPU's window + the NPU's down partials (two K chunks of ten 560-row calls, one replay group each)
+    # hidden + the GPU's window + the NPU's down partials (per K part, calls of NPU_ROWS rows, one replay group each)
     N, calls = 5120, -(-5120 // NPU_ROWS)
+    assert not pairs or len(ffnblk_parts(FFNBLK_PAIR)) == len(parts)
     cg = GU.CG
     GU.CG = 1
     try:
-        text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(FFNBLK_DOWN), rem=True,
+        text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
                       dup=((calls - 1) * NPU_COLS, N - NPU_ROWS))
     finally:
         GU.CG = cg
@@ -1101,11 +1123,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         GE.GROUPS, GE.ACT_PERM = groups, perm
     E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
                  "yah_half_norm.fused=0"], "norm_t_bfp_g1.hal", outdir)
-    out.append(("npuffnblk", F, 0, 0))
+    out.append(("npuffnblk", F, 256 if NPU_FUSE else 224, NPU_ROWS))   # F, gate / up features per call, down rows
     sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
     with GN.np_override(4):
         out.append(("npubytes_ffnsw",) + tuple(GN.stream_bytes(sw[0])))
-    for _, passes in FFNBLK_DOWN:
+    for passes in sorted({p for _, p in parts + (ffnblk_parts(FFNBLK_PAIR) if pairs else ())}):
         dn = next(j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes))
         out.append(("npubytes_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
     sp = next((j for j in jobs if j[1].startswith("npu_ffnsp_")), None)
