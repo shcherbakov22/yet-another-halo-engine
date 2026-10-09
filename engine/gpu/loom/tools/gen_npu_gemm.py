@@ -71,7 +71,10 @@ class Config:
                           # input): swiglu (cols = hpass): column c writes pass c; ain "h": records [M block][pass, slab]
     swcol: int = 0        # swiglu dcol 2: raw rows between columns' first gate rows (0: TN / 2)
     gord: str = "P4"      # dcol 2: the grid decoders' k-block order (gen_npu_dec DQ_GORD; "N": natural)
-    hp4: bool = False     # swiglu: H in P4 k-block order ((0, 2, 1, 3) per 4 k-blocks, IQ4_XS's and the P4 grid decoders')
+    hord: str = ""        # swiglu: H in the down decoder's k-block order: "P4" ((0, 2, 1, 3) per 4 k-blocks: IQ4_XS's
+                          # and the P4 grid decoders'), "Q4K" ((0, 4, 1, 5, 2, 6, 3, 7) per 8: Q4_K's; a call's 4 gate
+                          # k-blocks (one format) are then slabs 32 rows apart, the caller steps call j's rows by
+                          # 64 (j / 2) + 16 (j % 2)), "": natural
     ufmt: str = ""        # swiglu dcol 2 column pairs (cols 6): columns 0-2 compute gate rows (fmt), 3-5 the same features'
                           # up rows (ufmt); gate tail u streams its C segment (bf16) to up tail u + 3 (core stream)
     ofeat: int = 0      # final f32 output, fragment-major into [token / 16][ofeat / 16][16][16]: column c's 80 features are
@@ -475,7 +478,8 @@ def fill_inputs(e, cfg, panel):
                 assert cfg.dgu % 4 == 0 and NS_ % 2 == 0
                 e(f"  %fo{c} = constant.u64 {c * (cfg.swcol or TN // 2) * RS * 4} : reg<aie2p.array.offset : offset>")
                 e(f"  %fi_all{c} = sender %rwb, 0 : reg<aie2p.array.sender : tile<{P_}x2x{NS_ // 2}x16x{RW}xi32, "
-                  f"#encoding.layout.strided<strides=[{D.BLK}, {cfg.dgu // 4}, {16 * RS}, {RS}, 1]>>>")
+                  f"#encoding.layout.strided<strides=[{D.BLK}, {cfg.dgu // 4}, {(32 if cfg.hord == 'Q4K' else 16) * RS}, "
+                  f"{RS}, 1]>>>")
             else:
                 e(f"  %fo{c} = constant.u64 {c * TN * RS * 4} : reg<aie2p.array.offset : offset>")
                 e(f"  %fi_all{c} = sender %rwb, 0 : reg<aie2p.array.sender : tile<{P_}x{NS_}x16x{RW}xi32, "
@@ -1205,16 +1209,27 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None):
             e(f"  low.cond_br {p}im, ^swib{t}, ^swix{t} : {ER}")
             e(f"^swib{t}:")
             # gate rows: slab j, half i (sub-tiles at 256 i, 512 + 256 i); up: NP / 2 slabs on. The record takes the
-            # 8-feature blocks 2 j + i in loop order; P4 (hp4): per two slabs blocks 0, 2, 1, 3, so the loop's (j, i)
-            # stand for slab (j & ~1) | i, half j & 1
-            jj, ii = f"{p}j", f"{p}i"
-            if cfg.hp4:
+            # 8-feature blocks 2 j + i in loop order; P4 (and Q4K's 4 gate k-blocks of one format, its slabs 32 rows
+            # apart): per two slabs blocks 0, 2, 1, 3, so the loop's (j, i) stand for slab (j & ~1) | i, half j & 1;
+            # Q4K over 4 slabs (pairs): blocks 0, 4, 1, 5, 2, 6, 3, 7, slab (j >> 1) + 2 i, half j & 1
+            jj, ii, jstep = f"{p}j", f"{p}i", 1
+            if cfg.hord == "Q4K" and pair:
+                e(f"  {p}hk1 = mov.i32 1")
+                e(f"  {p}hk2 = mov.i32 2")
+                e(f"  {p}jod = and {p}j, {p}hk1")
+                e(f"  {p}jev = sub {p}j, {p}jod")
+                e(f"  {p}jhf = mul {p}i, {p}hk2")
+                e(f"  {p}jh2 = add.rr {p}jev, {p}jhf")
+                e(f"  {p}jpe = add.rr {p}jh2, {p}jhf")      # 2 slab: the slab offsets below take half the step
+                jj, ii, jstep = f"{p}jpe", f"{p}jod", 2
+            elif cfg.hord:
                 e(f"  {p}hk1 = mov.i32 1")
                 e(f"  {p}jod = and {p}j, {p}hk1")
                 e(f"  {p}jev = sub {p}j, {p}jod")
                 e(f"  {p}jpe = add.rr {p}jev, {p}i")
                 jj, ii = f"{p}jpe", f"{p}jod"
-            e(f"  {p}jo = mul {jj}, {p}k1024")
+            e(f"  {p}jsl = mov.i32 {1024 // jstep}")
+            e(f"  {p}jo = mul {jj}, {p}jsl")
             e(f"  {p}k256 = mov.i32 256")
             e(f"  {p}io = mul {ii}, {p}k256")
             e(f"  {p}ja = add.rr {p}ss, {p}jo")
@@ -1223,7 +1238,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None):
             e(f"  {p}gib = add.rr {p}ia, {p}k512")
             if pair:   # the slab is up (recv) or gate (send) rows; the gate values' buffer block (j, i): 256 bytes
                 e(f"  {p}uib = add.rr {p}gib, %zero")
-                e(f"  {p}kj512 = mov.i32 512")
+                e(f"  {p}kj512 = mov.i32 {512 // jstep}")
                 e(f"  {p}gjo = mul {jj}, {p}kj512")
                 e(f"  {p}gio = mul {ii}, {p}k256")
                 e(f"  {p}gja = add.rr {p}gbs0, {p}gjo")

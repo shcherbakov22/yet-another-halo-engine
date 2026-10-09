@@ -22,6 +22,7 @@ NPU FFN block (2026-10-09, set with YAH_NPU_DCOL + YAH_NPU_SPLIT=qkv=2240,gate=2
 NPU FFN block with column pairs (2026-10-09, the same set plus the 9 layers whose gate and up formats differ, 41 of 64 layers): gate on 16 windows vs golden5 KL mean 6.6e-5, p99.9 1.8e-3, max 3.3e-3, 0 flips, PPL 6.69296 (golden 6.69503). pp2048 ~3600 ms (one run, untuned): the pair layers add 9 more NPU jobs of 32 calls whose gate columns only feed the up columns.
 
 NPU FFN block with IQ4_XS downs (2026-10-09, 49 of 64 layers): gate on 16 windows vs golden5 KL mean 7.6e-5, p99.9 1.4e-3, max 4.4e-3, 0 flips, PPL 6.69401. pp2048 ~3840 ms (one run, untuned).
+NPU FFN block with Q4_K downs (2026-10-09, 52 of 64 layers): KL mean 8.1e-5, p99.9 1.4e-3, max 4.3e-3, 0 flips, PPL 6.69389. pp2048 ~3930 ms (one run, untuned).
 
 NPU GEMM path pieces (2026-10-06; checks byte-exact against numpy oracles):
 
