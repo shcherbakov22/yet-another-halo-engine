@@ -59,7 +59,9 @@ def main():
     mu, fuse = int(os.environ.get("NPU_MU", "2")), int(os.environ.get("NPU_FUSE", "0"))
     if os.environ.get("NPU_GROUPS"):   # replay groups of passes, e.g. "5" (one group)
         N.GE.GROUPS = tuple(int(v) for v in os.environ["NPU_GROUPS"].split(","))
-    cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse)
+    # fuse 2, NPU_KRAW=<K> NPU_K0=<k>: rows of K columns, the call's K at column k (a site's chunk)
+    kraw, k0r = int(os.environ.get("NPU_KRAW", "0")), int(os.environ.get("NPU_K0", "0"))
+    cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse, kraw=kraw)
     M, Nn, K = N.TM * nb, N.TN * cols, 8 * passes * sum(ks)
     os.makedirs(work, exist_ok=True)
     wq = None
@@ -69,10 +71,11 @@ def main():
         D = N.decoder("IQ4_XS")
         rd = gguf.GGUFReader(os.path.expanduser(os.environ.get(
             "NPU_GGUF", "~/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf")))
+        KR = kraw or K
         t = next(x for x in rd.tensors if x.tensor_type.name == "IQ4_XS" and len(x.shape) == 2
-                 and int(x.shape[0]) == K and int(x.shape[1]) >= Nn)
-        wraw = np.asarray(t.data).view(np.uint8).reshape(-1, K // 256, D.BLK)[:Nn].copy()
-        wf = D.weights(wraw).reshape(Nn, K)                        # the decoder's exact f32 weights
+                 and int(x.shape[0]) == KR and int(x.shape[1]) >= Nn)
+        wraw = np.asarray(t.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn].copy()
+        wf = D.weights(np.ascontiguousarray(wraw[:, k0r // 256:(k0r + K) // 256])).reshape(Nn, K)   # exact f32
         frag = wf.reshape(Nn // 8, 8, K // 8, 8).transpose(0, 2, 1, 3).reshape(-1, 8, 8)
         bb = D.Q.bfp_hw(frag).reshape(-1, 8, 9)                    # per row [E][8 mantissas]
         mq = bb[:, :, 1:].copy().view(np.int8).astype(np.float64)
@@ -114,10 +117,12 @@ def main():
             "--binding=" + w_b, "--binding=" + c_b]
     if fuse:   # the egress lanes' dummy binding (never transferred), the raw stream binding
         d_b, r_b = os.path.join(work, "d.bin"), os.path.join(work, "r.bin")
-        words = max(fw * nrec for fw, nrec in (N.fuse_record(cfg, r) for r in range(len(ks) - 1)))
+        words = max(fw * nrec for c in range(cols) for fw, nrec in (N.fuse_record(cfg, cov)
+                                                                  for cov in N.fuse_cover(cfg, c).values()))
         np.zeros(len(ks) * cols * words, np.int32).tofile(d_b)
         if fuse == 2:
-            np.concatenate([N.fuse_raw_dec(wraw, cfg), np.zeros(256, np.uint8)]).tofile(r_b)
+            # the GGUF rows as they are, from the call's first column
+            np.concatenate([wraw.reshape(-1)[k0r // 256 * D.BLK:], np.zeros(256, np.uint8)]).tofile(r_b)
         else:
             N.fuse_raw(np.frombuffer(rw.tobytes(), np.int32), cfg).tofile(r_b)
         base += ["--binding=" + d_b, "--binding=" + r_b]
