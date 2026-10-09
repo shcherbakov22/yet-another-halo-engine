@@ -304,6 +304,7 @@ class LoomPrefill {
              {TRef(*Find("token_embd.weight")), Ref(*ids_), Ref(*hidden_)}, 4);
     for (std::uint32_t l = 0; l < cfg_.main_block_count(); ++l) {
       const std::string pre = "blk." + std::to_string(l) + ".";
+      layer_ = l;
       tail_ = l + 1 == cfg_.main_block_count() ? keep_rows_ : kAllRows;
       if (cfg_.IsFullAttention(l)) {
         const bool q_af = Af("gemm_kqg", pre + "attn_q.weight");
@@ -1372,13 +1373,15 @@ class LoomPrefill {
       Fmt f{};
       FmtOf(static_cast<std::uint32_t>(Find(wname)->type), &f);
       swap = dir_ + "/npu_dcol_" + f.name + ".swap.xdna";
+      if (::access(swap.c_str(), R_OK) != 0) swap.clear();   // fused sets (YAH_NPU_FUSE): no decoder tiles to swap
     }
     for (std::size_t c = 0; c < chunks.size(); ++c) {
       const std::string image = npu_dcol_ ? DcolImage(wname, &dec)
                                           : dir_ + "/npu_gemm_" + std::to_string(chunks[c].second) + ".xdna";
       const std::size_t cp = NpuK(chunks[c].second).c;
       for (const NpuView& wv : w[c]) {
-        calls.push_back(npu_dcol_ ? npu_->BindRaw(image, swap, dec, a[c], gguf_.tensor_data_base() + wv.offset,
+        calls.push_back(npu_dcol_ ? npu_->BindRaw(image, swap.empty() ? image : swap, dec, a[c],
+                                                  gguf_.tensor_data_base() + wv.offset,
                                                   wv.length, {c_off, cp})
                                   : npu_->Bind(image, a[c], wv, {c_off, cp}));
         c_off += cp;
@@ -1496,7 +1499,7 @@ class LoomPrefill {
     if (!npu_dcol_) in.push_back(WSlot(job));
     graph_->AtomicStore(FlagWord(words.ready), words.gate, HRX_ATOMIC_FLAG_RELEASE | HRX_ATOMIC_FLAG_SYSTEM_SCOPE, in,
                         {Ref(npu_->C())});
-    flagged_.push_back({std::move(calls), std::move(tag), words});
+    flagged_.push_back({std::move(calls), std::move(tag), words, layer_});
   }
   // Queue the GPU work that runs beside the last enqueued job before this.
   void NpuJoin() {
@@ -1930,6 +1933,7 @@ class LoomPrefill {
   std::unique_ptr<LoomGraph> chunk_graph_;
   NpuSplit* npu_ = nullptr;        // EnableNpu
   bool npu_on_ = false;            // this chunk splits with the NPU
+  std::uint32_t layer_ = 0;        // RecordLayers' current layer (NpuSplit::Queued::layer)
   bool npu_planning_ = false;      // EnableNpu's binding pass: Dispatch records nothing
   LoomBuffer* npurem_ = nullptr;   // the GPU's K remainder of the NPU's out / down rows (f32 [tokens][rows])
   std::uint32_t ffnblk_ = 0;       // the NPU's FFN block features (dispatch.txt "npuffnblk"; RunFfnBlock), 0: none

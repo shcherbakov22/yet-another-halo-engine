@@ -1150,6 +1150,8 @@ class LoomNpuSplit : public NpuSplit {
         const std::size_t per = plan_.dcol ? kDcolJobsPerCommand : kJobsPerCommand;
         for (std::size_t i = queued + command.size(); i < jobs.size() && command.size() < per; ++i) {
           if (!command.empty() && calls + jobs[i].calls.size() > kCallsPerCommand) break;
+          // the NPU waits for the GPU between jobs: a command over many layers can outlast the 2000 ms limit
+          if (!command.empty() && jobs[i].layer >= jobs[queued].layer + kLayersPerCommand) break;
           LoomNpu::GatedJob g;
           for (const std::uint32_t id : jobs[i].calls) g.calls.push_back(&calls_.at(id));
           g.done = static_cast<volatile std::uint32_t*>(flags_.host) + jobs[i].words.done;
@@ -1198,7 +1200,10 @@ class LoomNpuSplit : public NpuSplit {
   // Jobs per NPU command: few commands, while the longest (its waits for the GPU included) stays far below the driver's
   // 2000 ms command limit.
   static constexpr std::size_t kJobsPerCommand = 16, kCallsPerCommand = 256;
-  // decoder-column sets: layers without NPU work leave longer waits between jobs (up to the gate's ~400 ms supply)
+  // Layers one command spans at most: its first job may wait up to the gate's supply (~1.2 s, gen_npu_gemm GPS) for
+  // the GPU, the rest of the command stays a few layers (~95 ms each in slow runs) under the 2000 ms limit.
+  static constexpr std::uint32_t kLayersPerCommand = 4;
+  // raw-row sets: layers without NPU work leave longer waits between jobs (up to the gate's ~1.2 s supply)
   static constexpr std::size_t kDcolJobsPerCommand = 8;
   // Decoder-column sets bind a few thousand calls (a gate slot each).
   static constexpr std::size_t kDcolFlagBytes = 2u << 20;

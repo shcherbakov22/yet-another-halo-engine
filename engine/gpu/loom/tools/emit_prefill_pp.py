@@ -641,12 +641,16 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 # tiles' setup alone: the engine switches formats inside a command). The decoders' k-block order (gen_npu_dec.KPERM)
 # permutes the activations (gen_bfp16_encode.ACT_PERM): "p4" for the fused writers (norm, postnorm, ffn unpack) and the
 # plain encoders, "pk" (Q4_K) by the "_pk" encoders into A's second half. Tensors of other formats stay on the GPU.
-NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1"
+# YAH_NPU_FUSE=1: the same raw-row sets on 8 fused GEMM columns (gen_npu_gemm fuse 2: every GEMM core decodes its own
+# panel slice; no decoder column, no swap images), images "npu_dcol_<fmt>_<K>.xdna" for the formats in FUSE_FMTS.
+NPU_FUSE = os.environ.get("YAH_NPU_FUSE") == "1"
+NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
+FUSE_FMTS = ("iq4xs",)
 DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
              "iq2xs": ("IQ2_XS", "p4")}
 NPU_KS = (36, 36, 36, 20) if NPU_DCOL else GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
-NPU_COLS = 7 if NPU_DCOL else 8
+NPU_COLS = 7 if NPU_DCOL and not NPU_FUSE else 8
 NPU_ROWS = NPU_COLS * GN.TN   # output rows per NPU call
 NPU_SITES = {"qkv": ("kstore", 640, 20), "gate": ("kstore", 384, 20), "q": ("kqg", 768, 20), "out": ("kres", 320, 24),
              "down": ("kres", 320, 68), "ffn": ("ffn", 1088, 20)}
@@ -722,7 +726,8 @@ def npu_split(rows, combos, B, outdir):
     assert not bad, "unknown NPU split sites %s" % sorted(bad)
     assert all(v % NPU_ROWS == 0 and 0 < v < NPU_SITES[k][1] * 16 for k, v in NPU_SPLIT.items()) and B % 512 == 0
     assert NPU_SPLIT.get("q", 0) % 512 == 0, "q: whole heads"
-    assert not (NPU_DCOL and "q" in NPU_SPLIT), "dcol: q's whole heads are not 560-row calls"
+    assert not (NPU_COLS == 7 and "q" in NPU_SPLIT), "dcol: q's whole heads are not 560-row calls"
+    assert not (NPU_FUSE and NPU_FFNBLK), "fuse: no FFN block images yet"
     GE.ACT_PERM = "p4" if NPU_DCOL else None
     out = []
     tmp = os.path.join(outdir, ".emit_tmp")
@@ -816,7 +821,7 @@ def npu_split(rows, combos, B, outdir):
             chunked = len(chunks) > 1 or npu_rem(site)
             for ci, chunk in (enumerate(chunks) if chunked else ((None, None),)):
                 if NPU_DCOL:
-                    if fmt in DCOL_FMTS:
+                    if fmt in (FUSE_FMTS if NPU_FUSE else DCOL_FMTS):
                         dcol_images.add((fmt, kb * 256))
                     continue
                 if (fmt, mt, kb, chunk) not in done:
@@ -976,9 +981,13 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     import hrx_paths
     jobs = []
     for fmt, K in sorted(images):
-        cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0], kraw=K)
+        if NPU_FUSE:
+            cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=K)
+        else:
+            cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
+                            kraw=K)
         jobs.append((cfg, "npu_dcol_%s_%d" % (fmt, K), None, GN.NP))
-    for fmt in sorted({f for f, _ in images}):
+    for fmt in sorted({f for f, _ in images} if not NPU_FUSE else ()):
         cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0])
         jobs.append((cfg, "npu_dcol_%s.swap" % fmt, "swap", GN.NP))
     jobs += [(cfg, name, mode, np_) for cfg, name, mode, np_ in extra]

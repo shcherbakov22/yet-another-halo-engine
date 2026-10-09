@@ -77,6 +77,7 @@ class NpuSplit {
     std::vector<std::uint32_t> calls;
     std::string tag;
     Job words;
+    std::uint32_t layer = 0;   // the layer that enqueued it (a command spans few layers: Enqueue)
   };
   // Queues the jobs at once, in NewJob order, several per NPU command: the NPU waits for each ready word itself.
   // If it throws, it has stored gate | kGateFailed to the done words of the jobs it did not queue (a launched graph

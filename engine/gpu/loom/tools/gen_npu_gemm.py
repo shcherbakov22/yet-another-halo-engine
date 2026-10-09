@@ -93,7 +93,7 @@ class Config:
 # (write; go at byte 0, done at byte 16). After its last firing of a job the head polls request-driven
 # (constrain.request: one fresh flag read per tick) until ready >= (its job count + 1) * GATE_CALLS (jobs count from 1 after the
 # setup call; jobs sharing a ready word store theirs in order, after the GPU joined the earlier ones), backing off (pace =
-# GP0 + GPS * max(0, polls - 64) delay iterations; a supply of 1024 polls lasts ~400 ms: decoder-column sets leave layers
+# GP0 + GPS * max(0, polls - 64) delay iterations; a supply of 1024 polls lasts ~1.2 s: raw-row sets leave layers
 # without NPU work; the tick stream takes one record per poll, so the supply cannot grow). It hands [seq, status, polls,
 # ncalls] to the mid over a leaf-synchronized neighbor channel and ticks / reads out the rest of the supply GB records per
 # firing of the next job. The mid emits go and done (constrain.signal + constrain.gate): the control program's gate
@@ -101,7 +101,7 @@ class Config:
 # after C. done = the job's ready value, with GATE_FAILED set if the head gave up (status 2). Job state (firings done, firings per job, leftover
 # supply, pending reads, sequence) lives in private storage, which the array setup of a core stream plan zeroes; a job of
 # N calls is N * nb * passes firings, and before the first gated job (state zero) it is one call: the setup call's.
-GP0, GPS, GB = 650, 104, 8
+GP0, GPS, GB = 650, 312, 8
 # The protocol the host follows (dispatch.txt "npugate <GATE_SUPPLY> <GATE_CALLS> <GATE_RECORD>"): a job's gate value is
 # sequence * GATE_CALLS + its calls (jobs of 1 .. GATE_CALLS - 1 calls); done lands GATE_RECORD bytes into the signal
 # binding. GATE_FAILED in done: the head gave up (the host sets it too for a failed command; gen_npu_unpack.GATED_LOOP).
