@@ -407,6 +407,7 @@ class LoomNpu {
       std::lock_guard<std::mutex> lock(mu_);
       family = nullptr;
     } else if (!resident) {
+      program_.Forget();   // a full setup outside FusedCommand
       YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k->first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
       std::lock_guard<std::mutex> lock(mu_);
       resident_ = family;
@@ -493,6 +494,104 @@ class LoomNpu {
     int dec = -1;
     const void* family = nullptr;
   };
+  // The core tiles' program memory as the array holds it once the commands built so far ran: FusedCommand builds in
+  // submission order and nothing else writes programs (a failure or a setup outside it forgets them).
+  struct ProgramState {
+    static constexpr std::uint32_t kCols = 8, kRows = 4, kWords = 0x10000 / 4;   // rows 2-5, [0x20000, 0x30000)
+    std::vector<std::uint32_t> word = std::vector<std::uint32_t>(kCols * kRows * kWords);
+    std::vector<std::uint8_t> known = std::vector<std::uint8_t>(kCols * kRows * kWords);
+    // per core tile, the read-only data blocks (address, bytes) of the last setup that wrote the tile: only that image
+    // ran there since, and an image never writes its own read-only data
+    std::vector<std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>> rodata =
+        std::vector<std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>>(kCols * kRows);
+    void Forget() {
+      std::fill(known.begin(), known.end(), 0);
+      for (auto& r : rodata) r.clear();
+    }
+  };
+  // A setup (transaction) with its program loads cut to the words the array does not hold already and its read-only
+  // data loads (decoder tables) dropped where the tile holds them already; every other operation runs in full and in
+  // order (zero-filled storages, registers, DMA waits: state the kernels change at run time). Setups are ~0.5 MB,
+  // 2/3 of it core programs, and images that follow each other share most of their code. Loom images load data memory
+  // only as read-only sections (PROGBITS) and zero-filled storages (NOBITS: all-zero blocks), one block per section.
+  std::vector<std::uint8_t> DeltaSetup(const std::uint8_t* src, std::size_t length) {
+    if (program_lost_.exchange(false)) program_.Forget();
+    std::uint32_t n = 0, size = 0;
+    std::memcpy(&n, src + 8, 4), std::memcpy(&size, src + 12, 4);
+    if (size != length || size < 16) throw LoomError("npu: unexpected setup header");
+    std::vector<std::uint8_t> out(src, src + 16);
+    std::uint32_t ops = 0;
+    std::vector<std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>> rodata(program_.rodata.size());
+    std::vector<std::uint8_t> touched(program_.rodata.size());
+    for (std::size_t o = 16; o < size;) {
+      std::uint32_t len = 0, addr = 0;
+      switch (src[o]) {   // libamdf transaction 0.1 operations (Loom's xdna_product.c)
+        case 0: len = 24; break;
+        case 3: len = 28; break;
+        case 1: std::memcpy(&len, src + o + 12, 4); break;
+        case 128: std::memcpy(&len, src + o + 4, 4); break;
+        default: throw LoomError("npu: unknown setup operation " + std::to_string(src[o]));
+      }
+      if (len < 16 || o + len > size) throw LoomError("npu: setup operation outside its command");
+      std::memcpy(&addr, src + o + 8, 4);
+      const std::uint32_t col = addr >> 25, row = (addr >> 20) & 31, off = addr & 0xFFFFF;
+      const bool core = col < ProgramState::kCols && row >= 2 && row < 2 + ProgramState::kRows;
+      const std::size_t t = core ? col * ProgramState::kRows + row - 2 : 0;
+      if (core) touched[t] = 1;
+      if (src[o] == 1 && core && off < 0x10000) {   // data memory
+        std::vector<std::uint8_t> payload(src + o + 16, src + o + len);
+        const bool zero = std::all_of(payload.begin(), payload.end(), [](std::uint8_t b) { return b == 0; });
+        const auto& prev = program_.rodata[t];
+        const bool held = !zero && std::any_of(prev.begin(), prev.end(), [&](const auto& b) {
+          return b.first == addr && b.second == payload;
+        });
+        if (!zero) rodata[t].emplace_back(addr, std::move(payload));
+        if (!held) out.insert(out.end(), src + o, src + o + len), ++ops;
+        o += len;
+        continue;
+      }
+      if (src[o] != 1 || col >= ProgramState::kCols || row < 2 || row >= 2 + ProgramState::kRows || off < 0x20000 ||
+          off >= 0x30000 || len % 4 || off % 4 || off - 0x20000 + (len - 16) > 0x10000) {
+        out.insert(out.end(), src + o, src + o + len), ++ops, o += len;
+        continue;
+      }
+      const std::size_t base = ((col * ProgramState::kRows + row - 2) * ProgramState::kWords) + (off - 0x20000) / 4;
+      const std::uint32_t words = (len - 16) / 4;
+      const std::uint8_t* w = src + o + 16;
+      auto differs = [&](std::uint32_t i) {
+        std::uint32_t v;
+        std::memcpy(&v, w + 4 * i, 4);
+        return !program_.known[base + i] || program_.word[base + i] != v;
+      };
+      for (std::uint32_t i = 0; i < words;) {
+        if (!differs(i)) {
+          ++i;
+          continue;
+        }
+        std::uint32_t end = i + 1;   // a run of differing words; gaps below a header's 4 words are written too
+        for (std::uint32_t j = end; j < words && j < end + 4; ++j)
+          if (differs(j)) end = j + 1;
+        const std::uint32_t bl = 16 + 4 * (end - i), at = addr + 4 * i;
+        const std::size_t h = out.size();
+        out.insert(out.end(), src + o, src + o + 16);
+        std::memcpy(&out[h + 8], &at, 4), std::memcpy(&out[h + 12], &bl, 4);
+        out.insert(out.end(), w + 4 * i, w + 4 * end);
+        for (std::uint32_t j = i; j < end; ++j) {
+          std::memcpy(&program_.word[base + j], w + 4 * j, 4);
+          program_.known[base + j] = 1;
+        }
+        ++ops, i = end;
+      }
+      o += len;
+    }
+    for (std::size_t t = 0; t < touched.size(); ++t)
+      if (touched[t]) program_.rodata[t] = std::move(rodata[t]);
+    const std::uint32_t bytes = static_cast<std::uint32_t>(out.size());
+    std::memcpy(&out[8], &ops, 4), std::memcpy(&out[12], &bytes, 4);
+    return out;
+  }
+  ProgramState program_;
+  std::atomic<bool> program_lost_{false};
   Fused FusedCommand(const std::vector<std::vector<const Call*>>& runs, int dec, const void* fam) {
     std::vector<std::uint8_t> bytes;
     std::uint32_t ops = 0;
@@ -509,7 +608,7 @@ class LoomNpu {
       int queued = 0, since = 0;
       if (const Kernel* k0 = calls[0]->k; FamilyOf(k0) != fam) {
         if (k0->setup.empty()) throw LoomError("npu: a job switches image families without a setup");
-        append(k0->setup);
+        append(DeltaSetup(k0->setup.data(), k0->setup.size()));
         fam = FamilyOf(k0), dec = k0->dec;
       }
       append(calls[0]->gate);
@@ -522,7 +621,7 @@ class LoomNpu {
         const Call& c = *calls[i];
         if (c.k->swap && c.k->dec != dec) {
           for (; queued > 0; --queued) append(calls[i - 1]->wait);
-          append_raw(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length);
+          append(DeltaSetup(CommandBytes(*c.k->swap, c.k->swap->first), c.k->swap->first.byte_length));
           dec = c.k->dec, since = 0;
         }
         append(since == 0 ? c.lead : c.push[since & 1]);
@@ -620,6 +719,7 @@ class LoomNpu {
         if (failure_.empty()) failure_ = e.what();
         resident_ = nullptr;
         resident_dec_ = -1;
+        program_lost_ = true;   // the next command's setups write whole programs (DeltaSetup)
       }
       const auto now = std::chrono::steady_clock::now();
       const double ms = std::chrono::duration<double, std::milli>(now - std::max(p.t0, last_retired_)).count();
