@@ -1,0 +1,57 @@
+Low bank packing (Loom AIE2P array plans, opt-in LOOM_EXP_PACK_LOW=1): read-only leaf data and ring records wider than a
+bank are placed from the lowest bank up instead of top-down / by channel bank rotation. A fused GEMM worker holds a
+decoder's gather tables (6 KB), a contiguous W ring wider than two banks and a 2-slot activation ring that must sit in
+one bank: top-down data left the activation ring 128 bytes short.
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -1764,7 +1764,15 @@
+     const loom_low_read_only_data_requirement_t* requirement,
+     const loom_aie2p_array_tile_state_t* tile_state,
+     loom_aie2p_array_local_memory_proposal_t* out_proposal) {
+-  if (requirement->bank_conflicts.count == 0) {
++  // EXPERIMENT: LOOM_EXP_PACK_LOW=1 tries the low banks first (wide ring
++  // records too, loom_aie2p_array_local_memory_propose_channel), so a record
++  // narrower than a bank keeps a whole upper bank.
++  static int low = -1;
++  if (low < 0) {
++    const char* value = getenv("LOOM_EXP_PACK_LOW");
++    low = value && value[0] == '1';
++  }
++  if (requirement->bank_conflicts.count == 0 && !low) {
+     return loom_aie2p_array_local_memory_propose_worker(
+         tile_state->resources.facts, tile_state->resources.bank_cursors,
+         requirement->contents.data_length, requirement->minimum_alignment,
+@@ -1773,7 +1781,8 @@
+ 
+   const uint8_t bank_count = tile_state->resources.facts->memory.bank_count;
+   for (uint8_t attempt = 0; attempt < bank_count; ++attempt) {
+-    const uint8_t bank = (uint8_t)(bank_count - attempt - 1u);
++    const uint8_t bank =
++        low ? attempt : (uint8_t)(bank_count - attempt - 1u);
+     if (!loom_aie2p_array_local_memory_propose_worker_from_bank(
+             tile_state->resources.facts, tile_state->resources.bank_cursors,
+             bank, requirement->contents.data_length,
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/local_memory.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/local_memory.c
+@@ -63,13 +63,20 @@
+   const char* align_wide = getenv("LOOM_EXP_WIDE_BANK_ALIGN");
+   const bool try_aligned = align_wide != NULL && atoi(align_wide) != 0 &&
+                            byte_length > bank_capacity;
++  // Experimental LOOM_EXP_PACK_LOW: a record wider than a bank tries the
++  // lowest bank first (plan.c places read-only data low too).
++  const char* pack_low = getenv("LOOM_EXP_PACK_LOW");
++  const bool low = pack_low != NULL && atoi(pack_low) != 0 &&
++                   byte_length > bank_capacity;
+   for (uint16_t attempt = 0;
+        attempt < (try_aligned ? 2u : 1u) * facts->memory.bank_count;
+        ++attempt) {
+     const bool aligned_pass =
+         try_aligned && attempt < facts->memory.bank_count;
+     const uint8_t bank =
+-        (uint8_t)((next_channel_bank + attempt) % facts->memory.bank_count);
++        low ? (uint8_t)attempt
++            : (uint8_t)((next_channel_bank + attempt) %
++                        facts->memory.bank_count);
+     if (aligned_pass && bank_cursors[bank] != 0) {
+       continue;
+     }

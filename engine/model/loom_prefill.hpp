@@ -939,9 +939,10 @@ class LoomPrefill {
     const std::string us = pair ? NpuHal(SwigluHal(pre + "ffn_up.weight", true, true)) : "";
     const std::uint32_t kbw = static_cast<std::uint32_t>(td->dims[0] - F) / 256;
     const std::string rem = "npuffnrem_" + std::string(fd.name) + "_" + std::to_string(kbw) + ".hal";
-    // gate / up write H in the down decoder's k-block order (emit_prefill_pp FFNBLK_HORD: IQ4_XS's P4, Q4_K's)
+    // gate / up write H in the down decoder's k-block order (emit_prefill_pp FFNBLK_HORD: IQ4_XS's P4, Q4_K's; fused sets
+    // P4 but Q4_K's)
     const bool q4k = std::strcmp(fd.name, "q4k") == 0;
-    const std::string hord = std::strcmp(fd.name, "iq4xs") == 0 ? "_p4" : q4k ? "_q4k" : "";
+    const std::string hord = q4k ? "_q4k" : std::strcmp(fd.name, "iq4xs") == 0 || FfnBlkFused() ? "_p4" : "";
     const std::string sw = dir_ + (pair ? "/npu_ffnsp_" + std::string(f.name) + "_" + fu.name : "/npu_ffnsw_" + std::string(f.name)) +
                            hord;
     const auto parts = FfnBlkParts(F);

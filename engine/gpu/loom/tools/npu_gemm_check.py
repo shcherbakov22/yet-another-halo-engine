@@ -61,18 +61,19 @@ def main():
         N.GE.GROUPS = tuple(int(v) for v in os.environ["NPU_GROUPS"].split(","))
     # fuse 2, NPU_KRAW=<K> NPU_K0=<k>: rows of K columns, the call's K at column k (a site's chunk)
     kraw, k0r = int(os.environ.get("NPU_KRAW", "0")), int(os.environ.get("NPU_K0", "0"))
-    cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse, kraw=kraw)
+    fmt = os.environ.get("NPU_FMT", "IQ4_XS")   # fuse 2: the raw rows' format (gen_npu_gemm FUSE_FMTS)
+    cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse, kraw=kraw, fmt=fmt)
     M, Nn, K = N.TM * nb, N.TN * cols, 8 * passes * sum(ks)
     os.makedirs(work, exist_ok=True)
     wq = None
-    if fuse == 2:   # real IQ4_XS rows (NPU_GGUF): the panels are decoded on the cores; W's value is the decoder's
+    if fuse == 2:   # real rows of fmt (NPU_GGUF): the panels are decoded on the cores; W's value is the decoder's
         sys.path.insert(0, os.path.expanduser("~/llama.cpp/gguf-py"))
         import gguf
-        D = N.decoder("IQ4_XS")
+        D = N.decoder(fmt, cfg.gord)
         rd = gguf.GGUFReader(os.path.expanduser(os.environ.get(
             "NPU_GGUF", "~/Downloads/Qwen3.8-27B-IQ4_XS-3.84bpw.gguf")))
         KR = kraw or K
-        t = next(x for x in rd.tensors if x.tensor_type.name == "IQ4_XS" and len(x.shape) == 2
+        t = next(x for x in rd.tensors if x.tensor_type.name == fmt and len(x.shape) == 2
                  and int(x.shape[0]) == KR and int(x.shape[1]) >= Nn)
         wraw = np.asarray(t.data).view(np.uint8).reshape(-1, KR // 256, D.BLK)[:Nn].copy()
         wf = D.weights(np.ascontiguousarray(wraw[:, k0r // 256:(k0r + K) // 256])).reshape(Nn, K)   # exact f32

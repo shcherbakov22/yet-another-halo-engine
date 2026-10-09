@@ -646,6 +646,7 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 NPU_FUSE = os.environ.get("YAH_NPU_FUSE") == "1"
 NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
 FUSE_FMTS = ("iq4xs",)
+FUSE_FFN_FMTS = ("iq4xs", "iq3xxs")   # the fused FFN block's (NP 4 images: room for a grid decoder's tables)
 DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
              "iq2xs": ("IQ2_XS", "p4")}
@@ -990,7 +991,8 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     jobs = []
     for fmt, K in sorted(images):
         if NPU_FUSE:
-            cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=K)
+            cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=K,
+                            fmt=DCOL_FMTS[fmt][0])
         else:
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
                             kraw=K)
@@ -1035,7 +1037,10 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         p = nm.split(".")
         if len(p) > 2 and p[0] == "blk" and p[2] in ("ffn_gate", "ffn_up", "ffn_down") and E.FMT.get(ty):
             by.setdefault(p[1], {})[p[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
-    fmts, dfmts = (FUSE_FMTS, FUSE_FMTS) if NPU_FUSE else (FFNBLK_FMTS, FFNBLK_DOWN_FMTS)
+    fmts, dfmts = (FUSE_FFN_FMTS, FUSE_FFN_FMTS) if NPU_FUSE else (FFNBLK_FMTS, FFNBLK_DOWN_FMTS)
+    # H's k-block order: the down decoder's (fused: P4 but Q4_K's)
+    hord_of = (lambda d: "Q4K" if d == "q4k" else "P4") if NPU_FUSE else (lambda d: FFNBLK_HORD.get(d, ""))
+    rows = NPU_COLS * 64 if NPU_FUSE else NPU_ROWS   # down rows per call (fused: NP 4)
     ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in fmts
           and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in dfmts]
     pairs = [l for l in by.values() if l.get("ffn_gate") and l.get("ffn_up") and l["ffn_gate"][0] != l["ffn_up"][0]
@@ -1043,7 +1048,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
              and l.get("ffn_down", ("",))[0] in FFNBLK_DOWN_FMTS and not NPU_FUSE]
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
-        hords = sorted({FFNBLK_HORD.get(l["ffn_down"][0], "") for l in ok if l["ffn_gate"] == (fmt, mt, kb)})
+        hords = sorted({hord_of(l["ffn_down"][0]) for l in ok if l["ffn_gate"] == (fmt, mt, kb)})
         for hord in hords:
             if hord == hords[0]:
                 t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
@@ -1053,8 +1058,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             name = "npu_ffnsw_%s%s" % (fmt, hord and "_" + hord.lower())
             if NPU_FUSE:
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
-                                       swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024, hord=hord),
-                             name, None, 4))
+                                       swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024, hord=hord,
+                                       fmt=DCOL_FMTS[fmt][0]), name, None, 4))
                 continue
             jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2,
                                    fmt=DCOL_FMTS[fmt][0], swiglu=True, dgu=mt * 16 * kb * blk, swcol=1024,
@@ -1079,8 +1084,8 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         for passes in sorted({p for _, p in parts + (ffnblk_parts(FFNBLK_PAIR) if pairs else ())}):
             if NPU_FUSE:
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
-                                       kraw=kb * 256, ain="h", hpass=F // 1024), "npu_ffndn%d_%s" % (passes, fmt),
-                             None, GN.NP))
+                                       kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0]),
+                             "npu_ffndn%d_%s" % (passes, fmt), None, 4))
                 continue
             jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
                                    kraw=kb * 256, ain="h", hpass=F // 1024, gord="N"), "npu_ffndn%d_%s" % (passes, fmt),
@@ -1096,21 +1101,22 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                                ufmt=DCOL_FMTS[uf][0], swiglu=True, swcol=2048, hpass=F // 1024, hord=hord),
                      name, None, (4, True)))
         jobs.append((jobs[-1][0], name + ".swap", "swap", (4, True)))
-    # hidden + the GPU's window + the NPU's down partials (per K part, calls of NPU_ROWS rows, one replay group each)
-    N, calls = 5120, -(-5120 // NPU_ROWS)
+    # hidden + the GPU's window + the NPU's down partials (per K part, calls of rows rows, one replay group each)
+    N, calls = 5120, -(-5120 // rows)
     assert not pairs or len(ffnblk_parts(FFNBLK_PAIR)) == len(parts)
     cg = GU.CG
     GU.CG = 1
     try:
-        text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
-                      dup=((calls - 1) * NPU_COLS, N - NPU_ROWS))
+        with GN.np_override(4 if NPU_FUSE else GN.NP):
+            text = GU.gen(B, calls * NPU_COLS, N, 0, resid=True, parts=len(parts), rem=True,
+                          dup=((calls - 1) * NPU_COLS, N - rows))
+            nj, wg = GN.TN // 8, GU.wg(calls * NPU_COLS)
     finally:
         GU.CG = cg
     src = os.path.join(tmp, "npu_unpack_ffnblk.loom")
     open(src, "w").write(text)
     E.emit(src, ["nop=0"], "npu_unpack_ffnblk.hal", outdir)
-    out.append(("npu_unpack_ffnblk.hal", B * calls * NPU_COLS * (GN.TN // 8) // GU.wg(calls * NPU_COLS),
-                GU.wg(calls * NPU_COLS), 0))
+    out.append(("npu_unpack_ffnblk.hal", B * calls * NPU_COLS * nj // wg, wg, 0))
     # gate / up read their activations in one replay group: the norm before them writes that stream (fragment-major)
     import gen_half_norm
     groups, perm = GE.GROUPS, GE.ACT_PERM
@@ -1123,13 +1129,14 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         GE.GROUPS, GE.ACT_PERM = groups, perm
     E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
                  "yah_half_norm.fused=0"], "norm_t_bfp_g1.hal", outdir)
-    out.append(("npuffnblk", F, 256 if NPU_FUSE else 224, NPU_ROWS))   # F, gate / up features per call, down rows
+    out.append(("npuffnblk", F, 256 if NPU_FUSE else 224, rows))   # F, gate / up features per call, down rows
     sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
     with GN.np_override(4):
         out.append(("npubytes_ffnsw",) + tuple(GN.stream_bytes(sw[0])))
     for passes in sorted({p for _, p in parts + (ffnblk_parts(FFNBLK_PAIR) if pairs else ())}):
         dn = next(j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes))
-        out.append(("npubytes_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
+        with GN.np_override(dn[3]):
+            out.append(("npubytes_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
     sp = next((j for j in jobs if j[1].startswith("npu_ffnsp_")), None)
     if sp:
         with GN.np_override(4, True):

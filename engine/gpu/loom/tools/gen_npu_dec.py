@@ -112,8 +112,8 @@ def grid_rodata(name):
             ks = f | ((bin(f).count("1") & 1) << 7)
             for j in range(8):
                 st[f >> 2, j // 4, f & 3, j % 4] = 0x8000 if (ks >> j) & 1 else 0
-        return [f'global.rodata.def @gt_{name} = align(4096) bytes("{hexs(gt)}")',
-                f'global.rodata.def @st_{name} = align(4096) bytes("{hexs(st)}")']
+        # one object, the sign table on the page after the grid's (its 2 KB alone would take a whole aligned page)
+        return [f'global.rodata.def @gt_{name} = align(4096) bytes("{hexs(gt)}{hexs(st)}")']
     grid = grid_table("grid_iq3s.bin", 512).astype(np.float32)
     gt = np.zeros((128, 2, 4, 4), np.uint16)
     for idx in range(512):
@@ -312,10 +312,12 @@ def leaf(name="dec", nports=1):
 
     if GRID:
         # rodata tables: their 4 KB pages as address high bytes (address = page << 12 | 16 index via vups << 4)
-        for t_ in (("gt", "st") if XXS or XS2 else ("gt", "st", "qt")):
+        for t_ in (("gt",) if XXS or XS2 else ("gt", "st", "qt")):
             e(f"%{t_}p = mov.local-address @{t_}_{name}")
             e(f"%{t_}a = mov.address-to-scalar %{t_}p")
             e(f"%{t_}c = lshl %{t_}a, {k(-12)}")
+        if XXS or XS2:                                  # the sign table: the pages after the grid's (grid_rodata)
+            e(f"%stc = add.rr %gtc, {k(2 if XS2 else 1)}")
     elif not Q3K:
         # ---- table (once per invocation of the program: a flag in private storage)
         tb_, tdone = label("tbuild"), label("tdone")
@@ -1685,23 +1687,29 @@ def leaf(name="dec", nports=1):
 
 
 def leaf_inline(nsb):
-    """The IQ4_XS leaf's body for inlining into another core function: decodes nsb super-blocks of an input record
+    """The leaf's body for inlining into another core function: decodes nsb super-blocks of an input record
     ([16 rows][RECROW]) at %in into OUT_B records at %out (2 per super-block, no output ring), storages at %sp
     (SCR_B, 2048-aligned) and %sp2 (SCR2_B), all defined by the caller (the table is rebuilt each call). Returns the
-    lines (not renamed; the caller prefixes its values and labels)."""
-    assert FMT == "IQ4_XS"
+    lines (not renamed; the caller prefixes its values and labels). Grid formats gather from module rodata
+    (inline_rodata, defined once by the caller's module)."""
     INLINE[0] = nsb
     try:
         txt = leaf("inl", 1)
     finally:
         INLINE[0] = 0
     out = []
-    for ln in txt.split("\n")[1:]:
+    for ln in txt.split("\n"):
         t = ln.strip()
-        if (" = resource<" in t or " = storage " in t or " = storage_address " in t or t in ("return", "}")):
+        if (t.startswith("global.rodata.def ") or t.startswith("low.func.def ") or " = resource<" in t or
+                " = storage " in t or " = storage_address " in t or t in ("return", "}")):
             continue
         out.append(ln)
     return out
+
+
+def inline_rodata():
+    """The module rodata leaf_inline's code reads (grid formats' tables), else []."""
+    return grid_rodata("inl") if GRID else []
 
 
 def place_consts(pre, body):
