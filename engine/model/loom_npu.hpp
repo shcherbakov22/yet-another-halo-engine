@@ -445,9 +445,10 @@ class LoomNpu {
   }
   // Commands: count, NPU time (each from the later of its submission and the previous command's completion, its
   // waits for the GPU included) and the longest (the driver kills a command after amdxdna tdr_timeout_ms, 2000 ms).
+  // Host involvement: command bytes, the host's waits for a free arena, the NPU's idle time with no command queued.
   struct CommandStats {
-    std::size_t commands = 0;
-    double busy_ms = 0, max_ms = 0;
+    std::size_t commands = 0, bytes = 0, arena_waits = 0;
+    double busy_ms = 0, max_ms = 0, arena_wait_ms = 0, idle_ms = 0;
   };
   CommandStats Commands() {
     std::lock_guard<std::mutex> lock(mu_);
@@ -546,7 +547,10 @@ class LoomNpu {
       } else {   // the next arena, once the commands in it retired
         arena_ = (arena_ + 1) % kArenas;
         std::unique_lock<std::mutex> lock(mu_);
+        const auto tw = std::chrono::steady_clock::now();
         retired_cv_.wait(lock, [&] { return retired_ >= arenas_[arena_].last; });
+        commands_.arena_waits += 1;
+        commands_.arena_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
         arenas_[arena_].used = 0;
       }
     }
@@ -554,6 +558,7 @@ class LoomNpu {
     {
       std::lock_guard<std::mutex> lock(mu_);
       a.last = submitted_ + 1;   // the command about to be submitted (EnqueueGated)
+      commands_.bytes += size;
     }
     std::memcpy(static_cast<std::uint8_t*>(a.storage.mapping.data) + a.used, bytes.data(), size);
     YAH_AMDF(api_->host_mapping_cache_control(a.map, AMDF_HOST_CACHE_OPERATION_FLUSH, a.used, size),
@@ -618,6 +623,9 @@ class LoomNpu {
       }
       const auto now = std::chrono::steady_clock::now();
       const double ms = std::chrono::duration<double, std::milli>(now - std::max(p.t0, last_retired_)).count();
+      // submitted after the previous command retired: the NPU sat idle with nothing queued
+      const double idle = p.t0 > last_retired_ && last_retired_.time_since_epoch().count()
+                              ? std::chrono::duration<double, std::milli>(p.t0 - last_retired_).count() : 0;
       last_retired_ = now;
       {
         std::lock_guard<std::mutex> lock(mu_);
@@ -628,6 +636,7 @@ class LoomNpu {
             st.jobs += 1, st.calls += g.calls.size();
           }
           commands_.commands += 1, commands_.busy_ms += ms, commands_.max_ms = std::max(commands_.max_ms, ms);
+          commands_.idle_ms += idle;
           last_command_ms_ = ms;
         }
       }
@@ -1069,6 +1078,8 @@ class LoomNpuSplit : public NpuSplit {
     const LoomNpu::CommandStats c = npu_.Commands();
     std::fprintf(f, "npu: %zu commands, NPU %.1f ms (waits for the GPU included), longest %.1f ms\n", c.commands,
                  c.busy_ms, c.max_ms);
+    std::fprintf(f, "npu: %.1f MB of commands, host waits for a free arena %zu (%.1f ms), NPU idle with none queued %.1f ms\n",
+                 c.bytes / 1e6, c.arena_waits, c.arena_wait_ms, c.idle_ms);
   }
 
  private:
