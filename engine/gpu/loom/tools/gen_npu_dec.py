@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NPU weight decoders for the fill column of gen_npu_gemm (dcol = 2), one per GGUF format (DQ_FMT: IQ4_XS, Q4_K, IQ3_S,
-IQ3_XXS, Q3_K; the module's constants follow DQ_FMT at import, gen_npu_gemm.decoder reloads it per format).
+IQ3_XXS, IQ2_XXS, IQ2_XS, Q3_K; the module's constants follow DQ_FMT at import, gen_npu_gemm.decoder reloads it per format).
 Standalone check: DQ_FMT=<fmt> [DQ_PORTS=2] gen_npu_dec.py <work> <model.gguf> (decodes 80 rows per port of the
 first matching K = 5120 tensor and compares every fragment with the oracle, bit for bit).
 The IQ4_XS decoder (16-row panel units):
@@ -28,13 +28,24 @@ def grid_table(name, n):
     return np.fromfile(os.path.join(TABLES, name), np.uint8).reshape(n, 4).astype(np.float64)
 
 FMT = os.environ.get("DQ_FMT", "IQ4_XS")
-BLK = {"IQ4_XS": 136, "Q4_K": 144, "IQ3_S": 110, "IQ3_XXS": 98, "Q3_K": 110}[FMT]     # bytes per super-block
-HBY = {"IQ4_XS": 8, "Q4_K": 16, "IQ3_S": 2, "IQ3_XXS": 2, "Q3_K": 0}[FMT]          # header bytes before qs
-GRID = FMT in ("IQ3_S", "IQ3_XXS")   # grid formats: gathers of 4-value grid entries + sign masks, tables as rodata
+BLK = {"IQ4_XS": 136, "Q4_K": 144, "IQ3_S": 110, "IQ3_XXS": 98, "IQ2_XXS": 66, "IQ2_XS": 74,
+       "Q3_K": 110}[FMT]   # bytes per super-block
+HBY = {"IQ4_XS": 8, "Q4_K": 16, "IQ3_S": 2, "IQ3_XXS": 2, "IQ2_XXS": 2, "IQ2_XS": 2,
+       "Q3_K": 0}[FMT]        # header bytes before qs
+GRID = FMT in ("IQ3_S", "IQ3_XXS", "IQ2_XXS", "IQ2_XS")   # grid formats: gathers of 4-value grid pieces + sign masks (rodata)
 GP4 = os.environ.get("DQ_GORD", "P4") == "P4"   # grid formats push in IQ4_XS's k-block order (0, 2, 1, 3) per sub-block
 gpair = (lambda kb: 2 * (kb // 4) + kb % 2) if GP4 else (lambda kb: kb // 2)   # hot-loop pair of a k-block
 gpos = (lambda kb: (kb % 4) // 2) if GP4 else (lambda kb: kb % 2)               # its position in the pair
-XXS = FMT == "IQ3_XXS"          # sign fields and scales in the aux words (7-bit ksigns indices, s = aux >> 28)
+XXS = FMT in ("IQ3_XXS", "IQ2_XXS")   # sign fields and scales in the aux words (7-bit ksigns indices, s = aux >> 28)
+# IQ2_XXS: per sub-block [4 grid index bytes | aux word]; an 8-value grid entry is two 4-value pieces (the halves of a
+# table line, like the signs: one address per row, duplicated, the odd lane reads the second piece). The index and aux
+# words are the even / odd 4-byte units of the realigned rows (shuffle modes 4 / 5); an index byte becomes an address
+# the way a sign field does. Otherwise IQ3_XXS: T = d (2 s + 1), the table holds grid / 8 (w = d (0.5 + s) grid / 4).
+X2 = FMT == "IQ2_XXS"
+# IQ2_XS: per k-block a u16 (9-bit grid index | 7-bit sign field << 9; 512 entries: 8 KB table, the page added),
+# a scale nibble per 16 values (8 bytes at +66): T = d (2 ls + 1) per 16 values, Q3_K's two chains (NPARTS 4, record c
+# = sub-blocks 4 c .. 4 c + 3) with ls' = 33 + 2 ls; the hot loop takes T per k-block (P4 pairs span two groups)
+XS2 = FMT == "IQ2_XS"
 # Q3_K: no gathers. Per record (128 values: qs bits of half n, hmask bit 4 n + j) both halves' rows of [hmask 32 B |
 # qs 32 B] are transposed to [chunk][row][8 B] and nibble-unpacked to scratch (NIB); a fragment (k-block 4 j + c) is
 # then (qs nibble & crumb mask) | (hmask nibble & 1 << j) doubled into place, interleaved with a high byte 0x43 (j even:
@@ -60,7 +71,7 @@ KV = I.KV if FMT == "IQ4_XS" else [float(v) for v in range(16)]
 OUTCAP = 2
 TC_IQ4 = (("su", 0x380), ("sv", 0), ("u", 0xC6A0), ("v", 0xC320), ("s", 0xC681), ("1", 0x4A01), ("1", 0x4901))
 TC_Q4K = (("su", 0x380), ("sv", 0), ("u", 0xC680), ("v", 0xC300), ("s", 0xC681), ("1", 0x4A01))   # T = d sc
-NPARTS = 4 if FMT in ("Q4_K", "Q3_K") else 2   # bf16 parts per scale line (T hi / lo; Q4_K adds -M hi / lo, Q3_K
+NPARTS = 4 if FMT in ("Q4_K", "Q3_K", "IQ2_XS") else 2   # bf16 parts per scale line (T hi / lo; Q4_K adds -M hi / lo, Q3_K
                                                # holds 8 sub-blocks: lines (f, p) = 2 f + p)
 NIB = 0                         # Q3_K: storage B nibble rows per half: hmask nibble n of chunk c at 64 c, qs lo / hi at
                                 # 64 (4 + c) / 64 (8 + c); 768 B per half (the gather addresses' region, unused)
@@ -78,12 +89,23 @@ def grid_rodata(name):
     grid 512 x [4 bf16] (both block halves), signs 256 x (masks of bits 0-3 | bits 4-7 in the two halves),
     qh bits 256 x [8 bytes 0 / 1] (both halves)."""
     hexs = lambda a: a.view(np.uint8).tobytes().hex()
-    if XXS:
+    if XXS or XS2:
         # IQ3_XXS: grid / 4 (T = d (2 s + 1)), 256 entries; signs by the 7-bit field f: ksigns(f) = f | parity(f) << 7
-        grid = (grid_table("grid_iq3xxs.bin", 256) / 4).astype(np.float32)
-        gt = np.zeros((64, 2, 4, 4), np.uint16)
-        for idx in range(256):
-            gt[idx >> 2, :, idx & 3] = bf16_bits_np(grid[idx])
+        gt = np.zeros((128 if XS2 else 64, 2, 4, 4), np.uint16)
+        if XS2:                                     # IQ2_XS: as IQ2_XXS, 512 entries
+            g8 = (np.fromfile(os.path.join(TABLES, "grid_iq2xs.bin"), np.uint8).reshape(512, 8) / 8).astype(np.float32)
+            for idx in range(512):
+                for h_ in range(2):
+                    gt[idx >> 2, h_, idx & 3] = bf16_bits_np(g8[idx, 4 * h_:4 * h_ + 4])
+        elif X2:                                      # IQ2_XXS: grid / 8, entry idx's values 4 h .. 4 h + 3 in half h
+            g8 = (np.fromfile(os.path.join(TABLES, "grid_iq2xxs.bin"), np.uint8).reshape(256, 8) / 8).astype(np.float32)
+            for idx in range(256):
+                for h_ in range(2):
+                    gt[idx >> 2, h_, idx & 3] = bf16_bits_np(g8[idx, 4 * h_:4 * h_ + 4])
+        else:
+            grid = (grid_table("grid_iq3xxs.bin", 256) / 4).astype(np.float32)
+            for idx in range(256):
+                gt[idx >> 2, :, idx & 3] = bf16_bits_np(grid[idx])
         st = np.zeros((32, 2, 4, 4), np.uint16)
         for f in range(128):
             ks = f | ((bin(f).count("1") & 1) << 7)
@@ -289,7 +311,7 @@ def leaf(name="dec", nports=1):
 
     if GRID:
         # rodata tables: their 4 KB pages as address high bytes (address = page << 12 | 16 index via vups << 4)
-        for t_ in (("gt", "st") if XXS else ("gt", "st", "qt")):
+        for t_ in (("gt", "st") if XXS or XS2 else ("gt", "st", "qt")):
             e(f"%{t_}p = mov.local-address @{t_}_{name}")
             e(f"%{t_}a = mov.address-to-scalar %{t_}p")
             e(f"%{t_}c = lshl %{t_}a, {k(-12)}")
@@ -348,9 +370,10 @@ def leaf(name="dec", nports=1):
         e.L.append(f"^{nm}x:")
 
 
-    def aux_words(x, base_scalar, row0):
+    def aux_words(x, base_scalar, row0, sel=None):
         """8 rows' aux words (realigned 64 B at base + 576 row) transposed: O[i] = words [2 i, 2 i + 1][row 0..7]
-        (zips 16, 14 / 15, 12 / 13 on 4-byte units)."""
+        (zips 16, 14 / 15, 12 / 13 on 4-byte units). sel: a shuffle mode applied to each row first (IQ2_XXS: 4 / 5,
+        its even / odd 4-byte units)."""
         sh_, al_ = x.t("ash"), x.t("aal")
         x(f"{sh_} = and {base_scalar}, {k(63)}")
         x(f"{al_} = and {base_scalar}, {k(-64)}")
@@ -363,6 +386,10 @@ def leaf(name="dec", nports=1):
             x(f"{va} = vlda.512.i8x64 {pv}, 0")
             x(f"{vb} = vlda.512.i8x64 {pv}, 64")
             x(f"{q} = vshift {va}, {vb}, {sh_}")
+            if sel is not None:
+                q2_ = x.t("qs")
+                x(f"{q2_} = vshuffle {q}, {q}, {k(sel)}")
+                q = q2_
             R.append(q)
         P_ = []
         for q in range(4):
@@ -401,8 +428,8 @@ def leaf(name="dec", nports=1):
     def xxs_scales(x, h, b8):
         """IQ3_XXS: ls = 33 + 2 s (s = aux >> 28, one per sub-block) in the lane order [s'][row][f]."""
         ab = x.t("xab")
-        x(f"{ab} = add.rr %hin_{h}, {k(66)}")
-        O = aux_words(x, ab, 0)
+        x(f"{ab} = add.rr %hin_{h}, {k(2 if X2 else 66)}")
+        O = aux_words(x, ab, 0, 5 if X2 else None)
         sh28 = x.t("s28")
         x(f"{sh28} = mov.shift 28")
         cs_ = []
@@ -469,6 +496,9 @@ def leaf(name="dec", nports=1):
         if GRID:                                # one run per half (pointer budget)
             e(f"%hdpa_{h} = add.rr %hb0_{h}, {k(HDR + 32)}")
             e(f"%hdp_{h} = mov.scalar-to-address %hdpa_{h}")
+            if XS2:                             # the scale bytes -> SCM [row][8 B]
+                e(f"%hsaa_{h} = add.rr %hb0_{h}, {k(SCM + 32)}")
+                e(f"%hsa_{h} = mov.scalar-to-address %hsaa_{h}")
             rows_s = []
         if Q3K:                                 # one run per half: d words -> HDR [row][8 B], sc -> SCM [c][row][8 B]
             for nm_, off_ in (("hdp", HDR + 32), ("hsa", SCM + 32), ("hsb", SCM + 96)):
@@ -490,6 +520,23 @@ def leaf(name="dec", nports=1):
             if GRID:                                        # IQ3_S: d (+0) and the 4 scale bytes (+106), u16 loads
                 rb_, pr2, dw, s0, s1, s1h, sw = (x.t(n) for n in ("rb", "pq", "dw", "s0", "s1", "s1h", "sw"))
                 x(f"{dw} = lda.u16 {pr}, 0")                # d first: one pointer per stream at a time
+                if XS2:                                     # d | 0 -> HDR, the 8 scale bytes (+66, u16 loads) -> SCM
+                    x(f"st {dw}, %hdp_{h}, {8 * r - 32}")
+                    x(f"st {k(0)}, %hdp_{h}, {8 * r - 28}")
+                    x(f"{rb_} = add.rr {ra}, {k(66)}")
+                    x(f"{pr2} = mov.scalar-to-address {rb_}")
+                    hs_ = []
+                    for i_ in range(4):
+                        hs_.append(x.t("hs"))
+                        x(f"{hs_[-1]} = lda.u16 {pr2}, {2 * i_}")
+                    for i_ in range(2):
+                        sh_, w_ = x.t("s1h"), x.t("sw")
+                        x(f"{sh_} = lshl {hs_[2 * i_ + 1]}, {k(16)}")
+                        x(f"{w_} = or {hs_[2 * i_]}, {sh_}")
+                        x(f"st {w_}, %hsa_{h}, {8 * r + 4 * i_ - 32}")
+                    if r == 7:
+                        run(rows_s, int(os.environ.get("DQ_HDRWIN", "1")))
+                    continue
                 if XXS:
                     x(f"st {dw}, %hdp_{h}, {8 * r - 32}")
                     x(f"st {k(0)}, %hdp_{h}, {8 * r - 28}")
@@ -585,7 +632,29 @@ def leaf(name="dec", nports=1):
             x(f"{LU} = vshuffle {LT}, {LT}, {k(11)}")            # f = 1 half to the front
             x(f"{a_} = vshuffle {LT}, {LU}, {m20}")              # [s'][row][f]
             return a_
-        if Q3K:   # d [row] as IQ4_XS's header shuffles leave it; per record c its 8 sub-blocks' sc [row][j] (SCM + 64 c)
+        if XS2:   # d as Q3_K; nibbles [row 0-3 | 4-7][16] -> record c's [row][j] (8-byte units of parity c: modes 6 / 7)
+            x(f"{H} = vlda.512.i8x64 {phd}, 0")
+            x(f"{DSv} = vshuffle {H}, {H}, {m4c}")
+            x(f"{Dv} = vshuffle {DSv}, {DSv}, {m2c}")
+            hv = x.t("hv")
+            x(f"{hv} = vshuffle {Dv}, {Dv}, {m18}")              # d [row][f]
+            scv = x.t("scv")
+            x(f"{scv} = vlda.512.i8x64 {phd}, {SCM}")
+            un = []
+            for i_ in range(2):
+                sl_, u_ = x.t("ss"), x.t("su")
+                x(f"{sl_} = slice {scv}[{i_}] : {V2} -> {V1}")
+                x(f"{u_} = vunpack.u4.to.u8x64 {sl_}")
+                un.append(u_)
+            chains = []
+            for c in range(2):
+                n_, n2_, ls_, b33 = x.t("sn"), x.t("n2"), x.t("LS"), x.t("b8")
+                x(f"{n_} = vshuffle {un[0]}, {un[1]}, {k(6 + c)}")
+                x(f"{n2_} = vadd.8 {n_}, {n_}")
+                x(f"{b33} = vbcst.8 {k(33)}")
+                x(f"{ls_} = vadd.8 {n2_}, {b33}")                # ls' = 33 + 2 ls: T = d (ls' - 32)
+                chains.append((lsplit(ls_), hv, TC_IQ4, c, False))
+        elif Q3K:   # d [row] as IQ4_XS's header shuffles leave it; per record c its 8 sub-blocks' sc [row][j] (SCM + 64 c)
             x(f"{H} = vlda.512.i8x64 {phd}, 0")
             x(f"{DSv} = vshuffle {H}, {H}, {m4c}")
             x(f"{Dv} = vshuffle {DSv}, {DSv}, {m2c}")
@@ -791,7 +860,7 @@ def leaf(name="dec", nports=1):
                         dv = x.t("dv")
                         x(f"{dv} = vshuffle {cs_[0]}, {cs_[1]}, {k(2 + f)}")
                         # Q3_K: record pbase, its lines (f, p) at 2 f + p
-                        pp_, o = x.addr(pph, (pbase * 2 * NPARTS * 64 + (2 * f + p) * 64) if Q3K else
+                        pp_, o = x.addr(pph, (pbase * 2 * NPARTS * 64 + (2 * f + p) * 64) if Q3K or XS2 else
                                         (f * 2 * NPARTS * 64 + (pbase + p) * 64), cursor="pph_w")
                         x(f"vst.512.bf16x32 {dv}, {pp_}, {o}")
                     if p < 1:
@@ -832,21 +901,23 @@ def leaf(name="dec", nports=1):
         # +74 + 16 r) realigned per row; qh (4 B at +66 + 4 r) by u16 loads into QS staging [row][s]; qh bits [s][l][e]
         # per row from the qh-bit table (gathers); qs and bits transposed to [kb][row][e] (zips 18, 16 / 17, 14 / 15),
         # signs to [kb][row] (zips 20, 18, 16 / 17); addresses (page << 12) + 16 index by vups << 4 into GA
-        for nm_, off_, mul_ in ((("q", 2, 32), ("r", 66, 16)) if XXS else (("q", 2, 32), ("s", 74, 16), ("h", 66, 4))):
+        for nm_, off_, mul_ in ((("q", 2, 32),) if X2 or XS2 else (("q", 2, 32), ("r", 66, 16)) if XXS else
+                                (("q", 2, 32), ("s", 74, 16), ("h", 66, 4))):
             e(f"%gr{nm_} = mul {r_}, {k(mul_)}")
             e(f"%gb{nm_} = add.rr %jin, %gr{nm_}")
             e(f"%go{nm_} = add.rr %gb{nm_}, {k(off_)}")
-        for nm_ in (("q",) if XXS else ("q", "s")):
+        for nm_ in (() if X2 or XS2 else ("q",) if XXS else ("q", "s")):
             e(f"%gsh{nm_} = and %go{nm_}, {k(63)}")
             e(f"%gal{nm_} = and %go{nm_}, {k(-64)}")
-        e("%cgv = vbcst.8 %gtc")
-        e("%csv = vbcst.8 %stc")
-        if not XXS:
+        if not (X2 or XS2):
+            e("%cgv = vbcst.8 %gtc")
+            e("%csv = vbcst.8 %stc")
+        if not (XXS or XS2):
             e("%cqv = vbcst.8 %qtc")
         e("%sh4 = mov.shift 4")
         # qh staging (scalar, both halves) first: the bit gathers below load it (a separate run orders the memory)
         rs0 = []
-        for hh in (range(2) if not XXS else ()):
+        for hh in (range(2) if not (XXS or XS2) else ()):
             for r in range(8):
                 row = 8 * hh + r
                 x = e.stream()
@@ -899,6 +970,74 @@ def leaf(name="dec", nports=1):
                     O.append(o_)
             return O
         for hh in range(2):
+            if XS2:
+                # IQ2_XS record r: 8 rows' u16 words (k-blocks 2 w, 2 w + 1) transposed; grid index (9 bit, + page << 8:
+                # the 8 KB table crosses a page) and sign field (7 bit, | page << 8) per k-block -> addresses
+                x = e.stream()
+                xa = x.t("xra")
+                x(f"{xa} = add.rr %goq, {k(ROWB * 8 * hh)}" if hh else f"{xa} = or %goq, {k(0)}")
+                O = aux_words(x, xa, 0)
+                cvs = {}
+                for kind, page_ in (("g", "%gtc"), ("s", "%stc")):
+                    cw_, cv_ = x.t("cw"), x.t("cv")
+                    x(f"{cw_} = lshl {page_}, {k(8)}")
+                    x(f"{cv_} = vbcst.16 {cw_}")
+                    cvs[kind] = cv_
+                for a_ in range(2):                             # words 4 a .. 4 a + 3
+                    for e_ in range(2):                         # the u16 of k-block 2 w + e
+                        for kind, msk, sh0, mx in (("g", 0x1FF, 0, 0), ("s", 0xFE00, 9, 127)):
+                            shr = x.t("shl")
+                            x(f"{shr} = mov.shift {sh0 + 16 * e_}")
+                            f_ = field(x, O[2 * a_], O[2 * a_ + 1], msk << (16 * e_), shr)
+                            if mx and e_:                       # the field's shift is arithmetic
+                                f_ = band(x, f_, mx)
+                            u_ = x.t("su")
+                            x(f"{u_} = {'vadd.16' if kind == 'g' else 'vbor'} {f_}, {cvs[kind]}")
+                            for h2, md2 in enumerate((k(18), k(19))):
+                                du, ua = x.t("sd"), x.t("sa")
+                                x(f"{du} = vshuffle {u_}, {u_}, {md2}")    # [w 2][row][dup]
+                                x(f"{ua} = vups.2x.x-to-c.unsigned {du}, %sh4")
+                                for q2 in range(2):
+                                    q1 = x.t("sg")
+                                    kb_ = 2 * (4 * a_ + 2 * h2 + q2) + e_
+                                    x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
+                                    pgs = P(x, "%spb", GAS + 2048 * hh + 256 * gpair(kb_) +
+                                            (128 if kind == "s" else 0) + 64 * gpos(kb_))
+                                    x(f"vst.acc {q1}, {pgs}, 0")
+                run([x], 1)
+                continue
+            if X2:
+                # IQ2_XXS record r: the 4 sub-blocks' index words (even units) and aux words (odd units) of 8 rows,
+                # transposed; index byte l / sign field l -> (v | page << 8) [ib 4][row], duplicated -> addresses
+                for kind, sel_, page_, wd in (("g", 4, "%gtc", 8), ("s", 5, "%stc", 7)):
+                    x = e.stream()
+                    xa = x.t("xra")
+                    x(f"{xa} = add.rr %goq, {k(ROWB * 8 * hh)}" if hh else f"{xa} = or %goq, {k(0)}")
+                    O = aux_words(x, xa, 0, sel_)
+                    cw_, cv_ = x.t("cw"), x.t("cv")
+                    x(f"{cw_} = lshl {page_}, {k(8)}")
+                    x(f"{cv_} = vbcst.16 {cw_}")
+                    for l in range(4):
+                        shr = x.t("shl")
+                        x(f"{shr} = mov.shift {wd * l}")
+                        f_ = field(x, O[0], O[1], ((1 << wd) - 1) << (wd * l), shr)
+                        if wd * l + wd == 32:                   # the field's shift is arithmetic: v - 256 for v >= 128
+                            f_ = band(x, f_, 0xFF)
+                        u_ = x.t("su")
+                        x(f"{u_} = vbor {f_}, {cv_}")
+                        for h2, md2 in enumerate((k(18), k(19))):
+                            du, ua = x.t("sd"), x.t("sa")
+                            x(f"{du} = vshuffle {u_}, {u_}, {md2}")    # [ib 2][row][dup]
+                            x(f"{ua} = vups.2x.x-to-c.unsigned {du}, %sh4")
+                            for q2 in range(2):
+                                q1 = x.t("sg")
+                                kb_ = 4 * (2 * h2 + q2) + l
+                                x(f"{q1} = slice {ua}[{q2}] : {M2} -> {M1}")
+                                pgs = P(x, "%spb", GAS + 2048 * hh + 256 * gpair(kb_) + (128 if kind == "s" else 0) +
+                                        64 * gpos(kb_))
+                                x(f"vst.acc {q1}, {pgs}, 0")
+                    run([x], 1)
+                continue
             # grid: qs rows (V1) and the qh-bit rows (gathers from the bit table) through the same network, then per
             # group: u16 qs | (page_g + bit) << 8, vups << 4 -> grid addresses
             rq = []
@@ -1236,19 +1375,30 @@ def leaf(name="dec", nports=1):
                     xs4.append(x4)
                 x = e.stream()
                 frags.append(x)
-                t4s = []
-                for p in range(2):
-                    ld, bc, ra, rb, t4 = x.t("pl"), x.t("bc"), x.t("ra"), x.t("rb"), x.t("TB")
-                    x(f"{ld} = vlda.512.bf16x32 {sp0}, {(hh * NPARTS + p) * 64}")
-                    x(f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {sl_}")
-                    x(f"{ra} = vshuffle {bc}, {bc}, {m52}")
-                    x(f"{rb} = vshuffle {bc}, {bc}, {m53}")
-                    x(f"{t4} = concat({ra}, {rb}) : ({V2}, {V2}) -> {V4}")
-                    t4s.append(t4)
+
+                def tload(line0, lane):
+                    t4s = []
+                    for p in range(2):
+                        ld, bc, ra, rb, t4 = x.t("pl"), x.t("bc"), x.t("ra"), x.t("rb"), x.t("TB")
+                        x(f"{ld} = vlda.512.bf16x32 {sp0}, {(line0 + p) * 64}")
+                        x(f"{bc} = vbroadcast.bf16x8.to.bf16x32 {ld}, {lane}")
+                        x(f"{ra} = vshuffle {bc}, {bc}, {m52}")
+                        x(f"{rb} = vshuffle {bc}, {bc}, {m53}")
+                        x(f"{t4} = concat({ra}, {rb}) : ({V2}, {V2}) -> {V4}")
+                        t4s.append(t4)
+                    return t4s
                 accs = []
-                for x4 in xs4:
-                    acc = mac(x, None, t4s[0], x4)
-                    accs.append(mac(x, acc, t4s[1], x4))
+                if XS2 and GP4:   # the k-block's 16-value group g = kb // 2: line 2 (g // 4) + p, lane g % 4 (one T live)
+                    for pos, x4 in enumerate(xs4):
+                        kb_ = 4 * (pr // 2) + 2 * pos + pr % 2 if GP4 else 2 * pr + pos
+                        t4s = tload(hh * NPARTS + 2 * (kb_ // 8), (kb_ // 2) % 4)
+                        acc = mac(x, None, t4s[0], x4)
+                        accs.append(mac(x, acc, t4s[1], x4))
+                else:             # (IQ2_XS in natural order: the pair is one group, pr)
+                    t4s = tload(hh * NPARTS + 2 * (pr // 4), pr % 4) if XS2 else tload(hh * NPARTS, sl_)
+                    for x4 in xs4:
+                        acc = mac(x, None, t4s[0], x4)
+                        accs.append(mac(x, acc, t4s[1], x4))
                 if hh == 0:
                     parked = accs
                     tails.append([])
@@ -1641,6 +1791,35 @@ def q3k_fields(blk):
 
 def weights(raw):
     """raw [rows][super-blocks][BLK] -> the decoder's f32 weights [rows][super-blocks][256] (its exact op order)."""
+    if XS2:                                             # w = d (2 ls + 1) (grid / 8)[q & 511][j] ksign(q >> 9): exact
+        grid = np.fromfile(os.path.join(TABLES, "grid_iq2xs.bin"), np.uint8).reshape(512, 8).astype(np.float64) / 8
+        d = raw[..., 0:2].copy().view(np.float16)[..., 0].astype(np.float64)
+        q = raw[..., 2:66].copy().view(np.uint16).astype(np.int64)
+        sb = raw[..., 66:74].astype(np.int64)
+        ls = np.stack([(sb[..., i // 2] >> (4 * (i % 2))) & 15 for i in range(16)], -1)
+        f = q >> 9
+        par = np.zeros_like(f)
+        for b in range(7):
+            par ^= (f >> b) & 1
+        ks = f | (par << 7)
+        sign = np.stack([1 - 2 * ((ks[..., v // 8] >> (v % 8)) & 1) for v in range(256)], -1)
+        g = grid[q & 511].reshape(raw.shape[:-1] + (256,))
+        return (np.repeat(d[..., None] * (1 + 2 * ls), 16, -1) * g * sign).astype(np.float32)
+    if X2:                                              # w = d (2 s + 1) (grid / 8)[qs][j] ksign: exact in f32
+        grid = np.fromfile(os.path.join(TABLES, "grid_iq2xxs.bin"), np.uint8).reshape(256, 8).astype(np.float64) / 8
+        d = raw[..., 0:2].copy().view(np.float16)[..., 0].astype(np.float64)
+        sb = raw[..., 2:66].reshape(raw.shape[:-1] + (8, 8))
+        qs = sb[..., 0:4].reshape(raw.shape[:-1] + (32,)).astype(np.int64)
+        aux = sb[..., 4:8].copy().view(np.uint32)[..., 0].astype(np.int64)
+        sc = aux >> 28
+        f = np.stack([(aux >> (7 * l)) & 127 for l in range(4)], -1)
+        par = np.zeros_like(f)
+        for b in range(7):
+            par ^= (f >> b) & 1
+        ks = f | (par << 7)
+        sign = np.stack([1 - 2 * ((ks[..., v // 32, (v // 8) % 4] >> (v % 8)) & 1) for v in range(256)], -1)
+        g = grid[qs].reshape(raw.shape[:-1] + (256,))
+        return (np.repeat(d[..., None] * (1 + 2 * sc), 32, -1) * g * sign).astype(np.float32)
     if XXS:                                             # w = d (2 s + 1) (grid / 4)[qs][j] ksign: exact in f32
         grid = grid_table("grid_iq3xxs.bin", 256) / 4
         d = raw[..., 0:2].copy().view(np.float16)[..., 0].astype(np.float64)
@@ -1712,7 +1891,7 @@ def main():
     t = next(x for x in rd.tensors if x.tensor_type.name == FMT and len(x.shape) == 2 and int(x.shape[0]) == 5120
              and int(x.shape[1]) >= 1024)
     raw = np.asarray(t.data).view(np.uint8).reshape(-1, 20, BLK)[160:160 + 80 * nports].copy()   # 80 rows per port
-    np.concatenate([raw.reshape(-1), np.zeros(256, np.uint8)]).tofile(f"{work}/in.bin")   # + slack: records over-read
+    np.concatenate([raw.reshape(-1), np.zeros(1024, np.uint8)]).tofile(f"{work}/in.bin")   # + slack: records over-read
     np.zeros(nports * 8 * units * OUT_B, np.uint8).tofile(f"{work}/o0.bin")
     r = subprocess.run([hrx_paths.XDNA_RUN, "--columns=1", f"--image={work}/p.xdna", "--entry=probe", "--binding_memory=system",
                         f"--binding={work}/in.bin", f"--binding={work}/o0.bin", f"--output=1={work}/out.bin"],

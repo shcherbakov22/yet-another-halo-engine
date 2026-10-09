@@ -889,8 +889,8 @@ class LoomPrefill {
   std::size_t FfnBlkH() const { return std::size_t{B_ / 64} * (FfnBlkF() / 1024) * 4 * 128 * 144; }
   std::size_t FfnBlkDown() const { return (FfnBlkH() + 4095) / 4096 * 4096; }
   static int DecoderId(const char* fmt) {
-    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k"};
-    for (int i = 0; i < 5; ++i)
+    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k", "iq2xxs"};
+    for (int i = 0; i < 6; ++i)
       if (std::strcmp(kDecoders[i], fmt) == 0) return i;
     return -1;
   }
@@ -1245,7 +1245,7 @@ class LoomPrefill {
   std::string DcolImage(const std::string& wname, int* dec = nullptr) const {
     Fmt f{};
     if (!FmtOf(static_cast<std::uint32_t>(Find(wname)->type), &f)) return "";
-    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k"};
+    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k", "iq2xxs"};
     const auto it = std::find_if(std::begin(kDecoders), std::end(kDecoders),
                                  [&](const char* d) { return std::strcmp(d, f.name) == 0; });
     if (it == std::end(kDecoders)) return "";
