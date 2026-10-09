@@ -1075,17 +1075,43 @@ def leaf(name="dec", nports=1):
         st["fifo"] = nxt
 
     if GRID:
-        # ---- IQ3_S hot: per k-block pair (same sub-block) and row half: T rows (2 parts), per k-block 8 grid + 8
-        # sign gathers (rows in lane order: [row][8] directly), X = grid | signs, 2 MACs; pushes [kb][h]
+        # ---- grid hot: per k-block pair (same sub-block) and row half. G streams (per k-block and table): one
+        # address vector -> 4 gathers (rows in lane order: [row][8] directly); C stream: T rows (2 parts), X = grid |
+        # signs, 2 MACs per k-block, pushes [kb][h]. Small G streams keep many gathers in flight (IQ4_XS's shape).
         frags, tails = [], []
         gpp = {}
         for pr in range(8):
             sl_ = pr // 2
             parked = None
             for hh in range(2):
+                xs4 = []
+                for pos in range(2):
+                    x = e.stream()
+                    frags.append(x)
+                    tails.append([])
+                    if (hh, pr // 4) not in gpp:     # pairs 4 j .. 4 j + 3 of a half: offsets -512 .. 448
+                        gpp[(hh, pr // 4)] = P(x, "%spb", GAS + 2048 * hh + 1024 * (pr // 4) + 512)
+                    gv = {}
+                    for kind, off in (("g", 0), ("s", 128)):
+                        ad = x.t("ad")
+                        x(f"{ad} = vlda.512.i8x64 {gpp[(hh, pr // 4)]}, {256 * (pr % 4) + off + 64 * pos - 512}")
+                        for hf_ in range(2):
+                            av, gl, gh, gc = x.t("av"), x.t("gl"), x.t("gh"), x.t("gc")
+                            x(f"{av} = slice {ad}[{hf_}] : {V2} -> {V1}")
+                            x(f"{gl} = vldb.4x32.lo {av}")
+                            x(f"{gh} = vldb.4x32.hi {av}")
+                            x(f"{gc} = concat({gl}, {gh}) : ({V1}, {V1}) -> {V2}")
+                            gv[(kind, hf_)] = gc
+                    xvs = []
+                    for hf_ in range(2):
+                        xv = x.t("xv")
+                        x(f"{xv} = vbor {gv[('g', hf_)]}, {gv[('s', hf_)]}")
+                        xvs.append(xv)
+                    x4 = x.t("X")
+                    x(f"{x4} = concat({xvs[0]}, {xvs[1]}) : ({V2}, {V2}) -> {V4}")
+                    xs4.append(x4)
                 x = e.stream()
                 frags.append(x)
-                pgp = P(x, "%spb", GAS + 2048 * hh + 256 * pr)        # this pair's grid / sign addresses
                 t4s = []
                 for p in range(2):
                     ld, bc, ra, rb, t4 = x.t("pl"), x.t("bc"), x.t("ra"), x.t("rb"), x.t("TB")
@@ -1096,25 +1122,7 @@ def leaf(name="dec", nports=1):
                     x(f"{t4} = concat({ra}, {rb}) : ({V2}, {V2}) -> {V4}")
                     t4s.append(t4)
                 accs = []
-                for kb_ in (2 * pr, 2 * pr + 1):
-                    ga_, sa_ = x.t("ga"), x.t("sa")
-                    x(f"{ga_} = vlda.512.i8x64 {pgp}, {64 * (kb_ % 2)}")
-                    x(f"{sa_} = vlda.512.i8x64 {pgp}, {128 + 64 * (kb_ % 2)}")
-                    xvs = []
-                    for hf_ in range(2):
-                        parts_ = []
-                        for adv in (ga_, sa_):
-                            av, gl, gh, gc = x.t("av"), x.t("gl"), x.t("gh"), x.t("gc")
-                            x(f"{av} = slice {adv}[{hf_}] : {V2} -> {V1}")
-                            x(f"{gl} = vldb.4x32.lo {av}")
-                            x(f"{gh} = vldb.4x32.hi {av}")
-                            x(f"{gc} = concat({gl}, {gh}) : ({V1}, {V1}) -> {V2}")
-                            parts_.append(gc)
-                        xv = x.t("xv")
-                        x(f"{xv} = vbor {parts_[0]}, {parts_[1]}")
-                        xvs.append(xv)
-                    x4 = x.t("X")
-                    x(f"{x4} = concat({xvs[0]}, {xvs[1]}) : ({V2}, {V2}) -> {V4}")
+                for x4 in xs4:
                     acc = mac(x, None, t4s[0], x4)
                     accs.append(mac(x, acc, t4s[1], x4))
                 if hh == 0:
@@ -1279,8 +1287,8 @@ def leaf(name="dec", nports=1):
                     if cc == 1 and (u == 0 or SLU):
                         flush(pt)                          # every 8 pushes (SLU: the iteration-end flush too)
                 tails.append(pt.L)
-    run(frags, int(os.environ.get("DQ_WINH", "2" if GRID else "6")), tails,
-        hv=int(os.environ.get("DQ_HHV", "20" if GRID else "24")))   # grid formats: 8 live T rows per stream
+    run(frags, int(os.environ.get("DQ_WINH", "6")), tails,
+        hv=int(os.environ.get("DQ_HHV", "20" if GRID else "24")))   # grid: X (4 vec256) per G stream, 8 T rows per C
     if SLU:
         e(f"%spc0 = copy {sp0} : reg<aie2p.ep> -> reg<aie2p.ep>")
         if 2 * NPARTS * 64 <= 448:
