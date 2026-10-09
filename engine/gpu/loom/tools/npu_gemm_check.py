@@ -146,7 +146,15 @@ def main():
         ref = value(a[:, k0:k1]) @ (value(w[:, k0:k1]) if wq is None else wq[:, k0:k1]).T
         ulp = np.exp2(np.floor(np.log2(np.maximum(np.abs(ref), 1e-30))) - 7)   # of bf16 at ref
         e = np.abs(part - ref) / ulp
-        err = max(err, float(np.where(np.isnan(e), np.inf, e).max()))   # (Python max drops NaN)
+        e = np.where(np.isnan(e), np.inf, e)   # (Python max drops NaN)
+        err = max(err, float(e.max()))
+        if err > 0.501:   # where: per column, the bad output rows (features) and tokens
+            for c in range(cols):
+                ec = e[:, N.TN * c:N.TN * (c + 1)]
+                if ec.max() > 0.501:
+                    bad = np.argwhere(ec > 0.501)
+                    print(f"group {g} column {c}: {len(bad)} bad, features {np.unique(bad[:, 1] // 16)} (slabs), "
+                          f"tokens {bad[:, 0].min()}..{bad[:, 0].max()}")
         k0 = k1
     got = unpack_c(raw, cols, nb, len(grp))
     exact = a.astype(np.float64) @ (w.astype(np.float64) if wq is None else wf).T

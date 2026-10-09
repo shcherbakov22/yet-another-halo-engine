@@ -335,7 +335,8 @@ def array_program(L, cfg):
     for c in range(cols):
         for r in range(rows):
             wrec = NP * slab(cfg.ks[r])
-            w_off = c * panel + sum(P * NP * slab(k) for k in cfg.ks[:r])
+            order = fuse_order(cfg, c)
+            w_off = c * panel + sum(P * NP * slab(cfg.ks[j]) for j in order[:order.index(r)])
             e(f"  %wo{c}_{r} = constant.u64 {w_off} : reg<aie2p.array.offset : offset>")
             e(f"  %ws{c}_{r} = sender %wb, 0 : reg<aie2p.array.sender : tile<{nb}x{P}x{wrec // 4}xi32, "
               f"#encoding.layout.strided<strides=[0, {wrec // 4}, 1]>>>")
@@ -570,14 +571,24 @@ def fuse_groups(cfg):
 
 
 def fuse_cover(cfg, c):
-    """Column c's filling rows: {filler row: the rows whose slices it fills (consecutive, its own first; their panels
-    share its fill, interleaved per unit)}. Rows 0 .. rows - 2 fill their own, the second-to-last also the last row's.
-    The gate column (fuse 2) has one filler, its head, for every row: four streams at most cross each downward link,
-    and the gate's tick and signal plus C leave room for a single egress."""
+    """Column c's filling rows: {filler row: the rows whose slices it fills, consecutive rows in panel member order
+    (their panels share its fill, interleaved per unit)}. Rows 0 .. rows - 2 fill their own, the second-to-last also
+    the last row's. The gate column (fuse 2) has one filler, its head, for every row: four streams at most cross each
+    downward link, and the gate's tick and signal plus C leave room for a single egress. fuse 2 lists the filler last:
+    a member's drain starts once its slice of the group's last unit lands, and the filler's drain overwrites its W ring,
+    the decoder's scratch, which the other members' slices are still copied from."""
     rows = len(cfg.ks)
     if cfg.fuse == 2 and cfg.gate and c == gate_ports(cfg)["col"]:
-        return {0: tuple(range(rows))}
-    return {r: ((r, rows - 1) if r == rows - 2 else (r,)) for r in range(rows - 1)}
+        return {0: tuple(range(1, rows)) + (0,)}
+    last = (rows - 1, rows - 2) if cfg.fuse == 2 else (rows - 2, rows - 1)
+    return {r: (last if r == rows - 2 else (r,)) for r in range(rows - 1)}
+
+
+def fuse_order(cfg, c):
+    """Column c's panel slices in W binding order (the memory-tile panel members' order: fuse_cover)."""
+    if cfg.fuse != 2:
+        return list(range(len(cfg.ks)))
+    return [r for _, cov in sorted(fuse_cover(cfg, c).items()) for r in cov]
 
 
 def fuse_filler(cfg, c, r):
@@ -588,7 +599,7 @@ def fuse_filler(cfg, c, r):
 def fuse_record(cfg, cov):
     """(egress record words, records per call) of a filler of the rows cov. Records are whole 4-word steps dividing
     every replay group's fill."""
-    unit = NP * sum(slab(cfg.ks[j]) for j in cov) // 4
+    unit = NP * sum(slab(cfg.ks[j]) for j in cov) // 4   # (fuse 1: cov in row order)
     if cfg.fuse == 2:   # whole 64-byte copies, whole records per slab
         fw = max(w for w in range(16, FUSE_REC + 1, 16) if all(sw % w == 0 for _, sw in fuse_pieces(cfg, cov)))
         return fw, cfg.passes * unit // fw
@@ -603,7 +614,7 @@ FUSE_UNIT_RAW = 16 * FUSE_SB * FUSE_BLK   # a (pass, slab) unit's raw bytes: [16
 
 def fuse_span(cfg, cov):
     """fuse 2, a filler of the rows cov: (k-block range k0, k1 of a pass; first super-block, super-block count)."""
-    k0, k1 = sum(cfg.ks[:cov[0]]), sum(cfg.ks[:cov[-1] + 1])
+    k0, k1 = sum(cfg.ks[:min(cov)]), sum(cfg.ks[:max(cov) + 1])
     s0, s1 = k0 // 32, -(-k1 // 32)
     return k0, k1, s0, s1 - s0
 
@@ -654,7 +665,7 @@ def fuse_channels(e, cfg, panel):
         e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cols}x{units}x{uw}xi32>>")
     covs = list(fuse_cover(cfg, -1).values())   # an ordinary column's covers, then any other column's
     covs += [cov for c in range(cols) for cov in fuse_cover(cfg, c).values() if cov not in covs]
-    tag = lambda cov: str(cov[0]) if cov in covs[:rows - 1] else "f" + "".join(map(str, cov))
+    tag = lambda cov: str(covs.index(cov)) if cov in covs[:rows - 1] else "f" + "".join(map(str, cov))
     for cov in covs:
         fw, nrec = fuse_record(cfg, cov)
         e(f"  %fdn{tag(cov)} = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
@@ -788,7 +799,7 @@ def fuse_prologue(L, cfg, role, ks, cov):
     dp, _ = fuse_ports(role)
     wrec = NP * slab(ks)
     sw = [slab(k) // 4 for k in cfg.ks]
-    pre = sum(sw[:cov[0]])
+    pre = sum(sw[:min(cov)])
     mine = sum(sw[j] for j in cov)
     post = sum(sw) - pre - mine
     e("  %fzs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
@@ -938,7 +949,7 @@ def fuse_decode(L, cfg, dp, cov):
     pieces = fuse_pieces(cfg, cov)
     assert FUSE_SB * FUSE_BLK <= D.RECROW and FUSE_SB * W % 16 <= 8
     assert FZ_SP + D.SCR_B <= FZ_IN and FZ_IN + 16 * D.RECROW <= FZ_SP2 and FZ_SP2 + D.SCR2_B <= FZ_OUT
-    assert FZ_OUT + nsb * 2 * D.OUT_B + 2047 <= 2 * NP * slab(cfg.ks[cov[0]]) and fw % 16 == 0
+    assert FZ_OUT + nsb * 2 * D.OUT_B + 2047 <= 2 * NP * slab(cfg.ks[cov[-1]]) and fw % 16 == 0   # (filler last)
     e("^fzdq(%fzN: reg<aie2p.er>):")
     e("  %fzpD = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     e("  st %fzN, %fzpD, 12")                       # the units left
