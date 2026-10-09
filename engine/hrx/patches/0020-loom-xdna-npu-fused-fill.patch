@@ -1,0 +1,206 @@
+Fused panel fill (Loom AIE2P array programs): GEMM workers fill their own memory-tile panels, so weights can be decoded
+by the cores that use them (no decoder column).
+- Data core streams may be multicast: a binding sender feeding several workers' core streams (constrain.core_stream
+  on each channel of one sender) takes one shim MM2S; followers route from the owner's shim channel. Streamed plans
+  give such supplies a descriptor set per parity, and the control program pushes them as call bindings.
+- Panels filled from worker egress (constrain.fill): each source fills its own panel; channels with the same fill
+  source share it (a filling row's panel also holds the next row's slice).
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index 6974bd075..f4e6c2373 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -885,7 +885,9 @@ static iree_status_t loom_aie2p_array_extract_topology(
+             loom_aie2p_array_lookup_entity(builder, loom_op_operands(op)[1])
+                 ->index;
+         builder->channels[panel].fill_source = source;
+-        builder->channels[source].fill_target = panel;
++        if (builder->channels[source].fill_target == UINT32_MAX) {
++          builder->channels[source].fill_target = panel;   // the first panel
++        }
+         break;
+       }
+       case AIE2P_ARRAY_DESCRIPTOR_REF_ARRAY_CONSTRAIN_SIGNAL: {
+@@ -2691,13 +2693,41 @@ static iree_status_t loom_aie2p_array_plan_core_stream_channel(
+       LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_MEMORY_TO_STREAM);
+   const loom_aie2p_array_worker_t* worker =
+       &builder->workers[(ingress ? receiver : sender)->owner_index];
+-  // Its whole chain: a streamed plan queues core stream channels only in its
+-  // gate and done invocations, not on alternating descriptor sets.
++  if (channel->source_channel_index != channel_index) {
++    // A multicast data stream's follower: the source's shim DMA, one more
++    // branch of its route (EXPERIMENT, HRX patch 0020).
++    const loom_aie2p_array_channel_t* source =
++        &builder->channels[channel->source_channel_index];
++    if (source->sender_dma_index == UINT32_MAX) {
++      return loom_aie2p_array_reject_channel_resources(
++          builder, channel_index,
++          builder->workers[receiver->owner_index].coordinate,
++          IREE_SV("a multicast core stream's source must be planned first"));
++    }
++    const loom_aie2p_array_dma_plan_t* shim_dma =
++        &builder->dma_channels[source->sender_dma_index];
++    channel->sender_dma_index = source->sender_dma_index;
++    if (!loom_aie2p_array_route_ingress(
++            &builder->route_builder, channel_index,
++            channel->source_channel_index, shim_dma->coordinate,
++            shim_dma->dma_channel,
++            builder->workers[receiver->owner_index].coordinate,
++            LOOM_XDNA_STREAM_PORT_CORE, 0, /*vertical_first=*/false)) {
++      return loom_aie2p_array_diagnose_route_capacity(builder, channel_index);
++    }
++    return iree_ok_status();
++  }
++  // Its whole chain: a streamed plan queues gate, signal, and request core
++  // streams only in its gate and done invocations; a data stream on the
++  // alternating descriptor sets, like every other binding.
++  const uint16_t chain = iree_max(
++      1, builder->binding_plans[channel->binding_plan_index].chain_length);
+   const uint16_t shim_descriptor_count =
+-      channel->signal
+-          ? 2
+-          : iree_max(1, builder->binding_plans[channel->binding_plan_index]
+-                            .chain_length);
++      channel->signal ? 2
++      : builder->plan->stream_panels &&
++              loom_aie2p_array_channel_is_data_stream(channel)
++          ? (uint16_t)(2u * chain)
++          : chain;
+   // A request's tick shares its poll's shim tile (planned first) and lock.
+   const loom_aie2p_array_dma_plan_t* poll_dma =
+       channel->request_partner != UINT32_MAX && !channel->request_poll
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+index f482cc30d..3fcc5e6e3 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.h
+@@ -300,6 +300,15 @@ typedef struct loom_aie2p_array_channel_t {
+   uint32_t stage_panel_unit_bytes;
+ } loom_aie2p_array_channel_t;
+ 
++// A core stream channel carrying data on every invocation (no gate, signal, or
++// request): queued with the other bindings, its binding fanout multicast to
++// several workers' stream ports (EXPERIMENT, HRX patch 0020).
++static inline bool loom_aie2p_array_channel_is_data_stream(
++    const loom_aie2p_array_channel_t* channel) {
++  return channel->core_stream && !channel->gate && !channel->signal &&
++         channel->request_partner == UINT32_MAX;
++}
++
+ // Declared requirements associated with a worker entry symbol.
+ struct loom_aie2p_array_leaf_t {
+   // Module-local core entry symbol.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index fc26ffc93..0cc1740b6 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -1691,8 +1691,14 @@ static iree_status_t loom_aie2p_program_build_stream_push(
+       group_count = iree_max(group_count, owner->stage_panel_group_count);
+       continue;
+     }
+-    // Core stream channels move in the gate and done invocations only.
+-    if (plan->channels[binding_plan->channel_index].core_stream) continue;
++    // Gate, signal, and request core streams move in the gate and done
++    // invocations only.
++    const loom_aie2p_array_channel_t* channel =
++        &plan->channels[binding_plan->channel_index];
++    if (channel->core_stream &&
++        !loom_aie2p_array_channel_is_data_stream(channel)) {
++      continue;
++    }
+     // A chained transfer axis: each parity set is its own chain.
+     const uint16_t chain = binding_plan->chain_step_byte_length != 0
+                                ? binding_plan->chain_length
+@@ -1793,7 +1799,10 @@ static void loom_aie2p_program_build_core_stream_phase(
+           &plan->binding_plans[i];
+       const loom_aie2p_array_channel_t* channel =
+           &plan->channels[binding_plan->channel_index];
+-      if (!channel->core_stream) continue;
++      if (!channel->core_stream ||
++          loom_aie2p_array_channel_is_data_stream(channel)) {
++        continue;
++      }
+       const loom_aie2p_array_dma_plan_t* dma =
+           &plan->dma_channels[binding_plan->dma_index];
+       const bool egress =
+@@ -1864,9 +1873,12 @@ static void loom_aie2p_program_build_control_pushes(
+   for (iree_host_size_t i = 0; i < builder->plan->binding_plan_count; ++i) {
+     const loom_aie2p_array_binding_plan_t* binding_plan =
+         &builder->plan->binding_plans[i];
+-    if (gated &&
+-        builder->plan->channels[binding_plan->channel_index].core_stream !=
+-            core_stream) {
++    // A data core stream moves with the call.
++    const loom_aie2p_array_channel_t* channel =
++        &builder->plan->channels[binding_plan->channel_index];
++    if (gated && (channel->core_stream &&
++                  !loom_aie2p_array_channel_is_data_stream(channel)) !=
++                     core_stream) {
+       continue;
+     }
+     const loom_aie2p_array_dma_plan_t* dma =
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+index 3af96ce3a..e073f4019 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+@@ -90,10 +90,14 @@ loom_aie2p_array_topology_channel_resource_flags(
+       const loom_aie2p_array_endpoint_t* base_sender =
+           loom_aie2p_array_topology_base_endpoint(topology->plan, sender);
+       if (channel->core_stream) {
+-        // The worker's core stream port is the compute end: only the shim DMA.
+-        return base_sender->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_BINDING
+-                   ? LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_MEMORY_TO_STREAM
+-                   : LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_STREAM_TO_MEMORY;
++        // The worker's core stream port is the compute end: only the shim DMA
++        // (a multicast ingress: its source channel's).
++        if (base_sender->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_BINDING) {
++          return owns_source
++                     ? LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_MEMORY_TO_STREAM
++                     : 0;
++        }
++        return LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_SHIM_STREAM_TO_MEMORY;
+       }
+       if (base_sender->owner_kind == LOOM_AIE2P_ARRAY_ENDPOINT_OWNER_BINDING) {
+         return LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_COMPUTE_STREAM_TO_MEMORY |
+@@ -1194,12 +1198,13 @@ iree_status_t loom_aie2p_array_topology_validate(
+     if ((!worker_pair &&
+          channel->transport != LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_EXTERNAL_DMA) ||
+         channel->stage_column != UINT16_MAX || channel->leaf_sync ||
+-        sender->channel_use_count != 1) {
++        (sender->channel_use_count != 1 &&
++         (worker_pair || !loom_aie2p_array_channel_is_data_stream(channel)))) {
+       return loom_aie2p_array_topology_reject_channel_connection(
+           topology, (uint32_t)i,
+           IREE_SV("a core stream channel must connect one binding and one "
+-                  "worker, or two workers, directly: no stage, multicast, or "
+-                  "leaf sync"));
++                  "worker, or two workers, directly: no stage, multicast (but "
++                  "a data stream's binding), or leaf sync"));
+     }
+     for (iree_host_size_t j = 0; j < i; ++j) {
+       const loom_aie2p_array_channel_t* other = &topology->channels[j];
+@@ -1308,6 +1313,26 @@ iree_status_t loom_aie2p_array_topology_validate(
+             sender->message_type, sender->binding_view_partitioned) <= 1) {
+       continue;   // only replayed panels are shared
+     }
++    // Worker-filled panels (constrain.fill): the channels one source fills
++    // share a panel, any other source fills a panel of its own. Channels
++    // without a fill source share as below (a decoder column's panel: its
++    // filled owner and the column's other rows).
++    if (channel->fill_source != UINT32_MAX) {
++      uint32_t owner = (uint32_t)channel_index;
++      for (iree_host_size_t other_index = 0; other_index < channel_index;
++           ++other_index) {
++        const loom_aie2p_array_channel_t* other =
++            &topology->channels[other_index];
++        if (other->fill_source == channel->fill_source &&
++            other->stage_panel_owner != UINT32_MAX) {
++          owner = other->stage_panel_owner;
++          break;
++        }
++      }
++      topology->channels[owner].stage_panel_owner = owner;
++      channel->stage_panel_owner = owner;
++      continue;
++    }
+     for (iree_host_size_t other_index = 0; other_index < channel_index;
+          ++other_index) {
+       loom_aie2p_array_channel_t* other = &topology->channels[other_index];

@@ -55,7 +55,11 @@ def main():
         sys.exit(__doc__)
     work, cols, nb = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
     ks, passes = tuple(int(v) for v in sys.argv[4].split(",")), int(sys.argv[5])
-    cfg = N.Config(cols, nb, ks, passes, mu=int(os.environ.get("NPU_MU", "2")))   # NPU_MU=1: one M slab per iteration
+    # NPU_MU=1: one M slab per iteration (2-slot activation ring); NPU_FUSE=1: the GEMM cores fill their panels
+    mu, fuse = int(os.environ.get("NPU_MU", "2")), int(os.environ.get("NPU_FUSE", "0"))
+    if os.environ.get("NPU_GROUPS"):   # replay groups of passes, e.g. "5" (one group)
+        N.GE.GROUPS = tuple(int(v) for v in os.environ["NPU_GROUPS"].split(","))
+    cfg = N.Config(cols, nb, ks, passes, mu=mu, fuse=fuse)
     M, Nn, K = N.TM * nb, N.TN * cols, 8 * passes * sum(ks)
     os.makedirs(work, exist_ok=True)
     if len(sys.argv) > 7:
@@ -69,7 +73,12 @@ def main():
     img = os.path.join(work, "npu_gemm.xdna")
     open(src, "w").write(N.gen(cfg))
     env = hrx_paths.env()
-    env.update(N.LOOM_ENV)
+    env.update(N.loom_env(cfg))
+    for k in os.environ.get("NPU_ENV_DROP", "").split(","):   # e.g. LOOM_EXP_PANEL_STREAM (diagnosis)
+        env.pop(k, None)
+    for kv in os.environ.get("NPU_ENV_ADD", "").split(","):    # e.g. LOOM_EXP_ROUTE_RESET=1 (diagnosis)
+        if "=" in kv:
+            env[kv.split("=")[0]] = kv.split("=", 1)[1]
     run([hrx_paths.LOOM_COMPILE, src, f"--root=@{cfg.entry}", "--target=amd.xdna.aie2p:amd.xdna.strix_halo.17f0_11",
          f"--output={img}"], env, "loom-compile")
     a_b, w_b, c_b = (os.path.join(work, n) for n in ("a.bin", "w.bin", "c.bin"))
@@ -83,6 +92,12 @@ def main():
     co = os.path.join(work, "c_out.bin")
     base = ["--image=" + img, "--entry=" + cfg.entry, "--binding_memory=system", "--binding=" + a_b,
             "--binding=" + w_b, "--binding=" + c_b]
+    if fuse:   # the egress lanes' dummy binding (never transferred), the raw stream binding
+        d_b, r_b = os.path.join(work, "d.bin"), os.path.join(work, "r.bin")
+        words = max(fw * nrec for fw, nrec in (N.fuse_record(cfg, r) for r in range(len(ks) - 1)))
+        np.zeros(len(ks) * cols * words, np.int32).tofile(d_b)
+        N.fuse_raw(np.frombuffer(rw.tobytes(), np.int32), cfg).tofile(r_b)
+        base += ["--binding=" + d_b, "--binding=" + r_b]
     width = None
     for cand in range(cols, 9):   # memory-tile stages can need a wider context than the compute columns
         r = subprocess.run([hrx_paths.XDNA_RUN, f"--columns={cand}", f"--output=2={co}"] + base,
