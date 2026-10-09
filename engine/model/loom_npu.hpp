@@ -920,20 +920,44 @@ class LoomNpuSplit : public NpuSplit {
     const auto key = std::make_tuple(image, a.offset + (a.in_c ? std::size_t{1} << 62 : 0), a.length, std::size_t{r0},
                                      raw_bytes, c.offset, c.length);
     if (const auto it = ids_.find(key); it != ids_.end()) return it->second;
-    const Raw* r = nullptr;
-    for (const Raw& x : raw_)
-      if (x.begin <= r0 && r0 + raw_bytes <= x.end) r = &x;
-    if (!r) throw LoomError("npu: raw weights outside the registered ranges");
+    std::vector<LoomNpu::View> views = CallViews(a, c);
+    views.push_back(RawView(raw, raw_bytes));
+    return ids_[key] = BindViews(image, swap, dec, family, std::move(views));
+  }
+  std::uint32_t BindRawPair(const std::string& image, const std::string& swap, int dec, NpuView a, const void* gate,
+                            std::size_t gate_bytes, const void* up, std::size_t up_bytes, NpuView c,
+                            std::size_t junk_bytes, const std::string& family) override {
+    const auto key = std::make_tuple(image, a.offset + (a.in_c ? std::size_t{1} << 62 : 0), a.length,
+                                     std::size_t{reinterpret_cast<std::uintptr_t>(gate)},
+                                     reinterpret_cast<std::uintptr_t>(up), c.offset, c.length);
+    if (const auto it = ids_.find(key); it != ids_.end()) return it->second;
+    if (junk_bytes > cscratch_.bytes) throw LoomError("npu: the gate columns' records exceed the scratch C");
+    std::vector<LoomNpu::View> views = CallViews(a, c);
+    views.push_back(RawView(gate, gate_bytes));
+    views.push_back(RawView(up, up_bytes));
+    views.push_back({&cscratch_, 0, junk_bytes});   // the gate columns' C records: never read
+    return ids_[key] = BindViews(image, swap, dec, family, std::move(views));
+  }
+  // A decoder-column call's bindings up to its raw rows: A, the panel (not read), C, the gate's flag / tick / signal,
+  // the fill sink (not written).
+  std::vector<LoomNpu::View> CallViews(NpuView a, NpuView c) {
     const std::size_t slot = GateSlot();
-    // bindings: A, the panel (not read), C, the gate's flag / tick / signal, the fill sink (not written), raw rows
-    const std::vector<LoomNpu::View> views = {{a.in_c ? &c_ : &a_, a.offset, a.length},
-                                              {&w_, 0, plan_.w_bytes},
-                                              {&c_, c.offset, c.length},
-                                              {&flags_, slot, plan_.gate_record},
-                                              {&flags_, slot + kTick, plan_.gate_record},
-                                              {&flags_, slot + kSignal, 2 * plan_.gate_record},
-                                              {&w_, 0, plan_.w_bytes},
-                                              {r->shared, r0 - r->begin, raw_bytes}};
+    return {{a.in_c ? &c_ : &a_, a.offset, a.length},
+            {&w_, 0, plan_.w_bytes},
+            {&c_, c.offset, c.length},
+            {&flags_, slot, plan_.gate_record},
+            {&flags_, slot + kTick, plan_.gate_record},
+            {&flags_, slot + kSignal, 2 * plan_.gate_record},
+            {&w_, 0, plan_.w_bytes}};
+  }
+  LoomNpu::View RawView(const void* raw, std::size_t bytes) const {
+    const auto r0 = reinterpret_cast<std::uintptr_t>(raw);
+    for (const Raw& x : raw_)
+      if (x.begin <= r0 && r0 + bytes <= x.end) return {x.shared, r0 - x.begin, bytes};
+    throw LoomError("npu: raw weights outside the registered ranges");
+  }
+  std::uint32_t BindViews(const std::string& image, const std::string& swap, int dec, const std::string& family,
+                          std::vector<LoomNpu::View> views) {
     // one instance per image, re-bound per call (an instance's storage is ~0.7 MB, mostly its array setup)
     LoomNpu::Kernel*& k = instances_[image];
     if (!k) {
@@ -942,13 +966,13 @@ class LoomNpuSplit : public NpuSplit {
       if (!sw) sw = &npu_.Load(swap, "npu_gemm", views);   // only its setup runs
       k->family = &families_[family], k->dec = dec, k->swap = sw;
       std::vector<LoomNpu::View> scratch = views;   // the setup instance: its call writes the scratch C
-      scratch[2] = {&cscratch_, 0, c.length};
+      scratch[2] = {&cscratch_, 0, views[2].length};
       k->setup = &npu_.Load(image, "npu_gemm", scratch);
     } else {
       npu_.Rebind(*k, views);
     }
     calls_.push_back(npu_.Snapshot(*k));
-    return ids_[key] = static_cast<std::uint32_t>(calls_.size() - 1);
+    return static_cast<std::uint32_t>(calls_.size() - 1);
   }
   // A flag word from / to the host, through memory (the NPU does not snoop CPU caches).
   void HostStore(std::uint32_t word, std::uint32_t value) override {

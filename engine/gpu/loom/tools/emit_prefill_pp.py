@@ -661,6 +661,10 @@ NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
 FFNBLK_FMTS = ("iq4xs", "iq3s", "iq3xxs")
 FFNBLK_DOWN_FMTS = ("iq3s", "iq3xxs")
 FFNBLK_DOWN = ((0, 4), (4, 3))   # (first pass, passes) of down's K slice F, per call
+# Layers whose gate and up formats differ: column pairs (gen_npu_gemm ufmt; 192 features per call), F = 6144 and down in
+# two 3-pass parts.
+FFNBLK_PAIR = 6144
+FFNBLK_PAIR_DOWN = ((0, 3), (3, 3))
 
 
 def npu_chunks(site):
@@ -937,7 +941,7 @@ def npu_split(rows, combos, B, outdir):
     out.append(("npu_flag_wait.hal", 1, 32, 0))
     out.append(("npugate", GN.GATE_SUPPLY, GN.GATE_CALLS, GN.GATE_RECORD))
     if NPU_DCOL:
-        extra = npu_ffnblk(rows, B, tmp, outdir, out, split) if NPU_FFNBLK else []
+        extra = npu_ffnblk(rows, B, tmp, outdir, out, split, variants) if NPU_FFNBLK else []
         out.extend(npu_dcol_images(dcol_images, B, tmp, outdir, extra))
         GE.ACT_PERM = None
         return out
@@ -977,7 +981,7 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     # sources and environments first (gen_npu_gemm's NP is module state), then the compiles in parallel
     built = []
     for cfg, name, mode, np_ in jobs:
-        with GN.np_override(np_):
+        with GN.np_override(*(np_ if isinstance(np_, tuple) else (np_,))):
             src = os.path.join(tmp, name + ".loom")
             open(src, "w").write(GN.gen(cfg))
             env = dict(hrx_paths.env(), **GN.loom_env(cfg, mode == "swap"))
@@ -996,8 +1000,8 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     return [("npudcol", NPU_COLS, 0, 0), ("npubytes_5120",) + tuple(GN.stream_bytes(cfg)), ("npurows", NPU_ROWS, 0, 0)]
 
 
-def npu_ffnblk(rows, B, tmp, outdir, out, split):
-    """NPU_FFNBLK: the GPU's kernels of the FFN block (appended to out, split: npu_split's) and its NPU images (returned
+def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
+    """NPU_FFNBLK: the GPU's kernels of the FFN block (appended to out, split / variants: npu_split's) and its NPU images (returned
     as npu_dcol_images extra jobs); dispatch.txt "npuffnblk <F>", "npubytes_ffnsw" / "npubytes_ffndn<passes>"."""
     import gen_bfp16_encode as GE
     import gen_gemm_tile as TG
@@ -1011,6 +1015,9 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split):
             by.setdefault(p[1], {})[p[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
     ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in FFNBLK_FMTS
           and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in FFNBLK_DOWN_FMTS]
+    pairs = [l for l in by.values() if l.get("ffn_gate") and l.get("ffn_up") and l["ffn_gate"][0] != l["ffn_up"][0]
+             and l["ffn_gate"][0] in FFNBLK_FMTS and l["ffn_up"][0] in FFNBLK_FMTS
+             and l.get("ffn_down", ("",))[0] in FFNBLK_DOWN_FMTS]
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
         t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
@@ -1021,8 +1028,9 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split):
                                swiglu=True, dgu=mt * 16 * kb * blk, swcol=1024, hpass=F // 1024),
                      "npu_ffnsw_%s" % fmt, None, 4))
         jobs.append((jobs[-1][0], "npu_ffnsw_%s.swap" % fmt, "swap", 4))
-    for fmt, mt, kb in sorted({l["ffn_down"] for l in ok}):
-        kbw = (kb * 256 - F) // 256   # the GPU's K window [0, 17408 - F)
+    for fmt, mt, kb, kbw in sorted({l["ffn_down"] + ((l["ffn_down"][2] * 256 - F) // 256,) for l in ok} |
+                                   {l["ffn_down"] + ((l["ffn_down"][2] * 256 - FFNBLK_PAIR) // 256,) for l in pairs}):
+        # the GPU's K window [0, 17408 - F)
         tr = fit_rowgrp(npu_rem_tile(fmt, kbw, kb), mt)
 
         def gen_rem(f, k, tr=tr, kb=kb):
@@ -1032,13 +1040,22 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split):
             finally:
                 TG.KWIN = None
         assert mt not in O16_MT, "the window writes f32"
-        out.append(_emit_gen(gen_rem, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s.hal" % fmt, outdir, "kstore", tr.rowgrp,
-                             kfull=kb))
+        out.append(_emit_gen(gen_rem, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d.hal" % (fmt, kbw), outdir, "kstore",
+                             tr.rowgrp, kfull=kb))
+    for fmt, mt, kb in sorted({l["ffn_down"] for l in ok} | {l["ffn_down"] for l in pairs}):
         for p0, passes in FFNBLK_DOWN:
             jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
                                    kraw=kb * 256, ain="h", hpass=F // 1024, gord="N"), "npu_ffndn%d_%s" % (passes, fmt),
                          None, GN.NP))
             jobs.append((jobs[-1][0], "npu_ffndn%d_%s.swap" % (passes, fmt), "swap", GN.NP))
+    for (gf, mt, kb), (uf, _, _) in sorted({(l["ffn_gate"], l["ffn_up"]) for l in pairs}):
+        # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = FFNBLK_PAIR)
+        variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), FFNBLK_PAIR)
+        variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), FFNBLK_PAIR)
+        jobs.append((GN.Config(6, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[gf][0],
+                               ufmt=DCOL_FMTS[uf][0], swiglu=True, swcol=2048, hpass=F // 1024),
+                     "npu_ffnsp_%s_%s" % (gf, uf), None, (4, True)))
+        jobs.append((jobs[-1][0], "npu_ffnsp_%s_%s.swap" % (gf, uf), "swap", (4, True)))
     # hidden + the GPU's window + the NPU's down partials (two K chunks of ten 560-row calls, one replay group each)
     N, calls = 5120, -(-5120 // NPU_ROWS)
     cg = GU.CG
@@ -1072,6 +1089,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split):
     for _, passes in FFNBLK_DOWN:
         dn = next(j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes))
         out.append(("npubytes_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
+    sp = next((j for j in jobs if j[1].startswith("npu_ffnsp_")), None)
+    if sp:
+        with GN.np_override(4, True):
+            out.append(("npubytes_ffnsp",) + tuple(GN.stream_bytes(sp[0])))
+        out.append(("npuffnpair", FFNBLK_PAIR, 0, 0))
     return jobs
 
 

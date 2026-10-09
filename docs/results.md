@@ -19,6 +19,8 @@ Prefill, default set (FA attention, chunked DeltaNet, paged KV; HRX pin a02a5ab9
 
 NPU FFN block (2026-10-09, set with YAH_NPU_DCOL + YAH_NPU_SPLIT=qkv=2240,gate=2240 + YAH_NPU_FFNBLK=7168, 32 layers): gate on 16 windows vs golden5 KL mean 6.2e-5, p99.9 1.7e-3, 0 flips, PPL 6.69516 (golden 6.69503; production NPU split 1.65e-4 / 3.9e-3 / 6.69644). pp2048 3347 ms, not yet tuned: the NPU is the critical path (3.3 s busy): the swiglu epilogue takes ~1.24M cycles per call against ~0.63M for the GEMM, and every family switch runs an image setup and an ungated call.
 
+NPU FFN block with column pairs (2026-10-09, the same set plus the 9 layers whose gate and up formats differ, 41 of 64 layers): gate on 16 windows vs golden5 KL mean 6.6e-5, p99.9 1.8e-3, max 3.3e-3, 0 flips, PPL 6.69296 (golden 6.69503). pp2048 ~3600 ms (one run, untuned): the pair layers add 9 more NPU jobs of 32 calls whose gate columns only feed the up columns.
+
 NPU GEMM path pieces (2026-10-06; checks byte-exact against numpy oracles):
 
 | piece | measured |

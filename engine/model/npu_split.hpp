@@ -48,6 +48,11 @@ class NpuSplit {
   virtual std::uint32_t BindRaw(const std::string& image, const std::string& swap, int dec, NpuView a,
                                 const void* raw, std::size_t raw_bytes, NpuView c,
                                 const std::string& family = "dcol") = 0;
+  // A column-pair image (gate rows of one format, up rows of another): two raw ranges, and junk_bytes for the gate
+  // columns' C records, which nothing reads.
+  virtual std::uint32_t BindRawPair(const std::string& image, const std::string& swap, int dec, NpuView a,
+                                    const void* gate, std::size_t gate_bytes, const void* up, std::size_t up_bytes,
+                                    NpuView c, std::size_t junk_bytes, const std::string& family) = 0;
   // Handoffs are 32-bit words in host memory (Flags(): their GPU view), with no host between the GPU and the NPU.
   // The graph stores a job's gate value to its ready word once the job's inputs are written (release, system scope).
   // The NPU image waits for it (gen_npu_gemm GATE), runs the calls and writes the value to the job's done word.

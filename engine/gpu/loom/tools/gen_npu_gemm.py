@@ -71,6 +71,8 @@ class Config:
                           # input): swiglu (cols = hpass): column c writes pass c; ain "h": records [M block][pass, slab]
     swcol: int = 0        # swiglu dcol 2: raw rows between columns' first gate rows (0: TN / 2)
     gord: str = "P4"      # dcol 2: the grid decoders' k-block order (gen_npu_dec DQ_GORD; "N": natural)
+    ufmt: str = ""        # swiglu dcol 2 column pairs (cols 6): columns 0-2 compute gate rows (fmt), 3-5 the same features'
+                          # up rows (ufmt); gate tail u streams its C segment (bf16) to up tail u + 3 (core stream)
     ofeat: int = 0      # final f32 output, fragment-major into [token / 16][ofeat / 16][16][16]: column c's 80 features are
                         # fragments 5c .. 5c + 4; needs one replay group (GE.GROUPS = (passes,)) and
                         # LOOM_EXP_LS_SEND_PITCH=1 (the whole f32 slot is sent)
@@ -125,10 +127,20 @@ def loom_env(cfg, swap=False):
         env["LOOM_EXP_LS_SEND_PITCH"] = str(SW_PITCH)
         env["LOOM_EXP_LS_SEND_PITCH_RECORD"] = str(SW_REC)
         env["LOOM_EXP_PANEL_GROUPS"] = str(cfg.passes)
+    if cfg.ufmt:   # 6 GEMM columns + the fill column: admitted on the engine's 8-column context
+        env["LOOM_EXP_PARTITION_COLUMNS"] = "8"
+    if cfg.dcol == 2 and not swap:   # images of other layouts share the context: their routes must not outlive them
+        env["LOOM_EXP_ROUTE_RESET"] = "1"
     if swap:
         env["LOOM_EXP_SETUP_ONLY"] = "1"
-        env["LOOM_EXP_SETUP_TILES"] = ",".join(f"{cfg.cols}:{2 + f}" for f in range(fill_workers(cfg)))
+        env["LOOM_EXP_SETUP_TILES"] = ",".join(f"{fill_col(cfg)}:{2 + f}" for f in range(fill_workers(cfg)))
     return env
+
+
+def fill_col(cfg):
+    """The fill workers' column: column cols, column pairs column 7 like every other image of the set (a context that
+    ran the pair image left its column 6 tiles' state unusable for a later image's GEMM column there)."""
+    return 7 if cfg.ufmt else cfg.cols
 
 
 def groups(cfg):
@@ -162,19 +174,21 @@ SW_SLOT = SW_PITCH * SW_REC
 
 
 @contextlib.contextmanager
-def np_override(n):
+def np_override(n, pair=False):
     """Generate with n 16-row slabs per column (TN = 16 n) instead of NP (e.g. 4: a swiglu call's 32 features per
-    column, so its k-block units line up with 1024-feature passes)."""
-    global NP, TN, SW_REC, SW_SLOT
-    saved = NP, TN, SW_REC, SW_SLOT
+    column, so its k-block units line up with 1024-feature passes). pair: column pairs (Config.ufmt), whose up columns
+    write all n slabs' features: twice the record, so a slot of 4 records holds the f32 segment."""
+    global NP, TN, SW_REC, SW_PITCH, SW_SLOT
+    saved = NP, TN, SW_REC, SW_PITCH, SW_SLOT
     NP, TN = n, 16 * n
-    SW_REC = NP * 2 * 72
+    SW_REC = NP * 2 * 72 * (2 if pair else 1)
+    SW_PITCH = 4 if pair else 8
     SW_SLOT = SW_PITCH * SW_REC
     assert SW_SLOT >= 1024 * NP
     try:
         yield
     finally:
-        NP, TN, SW_REC, SW_SLOT = saved
+        NP, TN, SW_REC, SW_PITCH, SW_SLOT = saved
 
 
 def slab(ks):
@@ -189,9 +203,10 @@ def stream_bytes(cfg):
              + slab(cfg.ks[-1]))
     w = cfg.cols * sum(cfg.passes * NP * slab(k) for k in cfg.ks)
     if cfg.swiglu:   # the receiver's extent in H: the last 16-token row's columns
-        # the last column's (pass's) last record in H
+        # the last column's (pass's) last record in H (column pairs: up column u writes passes 2 u, 2 u + 1)
+        last = 2 * (cfg.cols // 2 - 1) if cfg.ufmt else cfg.cols - 1
         return a, w, ((cfg.nb - 1) * cfg.hpass * MP * 128 * 144 + (MP - 1) * 128 * 144
-                      + (cfg.cols - 1) * MP * 128 * 144 + SW_REC)
+                      + last * MP * 128 * 144 + SW_REC)
     return a, w, max(1, len(groups(cfg))) * cfg.cols * cfg.nb * MP * NP * 2 * 256
 
 
@@ -245,6 +260,8 @@ def array_program(L, cfg):
         for r, role in enumerate(roles):
             e(f"  %lane{c}_{r} = constant.u32 {c * rows + r} : reg<aie2p.array.scalar : index>")
             grole = role + "_g" if cfg.gate and c == 0 and r < 2 else role
+            if cfg.ufmt and role == "tail" and c < cols // 2:
+                grole = "tail_s"   # a gate column's tail: it streams its C to the up column's tail
             e(f"  %k{c}_{r} = worker %workers, %lane{c}_{r}, @{grole}")
             e(f"  constrain.location %k{c}_{r}, %n{c}, %n{2 + rows - 1 - r}")
     # C first: rings are placed in channel order, so the tail's C claims whole banks before its input rings
@@ -255,9 +272,17 @@ def array_program(L, cfg):
     if cfg.swiglu:
         # column c's record (NP k-blocks of 16 tokens) at k-block NP c of its 16-token row in H
         rec = f"{SW_REC // 4}"   # column c: pass c of H [M block][pass][slab][128 k-blocks]
-        assert cols == cfg.hpass
-        e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nb}x{MP}x{rec}xi32, "
-          f"#encoding.layout.strided<strides=[{MP * 128 * 36}, {cfg.hpass * MP * 128 * 36}, {128 * 36}, 1]>>>")
+        if cfg.ufmt:   # up column u: passes 2 u, 2 u + 1 (j // 16 of the call); gate columns: a junk binding
+            h = cols // 2
+            e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{h}x{nb}x{MP}x{rec}xi32, "
+              f"#encoding.layout.strided<strides=[{2 * MP * 128 * 36}, {cfg.hpass * MP * 128 * 36}, {128 * 36}, 1]>>>")
+            e(f"  %jb = binding {9 if cfg.gate else 6}, \"write\"")
+            e(f"  %j_all = receiver %jb, 0 : reg<aie2p.array.receiver : tile<{h}x{nb * MP}x{rec}xi32>>")
+            e(f"  %nhalf = constant.u32 {h} : reg<aie2p.array.scalar : index>")
+        else:
+            assert cols == cfg.hpass
+            e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nb}x{MP}x{rec}xi32, "
+              f"#encoding.layout.strided<strides=[{MP * 128 * 36}, {cfg.hpass * MP * 128 * 36}, {128 * 36}, 1]>>>")
         stype = f"tile<{rec}xi32>"
     elif cfg.ofeat:
         # a segment is [sub-tile 5][16 tokens][16 f32] (the tail's convert_f32)
@@ -273,10 +298,22 @@ def array_program(L, cfg):
         e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{cols}x{ng * nb * MP}x{rec}xi32>>")
         stype = f"tile<{rec}xi32>"
     for c in range(cols):
-        e(f"  %cr{c} = partition.receiver %c_all, %origin, %n{c}, %ncols : reg<aie2p.array.receiver : tile<{rec}xi32>>")
+        if cfg.ufmt:
+            u = c % (cols // 2)
+            src = "%c_all" if c >= cols // 2 else "%j_all"
+            e(f"  %cr{c} = partition.receiver {src}, %origin, %n{u}, %nhalf : reg<aie2p.array.receiver : tile<{rec}xi32>>")
+        else:
+            e(f"  %cr{c} = partition.receiver %c_all, %origin, %n{c}, %ncols : reg<aie2p.array.receiver : tile<{rec}xi32>>")
         e(f"  %sc{c} = sender %k{c}_{rows - 1}, 2 : reg<aie2p.array.sender : {stype}>")
         e(f"  %chc{c} = channel %sc{c}, %cr{c}, %n{MP}, %nseg : reg<aie2p.array.channel : tile<{rec}xi32>>")
         e(f"  constrain.leaf_sync %chc{c}")
+    if cfg.ufmt:   # gate tail u -> up tail u + 3: its C segment as bf16 (core streams, 512 words a segment)
+        e(f"  %nxs = constant.u32 {nb * MP * 512} : reg<aie2p.array.scalar : index>")
+        for u in range(cols // 2):
+            e(f"  %xs{u} = sender %k{u}_{rows - 1}, 3 : reg<aie2p.array.sender : tile<1xi32>>")
+            e(f"  %xr{u} = receiver %k{u + cols // 2}_{rows - 1}, 3 : reg<aie2p.array.receiver : tile<1xi32>>")
+            e(f"  %chx{u} = channel %xs{u}, %xr{u}, %two, %nxs : reg<aie2p.array.channel : tile<1xi32>>")
+            e(f"  constrain.core_stream %chx{u}")
     if cfg.dcol:
         fill_channels(e, cfg, panel)
     # weights: per-column panels [slice][pass][record], staged in that column's memory tile, replayed per M block
@@ -319,7 +356,7 @@ def array_program(L, cfg):
             e(f"  %ra{c}_{r} = receiver %k{c}_{r}, 0 : reg<aie2p.array.receiver : tile<{arec}>>")
             e(f"  %cha{c}_{r} = channel %a{r}, %ra{c}_{r}, %n{acap}, %arec{r} : reg<aie2p.array.channel : tile<{arec}>>")
             e(f"  constrain.leaf_sync %cha{c}_{r}")
-            e(f"  constrain.stage %cha{c}_{r}, %n{(2 * r) % cols if cols > 1 else 2}")
+            e(f"  constrain.stage %cha{c}_{r}, %n{astage(r, cols) if cols > 1 else 2}")
     if cfg.gate:
         S = cfg.gate
         e('  %fb = binding 3, "read"')
@@ -355,8 +392,31 @@ FILL_PER = 2   # GEMM columns per fill worker
 FILL_DIV = 1   # timing emulation: input records frec / FILL_DIV, written FILL_DIV times (raw-sized DRAM reads)
 
 
+def astage(r, cols):
+    """The memory-tile column K-slice row r's activations stage in: one row per column (0, 2, 4, 6; 6 columns: 0, 2, 4, 1)."""
+    return 2 * r if 2 * r < cols else (2 * r + 1) % cols
+
+
+def fill_map(cfg):
+    """Per GEMM column its (fill worker, port, decoder format); per fill worker its (ports, format). Column pairs give
+    the gate columns and the up columns their own workers (one decoder format each)."""
+    if cfg.ufmt:
+        assert cfg.cols == 6
+        cols = [(0, 0, cfg.fmt), (0, 1, cfg.fmt), (1, 0, cfg.fmt), (2, 0, cfg.ufmt), (2, 1, cfg.ufmt), (3, 0, cfg.ufmt)]
+    else:
+        cols = [(c // FILL_PER, c % FILL_PER, cfg.fmt) for c in range(cfg.cols)]
+    workers = {}
+    for f, j, fmt in cols:
+        workers[f] = (max(workers.get(f, (0, fmt))[0], j + 1), fmt)
+    return cols, [workers[f] for f in sorted(workers)]
+
+
+def fill_name(cfg, n, fmt):
+    return f"fill{n}_{fmt}" if cfg.ufmt else f"fill{n}"
+
+
 def fill_workers(cfg):
-    return (cfg.cols + FILL_PER - 1) // FILL_PER
+    return len(fill_map(cfg)[1])
 
 
 def fill_channels(e, cfg, panel):
@@ -368,17 +428,19 @@ def fill_channels(e, cfg, panel):
     nrec = panel // frec
     fw = frec // 4
     e(f"  %fcol = constant.u32 {cols} : reg<aie2p.array.scalar : index>")
+    e(f"  %floc = constant.u32 {fill_col(cfg)} : reg<aie2p.array.scalar : index>")
     e(f"  %fnrec = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
     e(f"  %fsb = binding {6 if cfg.gate else 3}, \"write\"")
     e(f"  %fs_all = receiver %fsb, 0 : reg<aie2p.array.receiver : tile<{cols}x{nrec}x{fw}xi32>>")
-    for f in range(fill_workers(cfg)):
+    cmap, wmap = fill_map(cfg)
+    for f, (n, fmt) in enumerate(wmap):
         e(f"  %flane{f} = constant.u32 {rows * cols + f} : reg<aie2p.array.scalar : index>")
         e(f"  %frow{f} = constant.u32 {2 + f} : reg<aie2p.array.scalar : index>")
-        e(f"  %kf{f} = worker %workers, %flane{f}, @fill{min(FILL_PER, cols - FILL_PER * f)}")
-        e(f"  constrain.location %kf{f}, %fcol, %frow{f}")
+        e(f"  %kf{f} = worker %workers, %flane{f}, @{fill_name(cfg, n, fmt)}")
+        e(f"  constrain.location %kf{f}, %floc, %frow{f}")
     for c in range(cols):
-        f, j = c // FILL_PER, c % FILL_PER
-        nports = min(FILL_PER, cols - FILL_PER * f)
+        f, j, _ = cmap[c]
+        nports = wmap[f][0]
         e(f"  %fsr{c} = partition.receiver %fs_all, %origin, %n{c}, %fcol : reg<aie2p.array.receiver : tile<{fw}xi32>>")
         e(f"  %fss{c} = sender %kf{f}, {nports + j} : reg<aie2p.array.sender : tile<{fw}xi32>>")
         e(f"  %chf{c} = channel %fss{c}, %fsr{c}, %two, %fnrec : reg<aie2p.array.channel : tile<{fw}xi32>>")
@@ -391,16 +453,24 @@ def fill_inputs(e, cfg, panel):
     nrec, fw = panel // cfg.frec, cfg.frec // 4 // FILL_DIV
     if cfg.dcol == 2:
         # raw rows [N][kraw / 256][BLK]: per column 25 (pass, slab) units of [16 rows][4 super-blocks]
-        D = decoder(cfg.fmt, cfg.gord)
         P_, NS_ = cfg.passes, NP
-        RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * D.BLK // 4   # row stride in words
-        RW = D.ROWB // 4                                  # record row words (fixed for every format)
         assert sum(cfg.ks) == 128
         e(f"  %rwb = binding {7 if cfg.gate else 4}, \"read\"")
+        if cfg.ufmt:   # the up columns' rows: their own binding (another format, another row size)
+            e(f"  %rub = binding {8 if cfg.gate else 5}, \"read\"")
         e(f"  %funits = constant.u32 {P_ * NS_} : reg<aie2p.array.scalar : index>")
+        cmap = fill_map(cfg)[0]
         for c in range(cfg.cols):
-            f, j = c // FILL_PER, c % FILL_PER
-            if cfg.swiglu:   # column c: gate rows swcol c .. (its features), then the same up rows dgu bytes on
+            f, j, fmt = cmap[c]
+            D = decoder(fmt, cfg.gord)
+            RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * D.BLK // 4   # row stride in words
+            RW = D.ROWB // 4                                  # record row words (fixed for every format)
+            if cfg.ufmt:   # gate column u / up column u: rows swcol u .. of its own binding
+                up = c >= cfg.cols // 2
+                e(f"  %fo{c} = constant.u64 {(c % (cfg.cols // 2)) * cfg.swcol * RS * 4} : reg<aie2p.array.offset : offset>")
+                e(f"  %fi_all{c} = sender {'%rub' if up else '%rwb'}, 0 : reg<aie2p.array.sender : tile<{P_}x{NS_}x16x{RW}xi32, "
+                  f"#encoding.layout.strided<strides=[{D.BLK}, {16 * RS}, {RS}, 1]>>>")
+            elif cfg.swiglu:   # column c: gate rows swcol c .. (its features), then the same up rows dgu bytes on
                 assert cfg.dgu % 4 == 0 and NS_ % 2 == 0
                 e(f"  %fo{c} = constant.u64 {c * (cfg.swcol or TN // 2) * RS * 4} : reg<aie2p.array.offset : offset>")
                 e(f"  %fi_all{c} = sender %rwb, 0 : reg<aie2p.array.sender : tile<{P_}x2x{NS_ // 2}x16x{RW}xi32, "
@@ -412,18 +482,18 @@ def fill_inputs(e, cfg, panel):
             e(f"  %fiv{c} = view.sender %fi_all{c}, %fo{c} : reg<aie2p.array.sender : tile<16x{RW}xi32>>")
             e(f"  %fir{c} = receiver %kf{f}, {j} : reg<aie2p.array.receiver : tile<16x{RW}xi32>>")
             e(f"  %chfi{c} = channel %fiv{c}, %fir{c}, %one, %funits : reg<aie2p.array.channel : tile<16x{RW}xi32>>")
-            a_cols = {(2 * r) % cfg.cols for r in range(len(cfg.ks))}
+            a_cols = {astage(r, cfg.cols) for r in range(len(cfg.ks))}
             e(f"  constrain.stage %chfi{c}, {'%fcol' if c in a_cols else f'%n{c}'}")
         return
     for c in range(cfg.cols):
-        f, j = c // FILL_PER, c % FILL_PER
+        f, j, _ = fill_map(cfg)[0][c]
         e(f"  %fo{c} = constant.u64 {c * panel} : reg<aie2p.array.offset : offset>")
         e(f"  %fi_all{c} = sender %wb, 0 : reg<aie2p.array.sender : tile<{nrec}x{fw}xi32>>")
         e(f"  %fiv{c} = view.sender %fi_all{c}, %fo{c} : reg<aie2p.array.sender : tile<{fw}xi32>>")
         e(f"  %fir{c} = receiver %kf{f}, {j} : reg<aie2p.array.receiver : tile<{fw}xi32>>")
         e(f"  %chfi{c} = channel %fiv{c}, %fir{c}, %two, %fnrec : reg<aie2p.array.channel : tile<{fw}xi32>>")
         # the activation rows stage in memory tiles (2 r) % cols: those columns' fills stage in the fill column's
-        a_cols = {(2 * r) % cfg.cols for r in range(len(cfg.ks))}
+        a_cols = {astage(r, cfg.cols) for r in range(len(cfg.ks))}
         e(f"  constrain.stage %chfi{c}, {'%fcol' if c in a_cols else f'%n{c}'}")
 
 
@@ -453,14 +523,15 @@ def fill_leaf(L, cfg, nports):
     e("")
 
 
-def leaf(L, cfg, role, ks, gate=None):
+def leaf(L, cfg, role, ks, gate=None, pair=None):
     e = L.append
     tail = role == "tail"
     fa = slab(ks)
     acap = cfg.acap_t if tail else cfg.acap
     a_adv = acap == MP   # a ring of MP slabs is addressed like a whole record: the base advances per iteration
     assert MP % cfg.mu == 0 and (a_adv or cfg.mu % acap == 0), "ring slot of a row must be static per iteration"
-    e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{role}{'_g' if gate else ''}() asm {{")
+    name = role + ("_g" if gate else "") + ("_s" if pair == "send" else "")
+    e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{name}() asm {{")
     e("  %a = resource<native_pointer> {index = 0, source_type = buffer} : reg<aie2p.ep>")
     e("  %w = resource<native_pointer> {index = 1, source_type = buffer} : reg<aie2p.ep>")
     if gate:   # the neighbor channel to / from the relay (leaf-synchronized)
@@ -518,6 +589,8 @@ def leaf(L, cfg, role, ks, gate=None):
             e("  %clast = lt %pm2, %cnt")
         # first pass: C loads read a 1 KB zero buffer with step 0
         e("  %zst = storage {byte_alignment = 64, byte_length = 1024} : low.storage<private>")
+        if pair:   # a segment's gate values (bf16) on their way through the core stream
+            e(f"  %gbs = storage {{byte_alignment = 64, byte_length = {NP * 512}}} : low.storage<private>")
         e("  %zbp = storage_address %zst : low.storage<private> -> reg<aie2p.ep>")
         e("  low.cond_br %first, ^zfill, ^nofill : reg<aie2p.er>")
         e("^nofill:")
@@ -559,7 +632,7 @@ def leaf(L, cfg, role, ks, gate=None):
     if gate:   # job state: private storage, zeroed by the array setup of a core stream plan
         e("  %gst = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
         e("  %gsp = storage_address %gst : low.storage<private> -> reg<aie2p.ep>")
-    body(L, cfg, role, ks, a_adv, acap, gate)
+    body(L, cfg, role, ks, a_adv, acap, gate, pair)
 
 
 def gate_epilogue(L, cfg, gate):
@@ -725,7 +798,7 @@ def gate_epilogue(L, cfg, gate):
         e("  return")
 
 
-def body(L, cfg, role, ks, a_adv, acap, gate=None):
+def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None):
     """The locked stream: per sub-tile MMA + pop bundles, then the cascade boundary.
     head: chains start with mmul; after each sub-tile, 16 cascade writes (the next sub-tile's pops ride with them)
     mid:  mmul at k 0, then k 1-4 add the incoming partial quarter by quarter (fused cascade MMA); writes like the head
@@ -1054,6 +1127,27 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
             e(f"  {p}amk = mov.i32 32767")                      # bf16 |x| mask
             e(f"  {p}amv = vbcst.16 {p}amk")
             C2, C1, C3 = bf16_round(math.log(2) ** 2 / 2), bf16_round(math.log(2)), math.log(2) ** 3 / 6
+            if pair:   # the gate buffer's address as a scalar
+                e(f"  {p}gba = storage_address %gbs : low.storage<private> -> reg<aie2p.ep>")
+                e(f"  {p}gbs0 = mov.address-to-scalar {p}gba")
+                e(f"  {p}k32 = mov.i32 32")
+                e(f"  {p}k64n = mova.i32 {NP * 16}")   # 512-bit vector loops: 32 bytes x NP * 16 per segment
+            if pair == "recv":   # the gate tail's segment: NP * 512 bytes of bf16 from the core stream
+                e(f"  {p}rq0 = mova.i32 0")
+                e(f"  low.br ^rv{t}({p}rq0: {ER})")
+                e(f"^rv{t}({p}rq: {ER}):")
+                e(f"  {p}rqm = lt {p}rq, {p}k64n")
+                e(f"  low.cond_br {p}rqm, ^rvb{t}, ^rvx{t} : {ER}")
+                e(f"^rvb{t}:")
+                e(f"  {p}rqo = mul {p}rq, {p}k32")
+                e(f"  {p}rqa = add.rr {p}gbs0, {p}rqo")
+                e(f"  {p}rqp = mov.scalar-to-address {p}rqa")
+                for w in range(8):
+                    e(f"  {p}rw{w} = mov.ss")
+                    e(f"  st {p}rw{w}, {p}rqp, {4 * w}")
+                e(f"  {p}rq1 = add.rr {p}rq, %one")
+                e(f"  low.br ^rv{t}({p}rq1: {ER})")
+                e(f"^rvx{t}:")
             e(f"  {p}sp = mov.scalar-to-address {p}ss")
             e(f"  {p}sl = vlda.store-fifo.low512 {p}sp, 0")
             e(f"  {p}f0 = vlda.store-fifo.high512 {p}sp, {p}sl, 64")
@@ -1071,15 +1165,39 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
             MF, MP_, MS = "reg<aie2p.mstfifo>", "reg<aie2p.mpfs>", "reg<aie2p.mr26_fifo_st>"
             e(f"  {p}i0 = mova.i32 0")
             e(f"  {p}k1024 = mov.i32 1024")
-            # outer loop j over the gate slabs, inner i over their two 8-row halves
-            e(f"  {p}nj = mova.i32 {NP // 2}")
+            # outer loop j over the gate slabs (column pairs: every slab), inner i over their two 8-row halves
+            e(f"  {p}nj = mova.i32 {NP if pair else NP // 2}")
             e(f"  low.br ^swj{t}({p}i0: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
             e(f"^swj{t}({p}j: {ER}, {p}JF: {MF}, {p}JO: {MP_}, {p}JP: {MS}):")
             e(f"  {p}jm = lt {p}j, {p}nj")
             e(f"  low.cond_br {p}jm, ^swjb{t}, ^swjx{t} : {ER}")
             e(f"^swjb{t}:")
-            e(f"  {p}ji0 = mova.i32 0")
-            e(f"  low.br ^swi{t}({p}ji0: {ER}, {p}JF: {MF}, {p}JO: {MP_}, {p}JP: {MS})")
+            if pair == "recv":   # the record as two store streams (one stream lost its 18th line): the second at 576
+                h = NP // 2
+                e(f"  {p}kh1 = mova.i32 {h - 1}")
+                e(f"  {p}kh3 = mova.i32 {h + 1}")
+                e(f"  {p}ja1 = lt {p}kh1, {p}j")
+                e(f"  {p}jb3 = lt {p}j, {p}kh3")
+                e(f"  {p}jeq = mul {p}ja1, {p}jb3")
+                e(f"  low.cond_br {p}jeq, ^swre{t}, ^swno{t} : {ER}")
+                e(f"^swno{t}:")
+                e(f"  low.br ^swin{t}({p}JF: {MF}, {p}JO: {MP_}, {p}JP: {MS})")
+                e(f"^swre{t}:")
+                e(f"  {p}rf, {p}rp, {p}rq_ = vst.flush.512 {p}JF, {p}JO, {p}JP")
+                e(f"  {p}k576 = mov.i32 {2 * h * 144}")
+                e(f"  {p}s2 = add.rr {p}ss, {p}k576")
+                e(f"  {p}sp2 = mov.scalar-to-address {p}s2")
+                e(f"  {p}sl2 = vlda.store-fifo.low512 {p}sp2, 0")
+                e(f"  {p}f2 = vlda.store-fifo.high512 {p}sp2, {p}sl2, 64")
+                e(f"  {p}op2 = copy {p}sp2 : reg<aie2p.ep> -> reg<aie2p.mpfs>")
+                e(f"  {p}ps2 = mova.fifo.store.position 0")
+                e(f"  low.br ^swin{t}({p}f2: {MF}, {p}op2: {MP_}, {p}ps2: {MS})")
+                e(f"^swin{t}({p}NF: {MF}, {p}NO: {MP_}, {p}NP: {MS}):")
+                e(f"  {p}ji0 = mova.i32 0")
+                e(f"  low.br ^swi{t}({p}ji0: {ER}, {p}NF: {MF}, {p}NO: {MP_}, {p}NP: {MS})")
+            else:
+                e(f"  {p}ji0 = mova.i32 0")
+                e(f"  low.br ^swi{t}({p}ji0: {ER}, {p}JF: {MF}, {p}JO: {MP_}, {p}JP: {MS})")
             e(f"^swi{t}({p}i: {ER}, {p}F: {MF}, {p}O: {MP_}, {p}P: {MS}):")
             e(f"  {p}nbk = mova.i32 2")
             e(f"  {p}im = lt {p}i, {p}nbk")
@@ -1093,8 +1211,16 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
             e(f"  {p}ia = add.rr {p}ja, {p}io")
             e(f"  {p}k512 = mov.i32 512")
             e(f"  {p}gib = add.rr {p}ia, {p}k512")
-            e(f"  {p}kup = mov.i32 {1024 * NP // 2}")
-            e(f"  {p}uib = add.rr {p}gib, {p}kup")
+            if pair:   # the slab is up (recv) or gate (send) rows; the gate values' buffer block (j, i): 256 bytes
+                e(f"  {p}uib = add.rr {p}gib, %zero")
+                e(f"  {p}kj512 = mov.i32 512")
+                e(f"  {p}gjo = mul {p}j, {p}kj512")
+                e(f"  {p}gio = mul {p}i, {p}k256")
+                e(f"  {p}gja = add.rr {p}gbs0, {p}gjo")
+                e(f"  {p}gbb = add.rr {p}gja, {p}gio")
+            else:
+                e(f"  {p}kup = mov.i32 {1024 * NP // 2}")
+                e(f"  {p}uib = add.rr {p}gib, {p}kup")
             fifo = (f"{p}F", f"{p}O", f"{p}P")
             for i in (0,):                                  # one 8-feature block per loop body
                 for r in range(2):                              # token half: chain row bit
@@ -1108,13 +1234,30 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
                             e(f"  {x} = vlda.acc {pp}, {512 * r + 64 * q - 512}")
                             q4.append(x)
                         return q4
-                    g4, u4 = load(f"{p}gib", "g"), load(f"{p}uib", "u")
+                    if pair == "send":   # the gate values to the buffer, (r, h) blocks of 32 bf16
+                        g4 = load(f"{p}gib", "g")
+                        for h in range(2):
+                            g2 = f"{n}g2{h}"
+                            e(f"  {g2} = concat({g4[2 * h]}, {g4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
+                            e(f"  {n}gb{h} = vconv.bf16.fp32 {g2}")
+                            e(f"  {n}gp{h} = mov.scalar-to-address {p}gbb")   # short-lived (the ep budget is 8)
+                            e(f"  vst.512.bf16x32 {n}gb{h}, {n}gp{h}, {64 * (2 * r + h)}")
+                        continue
+                    if pair == "recv":
+                        u4 = load(f"{p}uib", "u")
+                    else:
+                        g4, u4 = load(f"{p}gib", "g"), load(f"{p}uib", "u")
                     hs = []
                     for h in range(2):
-                        g2, u2 = f"{n}g2{h}", f"{n}u2{h}"
-                        e(f"  {g2} = concat({g4[2 * h]}, {g4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
+                        u2 = f"{n}u2{h}"
                         e(f"  {u2} = concat({u4[2 * h]}, {u4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
-                        e(f"  {n}gb{h} = vconv.bf16.fp32 {g2}")
+                        if pair == "recv":
+                            e(f"  {n}gp{h} = mov.scalar-to-address {p}gbb")
+                            e(f"  {n}gb{h} = vlda.512.bf16x32 {n}gp{h}, {64 * (2 * r + h)}")
+                        else:
+                            g2 = f"{n}g2{h}"
+                            e(f"  {g2} = concat({g4[2 * h]}, {g4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
+                            e(f"  {n}gb{h} = vconv.bf16.fp32 {g2}")
                         e(f"  {n}ub{h} = vconv.bf16.fp32 {u2}")
 
                         # vmul / vmac.bf16x32: 32 f32 lanes in the first two units of the x4 accumulator
@@ -1181,11 +1324,29 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None):
             e(f"  low.br ^swj{t}({p}j1: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
             e(f"^swjx{t}:")
             fifo = (f"{p}JF", f"{p}JO", f"{p}JP")
-            if True:
-                # the flush writes whole 64-byte lines only: pad the 2 NP fragments (72 B each) to a multiple of 8
-                # with zeros (the slot's bytes below 1152 have all been read by now)
+            if pair == "send":   # the buffer out on the core stream, 8 words at a time
+                e(f"  {p}sq0 = mova.i32 0")
+                e(f"  low.br ^sd{t}({p}sq0: {ER})")
+                e(f"^sd{t}({p}sq: {ER}):")
+                e(f"  {p}sqm = lt {p}sq, {p}k64n")
+                e(f"  low.cond_br {p}sqm, ^sdb{t}, ^sdx{t} : {ER}")
+                e(f"^sdb{t}:")
+                e(f"  {p}sqo = mul {p}sq, {p}k32")
+                e(f"  {p}sqa = add.rr {p}gbs0, {p}sqo")
+                e(f"  {p}sqp = mov.scalar-to-address {p}sqa")
+                for w in range(8):
+                    e(f"  {p}sw{w} = lda {p}sqp, {4 * w}")
+                    e(f"  mov.ms {p}sw{w}")
+                e(f"  {p}sq1 = add.rr {p}sq, %one")
+                e(f"  low.br ^sd{t}({p}sq1: {ER})")
+                e(f"^sdx{t}:")
+            if pair != "send":
+                # the flush writes whole 64-byte lines only, and drops the last one when the stream ends on a 128-byte
+                # boundary: pad with zero fragments (72 B each) until it ends at 64 mod 128 (the slot's bytes below
+                # the pads have all been read by now)
                 e(f"  {p}zc = acc.clear.f32x64")
-                for z in range(-2 * NP % 8):
+                frags = 2 * NP   # column pairs: the second of two streams
+                for z in range(next(n for n in range(16) if 72 * (frags + n) % 128 == 64)):
                     nf += 1
                     nxt = (f"{p}xf{nf}", f"{p}xp{nf}", f"{p}xq{nf}")
                     e(f"  {nxt[0]}, {nxt[1]}, {nxt[2]} = vst.push.bfp16ebs8.from.fp32 {fifo[0]}, {p}zc, {fifo[1]}, {fifo[2]}")
@@ -1276,13 +1437,16 @@ def gen(cfg):
     leaf(L, cfg, "head", cfg.ks[0])
     assert len(set(cfg.ks[1:-1])) == 1, "the mids share one leaf"
     leaf(L, cfg, "mid", cfg.ks[1])
-    leaf(L, cfg, "tail", cfg.ks[-1])
+    leaf(L, cfg, "tail", cfg.ks[-1], pair="recv" if cfg.ufmt else None)
+    if cfg.ufmt:
+        leaf(L, cfg, "tail", cfg.ks[-1], pair="send")
     if cfg.dcol:
-        for n in sorted({min(FILL_PER, cfg.cols - FILL_PER * f) for f in range(fill_workers(cfg))}):
+        for n, fmt in sorted(set(fill_map(cfg)[1])):
             if cfg.dcol == 2:
-                if (cfg.fmt, cfg.gord, n) not in _LEAVES:   # scheduled in Python (gen_npu_dec, npu_lsched): once
-                    _LEAVES[(cfg.fmt, cfg.gord, n)] = decoder(cfg.fmt, cfg.gord).leaf(f"fill{n}", n)
-                L.append(_LEAVES[(cfg.fmt, cfg.gord, n)])
+                key = (fmt, cfg.gord, n, fill_name(cfg, n, fmt))
+                if key not in _LEAVES:   # scheduled in Python (gen_npu_dec, npu_lsched): once per process
+                    _LEAVES[key] = decoder(fmt, cfg.gord).leaf(fill_name(cfg, n, fmt), n)
+                L.append(_LEAVES[key])
                 L.append("")
             else:
                 fill_leaf(L, cfg, n)

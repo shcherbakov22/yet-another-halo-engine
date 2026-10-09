@@ -224,6 +224,19 @@ class LoomPrefill {
     if (npu_on_ && std::getenv("YAH_NPU_CPU")) {
       jobs.swap(flagged_);
       graph_ = nullptr;
+      if (const char* r = std::getenv("YAH_NPU_CPU_JOBS")) {   // "a-b,c-d": only these jobs (whole family runs)
+        if (!std::strcmp(r, "list"))
+          for (std::size_t i = 0; i < jobs.size(); ++i) std::fprintf(stderr, "npu cpu-driven: job %zu %s\n", i, jobs[i].tag.c_str());
+        std::vector<NpuSplit::Queued> kept;
+        std::size_t a = 0, b = 0;
+        for (int n = 0; std::sscanf(r, "%zu-%zu%n", &a, &b, &n) == 2 && a <= b && b < jobs.size(); r += n) {
+          kept.insert(kept.end(), jobs.begin() + a, jobs.begin() + b + 1);
+          if (r[n] != ',') break;
+          ++r;
+        }
+        jobs.swap(kept);
+        for (const auto& q : jobs) std::fprintf(stderr, "npu cpu-driven: keep %s gate %08x\n", q.tag.c_str(), q.words.gate);
+      }
       std::thread enq([&] {   // it blocks while the NPU's queue is full, the NPU waits for the stores below
         try {
           npu_->Enqueue(jobs);
@@ -237,6 +250,13 @@ class LoomPrefill {
       } join{enq};
       for (std::size_t i = 0; i < jobs.size(); ++i) {
         const NpuSplit::Job& w = jobs[i].words;
+        std::vector<std::uint32_t> before;   // the job's gate slots, to report which words its calls changed
+        for (std::uint32_t k = w.ready; k <= w.done + 16; ++k) before.push_back(npu_->HostLoad(k));
+        if (const char* h = std::getenv("YAH_NPU_CPU_HOLD"); h && std::strtoul(h, nullptr, 10) == i) {
+          // the job parked at its gate (its setup call done): the stall command sees the array waiting
+          std::this_thread::sleep_for(std::chrono::milliseconds(300));
+          if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) std::system(cmd);
+        }
         npu_->HostStore(w.ready, w.gate);
         const auto t0 = std::chrono::steady_clock::now();
         std::uint32_t d = 0;
@@ -247,10 +267,15 @@ class LoomPrefill {
         if ((d & 0x7fffffffu) < w.gate || (d & 0x80000000u)) {
           std::fprintf(stderr, "npu cpu-driven: job %zu (%s) stalled or failed: done %08x gate %08x\n", i,
                        jobs[i].tag.c_str(), d, w.gate);
+          if (const char* cmd = std::getenv("YAH_NPU_CPU_STALL_CMD")) std::system(cmd);   // e.g. an AIE status dump
+          for (std::uint32_t k = w.ready; k <= w.done + 16; ++k)
+            if (const std::uint32_t v = npu_->HostLoad(k); v != before[k - w.ready])
+              std::fprintf(stderr, "  word +%u: %08x -> %08x\n", k - w.ready, before[k - w.ready], v);
           return;
         }
       }
       std::fprintf(stderr, "npu cpu-driven: %zu jobs done\n", jobs.size());
+      if (const char* cmd = std::getenv("YAH_NPU_CPU_DONE_CMD")) std::system(cmd);
       return;
     }
     chunk_graph_->Launch();
@@ -874,62 +899,98 @@ class LoomPrefill {
     const auto* tg = Find(pre + "ffn_gate.weight");
     const auto* tu = Find(pre + "ffn_up.weight");
     const auto* td = Find(pre + "ffn_down.weight");
-    if (tg->type != tu->type || tg->dims != tu->dims || tu->offset != tg->offset + tg->bytes) return false;
-    Fmt f{}, fd{};
-    const std::string hal = AfHal(GemmHal("gemm_ffn", *tg, &f), ".af.to.hal");
-    if (hal.empty() || !FmtOf(static_cast<std::uint32_t>(td->type), &fd)) return false;
-    const std::string sh = NpuHal(hal), rem = "npuffnrem_" + std::string(fd.name) + ".hal";
-    const std::string sw = dir_ + "/npu_ffnsw_" + f.name;
-    const std::string dn[2] = {dir_ + "/npu_ffndn4_" + fd.name, dir_ + "/npu_ffndn3_" + fd.name};
-    if (sh.empty() || !geom_.count(rem) || ::access((dir_ + "/norm_t_bfp_g1.hal").c_str(), R_OK) ||
+    // gate and up of one format: one image (its columns compute both); else column pairs (gen_npu_gemm ufmt)
+    const bool pair = tg->type != tu->type;
+    if (tg->dims != tu->dims || (!pair && tu->offset != tg->offset + tg->bytes) || (pair && !geom_.count("npuffnpair")))
+      return false;
+    Fmt f{}, fu{}, fd{};
+    if (!FmtOf(static_cast<std::uint32_t>(tg->type), &f) || !FmtOf(static_cast<std::uint32_t>(tu->type), &fu) ||
+        !FmtOf(static_cast<std::uint32_t>(td->type), &fd))
+      return false;
+    const std::uint32_t F = pair ? geom_.at("npuffnpair").tokens : ffnblk_, M = static_cast<std::uint32_t>(tg->dims[1]);
+    // the GPU's features: the fused ffn's split, or (pairs) gate kstore + up swiglu splits, fragment-major into ffnup_
+    const std::string hal = pair ? "" : AfHal(GemmHal("gemm_ffn", *tg, &f), ".af.to.hal");
+    const std::string sh = pair ? "" : hal.empty() ? "" : NpuHal(hal);
+    const std::string gs = pair ? NpuHal(KstoreHal(pre + "ffn_gate.weight", true)) : "";
+    const std::string us = pair ? NpuHal(SwigluHal(pre + "ffn_up.weight", true, true)) : "";
+    const std::uint32_t kbw = static_cast<std::uint32_t>(td->dims[0] - F) / 256;
+    const std::string rem = "npuffnrem_" + std::string(fd.name) + "_" + std::to_string(kbw) + ".hal";
+    const std::string sw = dir_ + (pair ? "/npu_ffnsp_" + std::string(f.name) + "_" + fu.name : "/npu_ffnsw_" + std::string(f.name));
+    const std::string dn[2] = {dir_ + (pair ? "/npu_ffndn3_" : "/npu_ffndn4_") + fd.name, dir_ + "/npu_ffndn3_" + fd.name};
+    if ((pair ? gs.empty() || us.empty() || !Af("gemm_kstore", pre + "ffn_gate.weight") ||
+                    !Af("gemm_swiglu", pre + "ffn_up.weight")
+              : sh.empty()) ||
+        !geom_.count(rem) || ::access((dir_ + "/norm_t_bfp_g1.hal").c_str(), R_OK) ||
         ::access((sw + ".xdna").c_str(), R_OK) || ::access((dn[0] + ".xdna").c_str(), R_OK) ||
         ::access((dn[1] + ".xdna").c_str(), R_OK))
       return false;
-    const std::uint32_t F = ffnblk_, M = static_cast<std::uint32_t>(tg->dims[1]);
     // the norm also writes gate / up's activations (one replay group: that stream layout)
     RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, "ffnblk");
     const NpuView ag{0, NpuK(5120).a};
     const std::uint8_t* base = gguf_.tensor_data_base();
     const std::size_t rb = static_cast<std::size_t>(tg->bytes) / M, blk = rb * 256 / tg->dims[0];
+    const std::size_t rbu = static_cast<std::size_t>(tu->bytes) / M, blku = rbu * 256 / tu->dims[0];
     const std::size_t rbd = static_cast<std::size_t>(td->bytes) / td->dims[1], blkd = rbd * 256 / td->dims[0];
     const std::size_t f0 = M - F, dgu = static_cast<std::size_t>(tg->bytes);
-    if (npu_planning_) {   // the gate rows of F through the up rows of F; all of down
-      const std::size_t a = tg->offset + f0 * rb, e = std::min(tu->offset + M * rb + 4096, gguf_.tensor_data_size());
-      npu_->RegisterRaw(base + a, e - a);
-      npu_->RegisterRaw(base + td->offset, std::min<std::size_t>(td->bytes + 4096, gguf_.tensor_data_size() - td->offset));
+    if (npu_planning_) {   // the NPU's gate / up rows (one range when up follows gate), all of down
+      const std::size_t end = gguf_.tensor_data_size();
+      if (pair) {
+        npu_->RegisterRaw(base + tg->offset + f0 * rb, std::min(tg->offset + M * rb + 4096, end) - (tg->offset + f0 * rb));
+        npu_->RegisterRaw(base + tu->offset + f0 * rbu, std::min(tu->offset + M * rbu + 4096, end) - (tu->offset + f0 * rbu));
+      } else {
+        const std::size_t a = tg->offset + f0 * rb;
+        npu_->RegisterRaw(base + a, std::min(tu->offset + M * rb + 4096, end) - a);
+      }
+      npu_->RegisterRaw(base + td->offset, std::min<std::size_t>(td->bytes + 4096, end - td->offset));
     }
-    // gate / up: 32 calls of 224 features, H from 0
-    const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
     std::vector<std::uint32_t> csw, cdn[2];
-    for (std::uint32_t j = 0; j < F / 224; ++j)
-      csw.push_back(npu_->BindRaw(sw + ".xdna", sw + ".swap.xdna", DecoderId(f.name), ag,
-                                  base + tg->offset + (f0 + 32 * j) * rb,
-                                  dgu + (6 * 1024 + 31) * rb + 16 * blk + kDcolRecordRow, {4 * j * 144, bs.c}, "ffnsw"));
-    // down: per K part (passes 0-3, 4-6 of F) ten 560-row calls, the last at rows 4560..
-    const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf("npubytes_ffndn4").c;
-    const std::uint32_t p0[2] = {0, 4};
+    if (pair) {   // 32 calls of 192 features: call j's up column u writes passes 2 u + j / 16, k-blocks 8 (j % 16) ..
+      const NpuBytes bs = NpuBytesOf("npubytes_ffnsp");
+      for (std::uint32_t j = 0; j < F / 192; ++j) {
+        const std::size_t r0 = f0 + 1024 * (j / 16) + 64 * (j % 16);
+        csw.push_back(npu_->BindRawPair(
+            sw + ".xdna", sw + ".swap.xdna", 16 + 4 * DecoderId(f.name) + DecoderId(fu.name), ag,
+            base + tg->offset + r0 * rb, (2 * 2048 + 63) * rb + 16 * blk + kDcolRecordRow,
+            base + tu->offset + r0 * rbu, (2 * 2048 + 63) * rbu + 16 * blku + kDcolRecordRow,
+            {(j / 16) * 4 * 128 * 144 + (j % 16) * 8 * 144, bs.c}, 3 * (B_ / 64) * 4 * 1152,
+            "ffnsp_" + std::string(f.name) + "_" + fu.name));
+      }
+    } else {   // 32 calls of 224 features: call j's column c takes features 8 (128 c + 4 j) + [0, 32)
+      const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
+      for (std::uint32_t j = 0; j < F / 224; ++j)
+        csw.push_back(npu_->BindRaw(sw + ".xdna", sw + ".swap.xdna", DecoderId(f.name), ag,
+                                    base + tg->offset + (f0 + 32 * j) * rb,
+                                    dgu + (6 * 1024 + 31) * rb + 16 * blk + kDcolRecordRow, {4 * j * 144, bs.c}, "ffnsw"));
+    }
+    // down: per K part (same format: passes 0-3, 4-6 of F; pairs: 0-2, 3-5) ten 560-row calls, the last at rows 4560..
+    const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf("npubytes_ffndn3").c;
+    const std::uint32_t p0[2] = {0, pair ? 3u : 4u};
     for (int ci = 0; ci < 2; ++ci) {
-      const NpuBytes bd = NpuBytesOf(ci ? "npubytes_ffndn3" : "npubytes_ffndn4");
+      const NpuBytes bd = NpuBytesOf(ci || pair ? "npubytes_ffndn3" : "npubytes_ffndn4");
       for (std::uint32_t r = 0; r < kFfnBlkCalls; ++r) {
         const std::size_t r0 = std::min<std::size_t>(r * 560, td->dims[1] - 560), k0 = f0 / 256 + 4 * p0[ci];
         cdn[ci].push_back(npu_->BindRaw(dn[ci] + ".xdna", dn[ci] + ".swap.xdna", DecoderId(fd.name),
                                         {std::size_t{p0[ci]} * 4 * 128 * 144, bd.a, true},
                                         base + td->offset + r0 * rbd + k0 * blkd, 559 * rbd + 16 * blkd + kDcolRecordRow,
-                                        {doff + (ci * kFfnBlkCalls + r) * cp, cp}, ci ? "ffndn3" : "ffndn4"));
+                                        {doff + (ci * kFfnBlkCalls + r) * cp, cp}, ci || pair ? "ffndn3" : "ffndn4"));
       }
     }
-    NpuEnqueue(std::move(csw), "ffnsw");
-    NpuEnqueue(std::move(cdn[0]), "ffndn4");
+    NpuEnqueue(std::move(csw), pair ? "ffnsp" : "ffnsw");
+    NpuEnqueue(std::move(cdn[0]), pair ? "ffndn3" : "ffndn4");
     NpuEnqueue(std::move(cdn[1]), "ffndn3");
-    // the GPU's features: gate / up rows [0, M - F) (H's swiglu, fragment-major into ffnup_)
-    const Geom g = GeomOf(hal);
-    auto b = GemmWeights(*tg, f);
-    b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
-    const std::size_t first = b.size();
-    for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
-    const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(M) * 2}, g);
-    Dispatch(Exe(sh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), (M - F) / 16 / GeomOf(sh).rowgrp, tt, 1,
-             32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    if (pair) {
+      RunKstoreSplit(pre + "ffn_gate.weight", *gateffn_, true, gs, F);
+      RunSwigluSplit(pre + "ffn_up.weight", true, us, F);
+    } else {
+      const Geom g = GeomOf(hal);
+      auto b = GemmWeights(*tg, f);
+      b[0].length = static_cast<std::size_t>(tg->bytes + tu->bytes);
+      const std::size_t first = b.size();
+      for (const LoomBuffer* x : std::initializer_list<const LoomBuffer*>{normt_, wstage_, ostage_, ffnup_}) b.push_back(Ref(*x));
+      const std::uint32_t tt = Trim(b, first, {std::size_t(tg->dims[0]) * 2, 0, 0, std::size_t(M) * 2}, g);
+      Dispatch(Exe(sh), ("yah_ffn_gemm_" + std::string(f.name) + "_ffn").c_str(), (M - F) / 16 / GeomOf(sh).rowgrp, tt, 1,
+               32, 1, 1, b, GemmWrites(b, f, {ffnup_}));
+    }
     // down over them: f32 [tokens][5120]
     const Geom& gr = geom_.at(rem);
     auto r = GemmWeights(*td, fd);
