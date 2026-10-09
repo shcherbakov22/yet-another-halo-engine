@@ -59,7 +59,7 @@ class NpuSplit {
   // The graph's yah_npu_flag_wait polls done.
   // Failure: done with kGateFailed (the NPU gave up waiting, or the host saw its command fail) sets word kFlagStatus.
   // So does a GPU wait that timed out. It is sticky: every later wait returns at once, and the host reports it.
-  // Bounds: the NPU gives up after gen_npu_gemm.GATE_SUPPLY polls (~400 ms, below the driver's 2000 ms command limit,
+  // Bounds: the NPU gives up after gen_npu_gemm.GATE_SUPPLY polls (~1.3 s, below the driver's 2000 ms command limit,
   // amdxdna tdr_timeout_ms); a GPU wait after gen_npu_unpack.FLAG_WAIT_POLLS (~2 s, far beyond any NPU job).
   static constexpr std::uint32_t kFlagStatus = 1, kGateFailed = 0x80000000u;
   [[nodiscard]] virtual const LoomBuffer* Flags() const = 0;

@@ -92,16 +92,19 @@ class Config:
 # Extra bindings: 3 flag (read; 16-byte record, word 0 ready = the job's gate value), 4 tick (write; scratch), 5 signal
 # (write; go at byte 0, done at byte 16). After its last firing of a job the head polls request-driven
 # (constrain.request: one fresh flag read per tick) until ready >= (its job count + 1) * GATE_CALLS (jobs count from 1 after the
-# setup call; jobs sharing a ready word store theirs in order, after the GPU joined the earlier ones), backing off (pace =
-# GP0 + GPS * max(0, polls - 64) delay iterations; a supply of 1024 polls lasts ~1.2 s: raw-row sets leave layers
-# without NPU work; the tick stream takes one record per poll, so the supply cannot grow). It hands [seq, status, polls,
-# ncalls] to the mid over a leaf-synchronized neighbor channel and ticks / reads out the rest of the supply GB records per
+# setup call; jobs sharing a ready word store theirs in order, after the GPU joined the earlier ones), at a pace of
+# GP0 + GPS * max(0, polls - GFAST) delay iterations (~7.7 ns each in the engine). A poll sees ready ~17 polls after the
+# GPU stored it (the reads run that far behind; pp2048 fit), so a wait costs ~17 paces: a constant pace through the
+# waits the sets have (gaps of up to 7 layers without NPU work, ~270 ms: 896 polls of ~0.31 ms) keeps that ~5 ms, where
+# backing off from the start cost 4-17 ms per job, growing with the gap. The last 128 polls back off, so the supply still
+# lasts ~1.3 s (the tick stream takes one record per poll; 1024 is the most the shim's descriptors chain). It hands
+# [seq, status, polls, ncalls] to the mid over a leaf-synchronized neighbor channel and ticks / reads out the rest of the supply GB records per
 # firing of the next job. The mid emits go and done (constrain.signal + constrain.gate): the control program's gate
 # invocation waits for go before any data moves; its done invocation queues done after the job's egress, so done lands
 # after C. done = the job's ready value, with GATE_FAILED set if the head gave up (status 2). Job state (firings done, firings per job, leftover
 # supply, pending reads, sequence) lives in private storage, which the array setup of a core stream plan zeroes; a job of
 # N calls is N * nb * passes firings, and before the first gated job (state zero) it is one call: the setup call's.
-GP0, GPS, GB = 650, 312, 8
+GP0, GPS, GFAST, GB = 40000, 14750, 896, 8
 # The protocol the host follows (dispatch.txt "npugate <GATE_SUPPLY> <GATE_CALLS> <GATE_RECORD>"): a job's gate value is
 # sequence * GATE_CALLS + its calls (jobs of 1 .. GATE_CALLS - 1 calls); done lands GATE_RECORD bytes into the signal
 # binding. GATE_FAILED in done: the head gave up (the host sets it too for a failed command; gen_npu_unpack.GATED_LOOP).
@@ -1455,7 +1458,7 @@ def gate_epilogue(L, cfg, gate):
         e(f"  %g64 = mov.i32 {GATE_CALLS}")
         e("  %gexp = mul %gnext, %g64")   # ready = sequence * GATE_CALLS + calls
         e(f"  %gsup = mov.i32 {S}")
-        e("  %gfast = mov.i32 64")
+        e(f"  %gfast = mov.i32 {GFAST}")
         e(f"  %gp0 = mov.i32 {GP0}")
         e(f"  %gps = mov.i32 {GPS}")
         e("  low.br ^gp(%g0: reg<aie2p.er>, %g0: reg<aie2p.er>)")
