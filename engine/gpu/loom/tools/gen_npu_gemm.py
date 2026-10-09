@@ -534,7 +534,9 @@ def leaf(L, cfg, role, ks, gate=None, pair=None):
     fa = slab(ks)
     acap = cfg.acap_t if tail else cfg.acap
     a_adv = acap == MP   # a ring of MP slabs is addressed like a whole record: the base advances per iteration
-    assert MP % cfg.mu == 0 and (a_adv or cfg.mu % acap == 0), "ring slot of a row must be static per iteration"
+    # mu 1 with a 2-slot ring: the slot alternates per iteration (body: the base steps +1 / -1 slab by parity)
+    assert MP % cfg.mu == 0 and (a_adv or cfg.mu % acap == 0 or (cfg.mu, acap) == (1, 2)), \
+        "ring slot of a row must be static per iteration"
     name = role + ("_g" if gate else "") + ("_s" if pair == "send" else "")
     e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{name}() asm {{")
     e("  %a = resource<native_pointer> {index = 0, source_type = buffer} : reg<aie2p.ep>")
@@ -1418,7 +1420,21 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None):
                 cur[c] = f"%z{t + 1}_{c}"
     e("  rel %one, 0")
     steps = cfg.mu if a_adv else 1
-    if spa:   # scalar A pointer: advance by steps slab strides
+    if not a_adv and (cfg.mu, acap) == (1, 2):   # alternate slots: step = fstep (1 - 2 (mp & 1))
+        e("  %kh = mova.i32 -1")
+        e("  %ph = lshl %mp, %kh")
+        e("  %ph2 = add.rr %ph, %ph")
+        e("  %par = sub %mp, %ph2")
+        e("  %fst2 = add.rr %fstep, %fstep")
+        e("  %pst0 = mul %par, %fst2")
+        e("  %pst = sub %fstep, %pst0")
+    if spa and not a_adv and (cfg.mu, acap) == (1, 2):
+        e("  %pan = add.rr %pa, %pst")
+    elif not a_adv and (cfg.mu, acap) == (1, 2):
+        e("  %pac = copy %pa : reg<aie2p.ep> -> reg<aie2p.ep>")
+        e("  %pmod = mov.modifier %pst")
+        e("  %pan = padds.modifier %pac, %pmod")
+    elif spa:   # scalar A pointer: advance by steps slab strides
         e(f"  %kpst = mova.i32 {steps if a_adv else 0}")
         e("  %pastep = mul %fstep, %kpst")
         e("  %pan = add.rr %pa, %pastep")

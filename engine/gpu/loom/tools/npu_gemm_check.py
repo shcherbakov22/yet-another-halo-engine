@@ -55,7 +55,7 @@ def main():
         sys.exit(__doc__)
     work, cols, nb = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
     ks, passes = tuple(int(v) for v in sys.argv[4].split(",")), int(sys.argv[5])
-    cfg = N.Config(cols, nb, ks, passes)
+    cfg = N.Config(cols, nb, ks, passes, mu=int(os.environ.get("NPU_MU", "2")))   # NPU_MU=1: one M slab per iteration
     M, Nn, K = N.TM * nb, N.TN * cols, 8 * passes * sum(ks)
     os.makedirs(work, exist_ok=True)
     if len(sys.argv) > 7:
