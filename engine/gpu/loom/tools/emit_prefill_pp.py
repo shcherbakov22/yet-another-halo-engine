@@ -659,7 +659,8 @@ NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
 # A command switches image families at job boundaries (LoomNpu FusedCommand: the image's setup and one ungated call).
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
 FFNBLK_FMTS = ("iq4xs", "iq3s", "iq3xxs")
-FFNBLK_DOWN_FMTS = ("iq3s", "iq3xxs")
+FFNBLK_DOWN_FMTS = ("iq3s", "iq3xxs", "iq4xs")
+FFNBLK_HP4 = ("iq4xs",)   # down decoders in P4 k-block order: their layers' gate / up images write H in it (_p4)
 FFNBLK_DOWN = ((0, 4), (4, 3))   # (first pass, passes) of down's K slice F, per call
 # Layers whose gate and up formats differ: column pairs (gen_npu_gemm ufmt; 192 features per call), F = 6144 and down in
 # two 3-pass parts.
@@ -1020,14 +1021,17 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
              and l.get("ffn_down", ("",))[0] in FFNBLK_DOWN_FMTS]
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
-        t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
-        for sfx, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
-            split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), F)
-        blk = GN.decoder(DCOL_FMTS[fmt][0]).BLK
-        jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
-                               swiglu=True, dgu=mt * 16 * kb * blk, swcol=1024, hpass=F // 1024),
-                     "npu_ffnsw_%s" % fmt, None, 4))
-        jobs.append((jobs[-1][0], "npu_ffnsw_%s.swap" % fmt, "swap", 4))
+        for hp4 in sorted({l["ffn_down"][0] in FFNBLK_HP4 for l in ok if l["ffn_gate"] == (fmt, mt, kb)}):
+            if hp4 == min({l["ffn_down"][0] in FFNBLK_HP4 for l in ok if l["ffn_gate"] == (fmt, mt, kb)}):
+                t = dataclasses.replace(TG.default_tile(fmt, "swiglu", kb), **AF_TILE, **AF_FFN[fmt], ffn=True)
+                for sfx, tt in ((".af.hal", t), (".af.to.hal", dataclasses.replace(t, tout=True))):
+                    split(fmt, "ffn", mt, kb, tt, "gemm_ffn_%s_%d_%d%s" % (fmt, mt, kb, sfx), F)
+            blk = GN.decoder(DCOL_FMTS[fmt][0]).BLK
+            name = "npu_ffnsw_%s%s" % (fmt, "_p4" if hp4 else "")
+            jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2,
+                                   fmt=DCOL_FMTS[fmt][0], swiglu=True, dgu=mt * 16 * kb * blk, swcol=1024,
+                                   hpass=F // 1024, hp4=hp4), name, None, 4))
+            jobs.append((jobs[-1][0], name + ".swap", "swap", 4))
     for fmt, mt, kb, kbw in sorted({l["ffn_down"] + ((l["ffn_down"][2] * 256 - F) // 256,) for l in ok} |
                                    {l["ffn_down"] + ((l["ffn_down"][2] * 256 - FFNBLK_PAIR) // 256,) for l in pairs}):
         # the GPU's K window [0, 17408 - F)
@@ -1048,14 +1052,16 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                                    kraw=kb * 256, ain="h", hpass=F // 1024, gord="N"), "npu_ffndn%d_%s" % (passes, fmt),
                          None, GN.NP))
             jobs.append((jobs[-1][0], "npu_ffndn%d_%s.swap" % (passes, fmt), "swap", GN.NP))
-    for (gf, mt, kb), (uf, _, _) in sorted({(l["ffn_gate"], l["ffn_up"]) for l in pairs}):
+    for (gf, mt, kb), (uf, _, _), hp4 in sorted({(l["ffn_gate"], l["ffn_up"], l["ffn_down"][0] in FFNBLK_HP4)
+                                                 for l in pairs}):
         # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = FFNBLK_PAIR)
         variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), FFNBLK_PAIR)
         variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), FFNBLK_PAIR)
+        name = "npu_ffnsp_%s_%s%s" % (gf, uf, "_p4" if hp4 else "")
         jobs.append((GN.Config(6, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[gf][0],
-                               ufmt=DCOL_FMTS[uf][0], swiglu=True, swcol=2048, hpass=F // 1024),
-                     "npu_ffnsp_%s_%s" % (gf, uf), None, (4, True)))
-        jobs.append((jobs[-1][0], "npu_ffnsp_%s_%s.swap" % (gf, uf), "swap", (4, True)))
+                               ufmt=DCOL_FMTS[uf][0], swiglu=True, swcol=2048, hpass=F // 1024, hp4=hp4),
+                     name, None, (4, True)))
+        jobs.append((jobs[-1][0], name + ".swap", "swap", (4, True)))
     # hidden + the GPU's window + the NPU's down partials (two K chunks of ten 560-row calls, one replay group each)
     N, calls = 5120, -(-5120 // NPU_ROWS)
     cg = GU.CG

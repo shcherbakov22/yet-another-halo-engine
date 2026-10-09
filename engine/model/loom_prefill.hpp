@@ -915,7 +915,10 @@ class LoomPrefill {
     const std::string us = pair ? NpuHal(SwigluHal(pre + "ffn_up.weight", true, true)) : "";
     const std::uint32_t kbw = static_cast<std::uint32_t>(td->dims[0] - F) / 256;
     const std::string rem = "npuffnrem_" + std::string(fd.name) + "_" + std::to_string(kbw) + ".hal";
-    const std::string sw = dir_ + (pair ? "/npu_ffnsp_" + std::string(f.name) + "_" + fu.name : "/npu_ffnsw_" + std::string(f.name));
+    // gate / up write H in the down decoder's k-block order (emit_prefill_pp FFNBLK_HP4: IQ4_XS's P4, "_p4" images)
+    const std::string hord = std::strcmp(fd.name, "iq4xs") == 0 ? "_p4" : "";
+    const std::string sw = dir_ + (pair ? "/npu_ffnsp_" + std::string(f.name) + "_" + fu.name : "/npu_ffnsw_" + std::string(f.name)) +
+                           hord;
     const std::string dn[2] = {dir_ + (pair ? "/npu_ffndn3_" : "/npu_ffndn4_") + fd.name, dir_ + "/npu_ffndn3_" + fd.name};
     if ((pair ? gs.empty() || us.empty() || !Af("gemm_kstore", pre + "ffn_gate.weight") ||
                     !Af("gemm_swiglu", pre + "ffn_up.weight")
@@ -953,14 +956,14 @@ class LoomPrefill {
             base + tg->offset + r0 * rb, (2 * 2048 + 63) * rb + 16 * blk + kDcolRecordRow,
             base + tu->offset + r0 * rbu, (2 * 2048 + 63) * rbu + 16 * blku + kDcolRecordRow,
             {(j / 16) * 4 * 128 * 144 + (j % 16) * 8 * 144, bs.c}, 3 * (B_ / 64) * 4 * 1152,
-            "ffnsp_" + std::string(f.name) + "_" + fu.name));
+            "ffnsp_" + std::string(f.name) + "_" + fu.name + hord));
       }
     } else {   // 32 calls of 224 features: call j's column c takes features 8 (128 c + 4 j) + [0, 32)
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsw");
       for (std::uint32_t j = 0; j < F / 224; ++j)
         csw.push_back(npu_->BindRaw(sw + ".xdna", sw + ".swap.xdna", DecoderId(f.name), ag,
                                     base + tg->offset + (f0 + 32 * j) * rb,
-                                    dgu + (6 * 1024 + 31) * rb + 16 * blk + kDcolRecordRow, {4 * j * 144, bs.c}, "ffnsw"));
+                                    dgu + (6 * 1024 + 31) * rb + 16 * blk + kDcolRecordRow, {4 * j * 144, bs.c}, "ffnsw" + hord));
     }
     // down: per K part (same format: passes 0-3, 4-6 of F; pairs: 0-2, 3-5) ten 560-row calls, the last at rows 4560..
     const std::size_t doff = FfnBlkDown(), cp = NpuBytesOf("npubytes_ffndn3").c;
