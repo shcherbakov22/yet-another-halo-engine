@@ -148,6 +148,10 @@ class LoomNpu {
       api_->host_mapping_destroy(a.map);
       api_->memory_destroy(a.storage.memory);
     }
+    for (auto& [memory, map] : scripts_) {
+      api_->host_mapping_destroy(map);
+      api_->memory_destroy(memory);
+    }
     for (auto& k : kernels_) {
       for (auto* m : k->storage_maps) api_->host_mapping_destroy(m);
       for (auto& s : k->storage) api_->memory_destroy(s.memory);
@@ -408,6 +412,7 @@ class LoomNpu {
       family = nullptr;
     } else if (!resident) {
       program_.Forget();   // a full setup outside FusedCommand
+      ++epoch_;
       YAH_AMDF(api_->kernel_queue_wait(queue_, Submit(k->first), AMDF_TIMEOUT_INFINITE, 0), "kernel_queue_wait(setup)");
       std::lock_guard<std::mutex> lock(mu_);
       resident_ = family;
@@ -423,6 +428,10 @@ class LoomNpu {
       resident_dec_ = fused.dec;
       resident_ = fused.family;
     }
+    if (recording_) {
+      recording_->jobs.push_back(jobs);
+      recording_->family = fused.family, recording_->dec = fused.dec;
+    }
     const std::uint64_t submission = Submit(command);
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -430,6 +439,72 @@ class LoomNpu {
       ++submitted_;
     }
     reap_cv_.notify_one();
+  }
+  // Command replay. A command's bytes depend only on its jobs and on the array state it starts from (DeltaSetup's
+  // program memory and read-only data, the family and decoder set up), and a sequence of commands leaves the state of
+  // everything its setups wrote set by them alone. So a chunk whose jobs repeat the previous chunk's (with no forgotten
+  // program state since) builds the same commands as the next such chunk: Record keeps the commands EnqueueGated builds
+  // from now on, Seal copies them into their own command storage, and Replay submits them again as they are.
+  struct Script {
+    std::vector<std::vector<std::uint8_t>> bytes;   // the recorded commands, until Seal
+    std::vector<std::vector<GatedJob>> jobs;        // per command
+    const void* family = nullptr;                   // the family and decoder set up after the last command
+    int dec = -1;
+    iree_hal_amd_xdna_executable_storage_t storage{};
+    amdf_host_mapping_t* map = nullptr;
+    std::vector<amdf_xdna_kernel_command_t> commands;
+  };
+  // Program state forgotten so far (a failed command, a setup outside FusedCommand): scripts recorded before a change
+  // start from a state the array no longer holds.
+  [[nodiscard]] std::uint64_t Epoch() const { return epoch_.load(); }
+  void Record(Script* s) { recording_ = s; }
+  void Seal(Script& s) {
+    recording_ = nullptr;
+    std::size_t size = 0;
+    for (const auto& b : s.bytes) size += (b.size() + kCommandAlign - 1) / kCommandAlign * kCommandAlign;
+    iree_xdna_elf_allocation_record_t req{};
+    req.domain = IREE_XDNA_ELF_ALLOCATION_DOMAIN_COMMAND;
+    req.byte_length = size;
+    req.alignment = kCommandAlign;
+    AllocateStorage(req, &s.storage, &s.map);
+    scripts_.push_back({s.storage.memory, s.map});
+    std::size_t at = 0;
+    for (const auto& b : s.bytes) {
+      std::memcpy(static_cast<std::uint8_t*>(s.storage.mapping.data) + at, b.data(), b.size());
+      amdf_xdna_kernel_command_t c{};
+      c.memory = s.storage.memory;
+      c.access_ordinal = s.storage.access_ordinal;
+      c.byte_offset = s.storage.memory_byte_offset + at;
+      c.byte_length = b.size();
+      s.commands.push_back(c);
+      at += (b.size() + kCommandAlign - 1) / kCommandAlign * kCommandAlign;
+    }
+    YAH_AMDF(api_->host_mapping_cache_control(s.map, AMDF_HOST_CACHE_OPERATION_FLUSH, 0, size),
+             "host_mapping_cache_control(script)");
+    s.bytes.clear();
+  }
+  // Submits a sealed script's commands (the array in the state its recording started from); queued counts the jobs
+  // submitted.
+  void Replay(const Script& s, std::size_t& queued) {
+    CheckHealth();
+    for (std::size_t i = 0; i < s.commands.size(); ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      const std::uint64_t submission = Submit(s.commands[i]);
+      std::lock_guard<std::mutex> lock(mu_);
+      pending_.push_back({submission, s.jobs[i], t0});
+      ++submitted_, ++commands_.replayed;
+      resident_ = s.family, resident_dec_ = s.dec;
+      queued += s.jobs[i].size();
+      reap_cv_.notify_one();
+    }
+  }
+  void Free(Script& s) {
+    Drain();
+    if (s.map) {
+      api_->host_mapping_destroy(s.map), api_->memory_destroy(s.storage.memory);
+      std::erase_if(scripts_, [&](const auto& m) { return m.first == s.storage.memory; });
+    }
+    s = Script{};
   }
   // Waits until the reaper retired every submitted command (its stats and failures are in).
   void Drain() {
@@ -448,7 +523,7 @@ class LoomNpu {
   // waits for the GPU included) and the longest (the driver kills a command after amdxdna tdr_timeout_ms, 2000 ms).
   // Host involvement: command bytes, the host's waits for a free arena, the NPU's idle time with no command queued.
   struct CommandStats {
-    std::size_t commands = 0, bytes = 0, arena_waits = 0;
+    std::size_t commands = 0, bytes = 0, arena_waits = 0, replayed = 0;
     double busy_ms = 0, max_ms = 0, arena_wait_ms = 0, idle_ms = 0;
   };
   CommandStats Commands() {
@@ -592,6 +667,9 @@ class LoomNpu {
   }
   ProgramState program_;
   std::atomic<bool> program_lost_{false};
+  std::atomic<std::uint64_t> epoch_{0};   // Epoch
+  Script* recording_ = nullptr;           // Record
+  std::vector<std::pair<amdf_memory_t*, amdf_host_mapping_t*>> scripts_;   // sealed scripts' storage
   Fused FusedCommand(const std::vector<std::vector<const Call*>>& runs, int dec, const void* fam) {
     std::vector<std::uint8_t> bytes;
     std::uint32_t ops = 0;
@@ -634,6 +712,7 @@ class LoomNpu {
     const std::uint32_t size = static_cast<std::uint32_t>(bytes.size());
     std::memcpy(&bytes[8], &ops, 4), std::memcpy(&bytes[12], &size, 4);
     if (size > kArenaBytes) throw LoomError("npu: fused command exceeds its arena");
+    if (recording_) recording_->bytes.push_back(bytes);
     if (arenas_.empty() || arenas_[arena_].used + size > kArenaBytes) {
       if (arenas_.size() < kArenas) {
         arenas_.emplace_back();
@@ -720,6 +799,7 @@ class LoomNpu {
         resident_ = nullptr;
         resident_dec_ = -1;
         program_lost_ = true;   // the next command's setups write whole programs (DeltaSetup)
+        ++epoch_;
       }
       const auto now = std::chrono::steady_clock::now();
       const double ms = std::chrono::duration<double, std::milli>(now - std::max(p.t0, last_retired_)).count();
@@ -1139,11 +1219,28 @@ class LoomNpuSplit : public NpuSplit {
   void BeginChunk() override {
     if (plan_.dcol) job_family_ = nullptr, fresh_ = true;
   }
+  // A chunk's jobs as the previous chunk's, with the array's program state kept since that chunk started, build the same
+  // commands every time (LoomNpu::Script): the second such chunk records them, later ones replay them.
   void Enqueue(const std::vector<Queued>& jobs) override {
     std::size_t queued = 0;
+    const bool chunk = fresh_;
+    const bool repeat = chunk && plan_.dcol && npu_.Epoch() == prev_epoch_ && SameJobs(jobs, prev_jobs_);
+    if (chunk) prev_epoch_ = npu_.Epoch(), prev_jobs_ = jobs;
+    const bool replay = repeat && !script_.commands.empty() && SameJobs(jobs, script_jobs_);
+    const bool record = repeat && !replay;
     try {
       npu_.CheckHealth();
       if (Word(kFlagStatus)) throw LoomError("npu: a GPU wait for the NPU failed");
+      if (replay) {
+        npu_.Replay(script_, queued);
+        fresh_ = false;
+        return;
+      }
+      if (record) {
+        npu_.Free(script_);
+        script_jobs_.clear();
+        npu_.Record(&script_);
+      }
       while (queued < jobs.size()) {
         std::vector<LoomNpu::GatedJob> command;
         std::size_t calls = 0;
@@ -1165,7 +1262,15 @@ class LoomNpuSplit : public NpuSplit {
         fresh_ = false;
         queued += n;
       }
+      if (record && npu_.Epoch() == prev_epoch_) {
+        npu_.Seal(script_);
+        script_jobs_ = jobs;
+      } else if (record) {   // the recording's own setups forgot program state
+        npu_.Record(nullptr), npu_.Free(script_);
+      }
     } catch (...) {
+      if (record) npu_.Record(nullptr), npu_.Free(script_);
+      prev_jobs_.clear();
       for (std::size_t i = queued; i < jobs.size(); ++i)
         HostStore(jobs[i].words.done, jobs[i].words.gate | kGateFailed);
       throw;
@@ -1182,6 +1287,7 @@ class LoomNpuSplit : public NpuSplit {
                  c.busy_ms, c.max_ms);
     std::fprintf(f, "npu: %.1f MB of commands, host waits for a free arena %zu (%.1f ms), NPU idle with none queued %.1f ms\n",
                  c.bytes / 1e6, c.arena_waits, c.arena_wait_ms, c.idle_ms);
+    if (c.replayed) std::fprintf(f, "npu: %zu commands replayed\n", c.replayed);
   }
 
  private:
@@ -1223,6 +1329,16 @@ class LoomNpuSplit : public NpuSplit {
   std::uint32_t seq_ = 0;
   const void* job_family_ = nullptr;   // NewJob's current family run (decoder-column sets)
   bool fresh_ = false;                 // the next command starts a chunk (BeginChunk)
+  // Enqueue's command replay: the previous chunk's jobs and the program epoch at its start, the script and its jobs
+  std::vector<Queued> prev_jobs_, script_jobs_;
+  std::uint64_t prev_epoch_ = 0;
+  LoomNpu::Script script_;
+  static bool SameJobs(const std::vector<Queued>& a, const std::vector<Queued>& b) {
+    return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](const Queued& x, const Queued& y) {
+      return x.calls == y.calls && x.tag == y.tag && x.layer == y.layer && x.words.ready == y.words.ready &&
+             x.words.done == y.words.done && x.words.gate == y.words.gate;
+    });
+  }
   std::deque<LoomNpu::Call> calls_;   // stable addresses (LoomNpu::GatedJob)
   std::vector<Raw> raw_;
   std::map<std::string, LoomNpu::Kernel*> instances_;
