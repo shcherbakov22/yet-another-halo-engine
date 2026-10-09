@@ -81,10 +81,10 @@ class LoomNpu {
     const void* family = nullptr;
     int dec = -1;
     const Kernel* swap = nullptr;
-    // a second instance of the image whose first (the array setup and one ungated call, the state the gate expects
-    // before its first job) writes a scratch C; spliced in where a job's family differs from the array's
-    // (FusedCommand); nullptr: none
-    const Kernel* setup = nullptr;
+    // the bytes of first bound to a scratch C (the array setup and one ungated call, the state the gate expects before
+    // its first job), spliced in where a job's family differs from the array's (FusedCommand); empty: none. A copy, not
+    // a second instance: the NPU's command memory holds ~90 instances (hardware.md)
+    std::vector<std::uint8_t> setup;
     amdf_xdna_kernel_command_t first{};
     // first sets the array up and runs one whole call (any data). gate opens a job once its ready word reaches the
     // job's gate value; done writes the done word after the job's last C (gen_npu_gemm GATE).
@@ -357,6 +357,11 @@ class LoomNpu {
                                                 k.storage[i].mapping.data_length),
                "host_mapping_cache_control(storage)");
   }
+  // The bytes of k's first as bound now.
+  std::vector<std::uint8_t> FirstBytes(const Kernel& k) const {
+    const std::uint8_t* p = CommandBytes(k, k.first);
+    return {p, p + k.first.byte_length};
+  }
   // The invocation bytes of k as bound now.
   Call Snapshot(const Kernel& k) const {
     Call c;
@@ -397,7 +402,7 @@ class LoomNpu {
       resident = resident_ == family;
       dec = resident_dec_;
     }
-    if ((!resident || fresh) && k->setup) {
+    if ((!resident || fresh) && !k->setup.empty()) {
       // FusedCommand splices the setup twin in front of the first job
       std::lock_guard<std::mutex> lock(mu_);
       family = nullptr;
@@ -502,8 +507,8 @@ class LoomNpu {
     for (const auto& calls : runs) {
       int queued = 0, since = 0;
       if (const Kernel* k0 = calls[0]->k; FamilyOf(k0) != fam) {
-        if (!k0->setup) throw LoomError("npu: a job switches image families without a setup twin");
-        append_raw(CommandBytes(*k0->setup, k0->setup->first), k0->setup->first.byte_length);
+        if (k0->setup.empty()) throw LoomError("npu: a job switches image families without a setup");
+        append(k0->setup);
         fam = FamilyOf(k0), dec = k0->dec;
       }
       append(calls[0]->gate);
@@ -818,7 +823,11 @@ class LoomNpu {
     ci.byte_length = (req.byte_length + g - 1) / g * g;
     ci.minimum_alignment = p.allocation.minimum_alignment;
     ci.accesses = &access;
-    YAH_AMDF(api_->memory_create(scope, &ci, &out->memory), "memory_create(storage)");
+    storage_bytes_ += ci.byte_length;   // the NPU's command memory is small (~64 MB per process): report the total
+    ++storage_count_;
+    YAH_AMDF(api_->memory_create(scope, &ci, &out->memory),
+             ("memory_create(storage) " + std::to_string(storage_count_) + " storages, " +
+              std::to_string(storage_bytes_ >> 10) + " KB with this one").c_str());
     YAH_AMDF(api_->memory_query_address(out->memory, 0, kind, &out->device_address), "memory_query_address(storage)");
     amdf_memory_map_info_t mi{};
     mi.type = AMDF_STRUCTURE_TYPE_MEMORY_MAP_INFO;
@@ -852,6 +861,8 @@ class LoomNpu {
   std::vector<std::unique_ptr<Shared>> shared_;
   std::vector<std::unique_ptr<Kernel>> kernels_;
   const void* resident_ = nullptr;  // the image (family) whose array state is set up; under mu_
+  std::uint64_t storage_bytes_ = 0;    // command-memory storages allocated (images' and the command arenas')
+  std::uint32_t storage_count_ = 0;
   int resident_dec_ = -1;            // its decoder format at the end of the last submitted command; under mu_
   std::map<std::tuple<const Shared*, std::size_t, std::size_t>, amdf_memory_t*> imports_;   // DMA-BUF views
   std::atomic<double> last_command_ms_{0};
@@ -965,9 +976,13 @@ class LoomNpuSplit : public NpuSplit {
       LoomNpu::Kernel*& sw = instances_[swap];
       if (!sw) sw = &npu_.Load(swap, "npu_gemm", views);   // only its setup runs
       k->family = &families_[family], k->dec = dec, k->swap = sw;
-      std::vector<LoomNpu::View> scratch = views;   // the setup instance: its call writes the scratch C
+      std::vector<LoomNpu::View> scratch = views;   // the setup: first with its call's C on the scratch
       scratch[2] = {&cscratch_, 0, views[2].length};
-      k->setup = &npu_.Load(image, "npu_gemm", scratch);
+      npu_.Rebind(*k, scratch);
+      k->setup = npu_.FirstBytes(*k);
+      npu_.Rebind(*k, views);
+      if (k->setup == npu_.FirstBytes(*k))   // the copy relies on C's address living in first's own bytes
+        throw LoomError("npu: " + image + ": first does not hold C's address");
     } else {
       npu_.Rebind(*k, views);
     }

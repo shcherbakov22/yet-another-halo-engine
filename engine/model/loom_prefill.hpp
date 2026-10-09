@@ -889,8 +889,8 @@ class LoomPrefill {
   std::size_t FfnBlkH() const { return std::size_t{B_ / 64} * (FfnBlkF() / 1024) * 4 * 128 * 144; }
   std::size_t FfnBlkDown() const { return (FfnBlkH() + 4095) / 4096 * 4096; }
   static int DecoderId(const char* fmt) {
-    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k"};
-    for (int i = 0; i < 4; ++i)
+    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k"};
+    for (int i = 0; i < 5; ++i)
       if (std::strcmp(kDecoders[i], fmt) == 0) return i;
     return -1;
   }
@@ -953,7 +953,7 @@ class LoomPrefill {
       for (std::uint32_t j = 0; j < F / 192; ++j) {
         const std::size_t r0 = f0 + 1024 * (j / 16) + 64 * (j % 16);
         csw.push_back(npu_->BindRawPair(
-            sw + ".xdna", sw + ".swap.xdna", 16 + 4 * DecoderId(f.name) + DecoderId(fu.name), ag,
+            sw + ".xdna", sw + ".swap.xdna", 16 + 8 * DecoderId(f.name) + DecoderId(fu.name), ag,
             base + tg->offset + r0 * rb, (2 * 2048 + 63) * rb + 16 * blk + kDcolRecordRow,
             base + tu->offset + r0 * rbu, (2 * 2048 + 63) * rbu + 16 * blku + kDcolRecordRow,
             {(j / 16) * 4 * 128 * 144 + (j % 16) * 8 * 144, bs.c}, 3 * (B_ / 64) * 4 * 1152,
@@ -1245,7 +1245,7 @@ class LoomPrefill {
   std::string DcolImage(const std::string& wname, int* dec = nullptr) const {
     Fmt f{};
     if (!FmtOf(static_cast<std::uint32_t>(Find(wname)->type), &f)) return "";
-    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k"};
+    static const char* const kDecoders[] = {"iq4xs", "iq3s", "iq3xxs", "q4k", "q3k"};
     const auto it = std::find_if(std::begin(kDecoders), std::end(kDecoders),
                                  [&](const char* d) { return std::strcmp(d, f.name) == 0; });
     if (it == std::end(kDecoders)) return "";

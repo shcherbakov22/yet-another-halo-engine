@@ -642,7 +642,8 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 # permutes the activations (gen_bfp16_encode.ACT_PERM): "p4" for the fused writers (norm, postnorm, ffn unpack) and the
 # plain encoders, "pk" (Q4_K) by the "_pk" encoders into A's second half. Tensors of other formats stay on the GPU.
 NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1"
-DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk")}
+DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
+             "q3k": ("Q3_K", "p4")}
 NPU_KS = (36, 36, 36, 20) if NPU_DCOL else GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
 NPU_COLS = 7 if NPU_DCOL else 8
 NPU_ROWS = NPU_COLS * GN.TN   # output rows per NPU call
@@ -658,7 +659,7 @@ NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
 # (".npu.hal", nn = F) and down over them ("npuffnrem_<fmt>.hal", a K window); npu_unpack_ffnblk.hal adds hidden + both.
 # A command switches image families at job boundaries (LoomNpu FusedCommand: the image's setup and one ungated call).
 NPU_FFNBLK = int(os.environ.get("YAH_NPU_FFNBLK", "0"))
-FFNBLK_FMTS = ("iq4xs", "iq3s", "iq3xxs")
+FFNBLK_FMTS = ("iq4xs", "iq3s", "iq3xxs", "q3k")
 FFNBLK_DOWN_FMTS = ("iq3s", "iq3xxs", "iq4xs", "q4k")
 # the down decoders' k-block order where it is not natural: their layers' gate / up images write H in it (_p4 / _q4k)
 FFNBLK_HORD = {"iq4xs": "P4", "q4k": "Q4K"}
