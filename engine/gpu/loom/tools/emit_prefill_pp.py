@@ -1053,16 +1053,18 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split):
     E.emit(src, ["nop=0"], "npu_unpack_ffnblk.hal", outdir)
     out.append(("npu_unpack_ffnblk.hal", B * calls * NPU_COLS * (GN.TN // 8) // GU.wg(calls * NPU_COLS),
                 GU.wg(calls * NPU_COLS), 0))
-    # gate / up read their activations in one replay group: the encoder of that stream layout (fragment-major input)
-    groups = GE.GROUPS
+    # gate / up read their activations in one replay group: the norm before them writes that stream (fragment-major)
+    import gen_half_norm
+    groups, perm = GE.GROUPS, GE.ACT_PERM
     GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
     try:
-        src = os.path.join(tmp, "npu_enc_5120_g1_t.loom")
-        open(src, "w").write(GE.gen("act", B, list(NPU_KS), NPU_PASSES, tiled=True, k_off=0, k_src=None))
+        src = os.path.join(tmp, "norm_t_bfp_g1.loom")
+        open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True,
+                                                     bfp=(B, list(NPU_KS), NPU_PASSES)))
     finally:
-        GE.GROUPS = groups
-    E.emit(src, ["nop=0"], "npu_enc_5120_g1_t.hal", outdir)
-    out.append(("npu_enc_5120_g1_t.hal", B // 8 * (NPU_PASSES * sum(NPU_KS)) // GE.WG, GE.WG, 0))
+        GE.GROUPS, GE.ACT_PERM = groups, perm
+    E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                 "yah_half_norm.fused=0"], "norm_t_bfp_g1.hal", outdir)
     out.append(("npuffnblk", F, 0, 0))
     sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
     with GN.np_override(4):

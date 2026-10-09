@@ -5,7 +5,8 @@ usage: norm_bfp_check.py <model.gguf> <workdir> <norm weight tensor> [row|tiled|
 
 Runs the plain norm and the bfp form on the same random hidden state: their f16 outputs must match bit for bit, and the
 BFP16 stream must equal the numpy oracle of bfp16_check.py on that f16 (what yah_bfp16_encode_act writes from it).
-HAL_RUN_ITERS=N times both.
+HAL_RUN_ITERS=N times both. NORM_BFP_GROUPS=<passes,..> and NORM_BFP_PERM=p4|pk set the stream's replay groups and k-block
+order (gen_bfp16_encode GROUPS / ACT_PERM; e.g. 5 and p4: the FFN block's one-group stream).
 """
 import os
 import subprocess
@@ -28,6 +29,9 @@ def main():
         sys.exit(__doc__)
     model, work, wname = sys.argv[1:4]
     mode = sys.argv[4] if len(sys.argv) > 4 else "row"
+    if os.environ.get("NORM_BFP_GROUPS"):
+        GE.GROUPS = tuple(int(v) for v in os.environ["NORM_BFP_GROUPS"].split(","))
+    GE.ACT_PERM = os.environ.get("NORM_BFP_PERM") or None
     rows = int(sys.argv[5]) if len(sys.argv) > 5 else 2048
     tiled = {"row": False, "tiled": True, "both": "both"}[mode]
     os.makedirs(work, exist_ok=True)
@@ -68,7 +72,14 @@ def main():
     h = pf[0].view(np.float16).reshape(rows, DIM)
     if tiled is True:   # fragment-major [row / 16][k / 16][row % 16][k % 16] back to rows
         h = h.reshape(rows // 16, DIM // 16, 16, 16).transpose(0, 2, 1, 3).reshape(rows, DIM)
+    if GE.ACT_PERM:   # stream position q of a pass holds k-block perm[q]
+        sub = {"p4": (0, 2, 1, 3), "pk": (0, 4, 1, 5, 2, 6, 3, 7)}[GE.ACT_PERM]
+        n = len(sub)
+        kperm = np.array([n * (q // n) + sub[q % n] for q in range(DIM // 8)])
+        h = h.reshape(rows, DIM // 8, 8)[:, kperm].reshape(rows, DIM)
+    perm, GE.ACT_PERM = GE.ACT_PERM, None
     ref, off = B.reference(np.ascontiguousarray(h), "act", rows, list(NPU_KS), PASSES, 64, True)
+    GE.ACT_PERM = perm
     idx = (off[..., None] + np.arange(72)).reshape(-1)
     bad = np.count_nonzero(bf[-1][idx] != ref[idx])
     print(f"{wname} {mode} rows={rows}: f16 outputs {'identical' if same else 'DIFFER'}, BFP16 stream {bad} of {idx.size} "

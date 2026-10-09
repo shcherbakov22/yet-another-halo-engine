@@ -880,17 +880,14 @@ class LoomPrefill {
     const std::string sh = NpuHal(hal), rem = "npuffnrem_" + std::string(fd.name) + ".hal";
     const std::string sw = dir_ + "/npu_ffnsw_" + f.name;
     const std::string dn[2] = {dir_ + "/npu_ffndn4_" + fd.name, dir_ + "/npu_ffndn3_" + fd.name};
-    if (sh.empty() || !geom_.count(rem) || !geom_.count("npu_enc_5120_g1_t.hal") ||
+    if (sh.empty() || !geom_.count(rem) || ::access((dir_ + "/norm_t_bfp_g1.hal").c_str(), R_OK) ||
         ::access((sw + ".xdna").c_str(), R_OK) || ::access((dn[0] + ".xdna").c_str(), R_OK) ||
         ::access((dn[1] + ".xdna").c_str(), R_OK))
       return false;
     const std::uint32_t F = ffnblk_, M = static_cast<std::uint32_t>(tg->dims[1]);
-    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled);
-    // the gate / up image runs one replay group: its activation stream has that group's layout
-    const Geom& ge = geom_.at("npu_enc_5120_g1_t.hal");
+    // the norm also writes gate / up's activations (one replay group: that stream layout)
+    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, "ffnblk");
     const NpuView ag{0, NpuK(5120).a};
-    Dispatch(Exe("npu_enc_5120_g1_t.hal"), "yah_bfp16_encode_act", ge.tokens, 1, 1, ge.rowgrp, 1, 1,
-             {Ref(*normt_), {npu_->A().handle, ag.offset, ag.length}}, 2);
     const std::uint8_t* base = gguf_.tensor_data_base();
     const std::size_t rb = static_cast<std::size_t>(tg->bytes) / M, blk = rb * 256 / tg->dims[0];
     const std::size_t rbd = static_cast<std::size_t>(td->bytes) / td->dims[1], blkd = rbd * 256 / td->dims[0];
@@ -1009,10 +1006,12 @@ class LoomPrefill {
   // writes its BFP16 input into A ("<norm>_bfp.hal") and NpuEncode(npu_site) skips the encoder.
   void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow, const char* npu_site = nullptr) {
     // A row takes `split` waves (dispatch.txt norm_split, else 1); a workgroup of w waves takes w / split rows.
-    const bool bfp = npu_site && geom_.count("npunormbfp");
-    norm_bfp_ = bfp ? npu_site : "";
+    // npu_site "ffnblk": the FFN block's one-replay-group stream (RunFfnBlock, fragment-major output only)
+    const bool g1 = npu_site && std::strcmp(npu_site, "ffnblk") == 0;
+    const bool bfp = npu_site && (g1 || geom_.count("npunormbfp"));
+    norm_bfp_ = bfp && !g1 ? npu_site : "";
     const std::string hal = mode == NormOut::kTiled ? "norm_t" : mode == NormOut::kBoth ? "norm_rt" : "norm";
-    const LoomExecutable& exe = Exe(hal + (bfp ? "_bfp.hal" : ".hal"));
+    const LoomExecutable& exe = Exe(g1 ? "norm_t_bfp_g1.hal" : hal + (bfp ? "_bfp.hal" : ".hal"));
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
     const auto ns = geom_.find("norm_split");
     const std::uint32_t split = ns != geom_.end() && ns->second.rowgrp ? ns->second.rowgrp : 1;
