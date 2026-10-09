@@ -646,7 +646,7 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 NPU_FUSE = os.environ.get("YAH_NPU_FUSE") == "1"
 NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
 FUSE_FMTS = ("iq4xs",)
-FUSE_FFN_FMTS = ("iq4xs", "iq3xxs")   # the fused FFN block's (NP 4 images: room for a grid decoder's tables)
+FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s")   # the fused FFN block's (NP 4 images: room for a grid decoder's tables)
 DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
              "iq2xs": ("IQ2_XS", "p4")}
