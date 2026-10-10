@@ -2023,27 +2023,45 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
 
             def stream(lo, hi, tag):
                 """Column pairs: the gate buffer's 32-byte rows lo .. hi - 1 over the core stream (gate tail: out, up
-                tail: in), 8 words at a time."""
+                tail: in), 4 rows (32 words) an iteration. The tails are locked (one instruction a bundle), so the
+                order is the schedule: each row's 8 transfers alternate with the next row's 8 loads (send) / reads
+                (recv), which then sit 8+ cycles ahead of their use, and each row's pointer is made a row ahead."""
                 s_ = "sd" if pair == "send" else "rv"
                 q = f"{p}{s_}{tag}"
+                R = 4 if (hi - lo) % 4 == 0 else 1
                 e(f"  {q}0 = mova.i32 {lo}")
                 e(f"  {q}n = mova.i32 {hi}")
-                e(f"  low.br ^{s_}{t}{tag}({q}0: {ER})")
-                e(f"^{s_}{t}{tag}({q}: {ER}):")
+                e(f"  {q}r = mova.i32 {R}")
+                e(f"  {q}k = mov.i32 {32 * lo}")
+                e(f"  {q}a0 = add.rr {p}gbs0, {q}k")
+                e(f"  low.br ^{s_}{t}{tag}({q}0: {ER}, {q}a0: {ER})")
+                e(f"^{s_}{t}{tag}({q}: {ER}, {q}A0: {ER}):")
                 e(f"  {q}m = lt {q}, {q}n")
                 e(f"  low.cond_br {q}m, ^{s_}b{t}{tag}, ^{s_}x{t}{tag} : {ER}")
                 e(f"^{s_}b{t}{tag}:")
-                e(f"  {q}o = mul {q}, {p}k32")
-                e(f"  {q}a = add.rr {p}gbs0, {q}o")
-                e(f"  {q}p = mov.scalar-to-address {q}a")
-                # all 8 loads (reads) before the 8 writes: stream ops keep their order with memory ops, so a
-                # word-at-a-time load -> write chain pays the full latency per word
+
+                def row_ptr(r):   # row r's pointer and row r + 1's address
+                    e(f"  {q}P{r} = mov.scalar-to-address {q}A{r}")
+                    e(f"  {q}A{r + 1} = add.rr {q}A{r}, {p}k32")
+
+                def take(r, w):   # word w of row r: send loads it, recv reads it
+                    e(f"  {q}w{r}_{w} = lda {q}P{r}, {4 * w}" if pair == "send" else f"  {q}w{r}_{w} = mov.ss")
+
+                def give(r, w):   # send writes it to the stream, recv stores it
+                    e(f"  mov.ms {q}w{r}_{w}" if pair == "send" else f"  st {q}w{r}_{w}, {q}P{r}, {4 * w}")
+
+                row_ptr(0)
                 for w in range(8):
-                    e(f"  {q}w{w} = lda {q}p, {4 * w}" if pair == "send" else f"  {q}w{w} = mov.ss")
-                for w in range(8):
-                    e(f"  mov.ms {q}w{w}" if pair == "send" else f"  st {q}w{w}, {q}p, {4 * w}")
-                e(f"  {q}1 = add.rr {q}, %one")
-                e(f"  low.br ^{s_}{t}{tag}({q}1: {ER})")
+                    take(0, w)
+                for r in range(R):
+                    if r + 1 < R:
+                        row_ptr(r + 1)
+                    for w in range(8):
+                        give(r, w)
+                        if r + 1 < R:
+                            take(r + 1, w)
+                e(f"  {q}1 = add.rr {q}, {q}r")
+                e(f"  low.br ^{s_}{t}{tag}({q}1: {ER}, {q}A{R}: {ER})")
                 e(f"^{s_}x{t}{tag}:")
 
             def jloop(lo, hi, kind, tag, fifo):
