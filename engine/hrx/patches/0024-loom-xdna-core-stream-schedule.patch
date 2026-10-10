@@ -1,0 +1,112 @@
+Scalar core stream transfers schedule like the cascade (Loom AIE2P descriptors): mov.ss / mov.ms were descriptor
+barriers, so each one split its block into separately scheduled source ranges, and consecutive transfers waited the
+previous one's full result latency (8 cycles after a read, 3 after a write) through the barrier effect's schedule-class
+fallback. They now keep their order through named timing events (in order on one port, 1 cycle; independent of the
+other port and of local memory, 0) and stay side-effecting, so they are never merged, hoisted or removed. A worker to
+worker stream went from ~9.8 to ~3.6 cycles per word.
+diff --git a/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py b/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py
+index 1b0568c..21c00ad 100644
+--- a/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py
++++ b/loom/py/loom/target/arch/amd/xdna/aie2p/core_descriptors.py
+@@ -39,6 +39,8 @@ from loom.target.arch.amd.xdna.aie2p.core_encoding_data import CORE_ENCODING_TAB
+ from loom.target.arch.amd.xdna.aie2p.core_stream_descriptors import (
+     CASCADE_READ_EVENT,
+     CASCADE_WRITE_EVENT,
++    STREAM_READ_EVENT,
++    STREAM_WRITE_EVENT,
+ )
+ from loom.target.arch.amd.xdna.aie2p.core_machine_data import CORE_MACHINE_TABLE
+ from loom.target.arch.amd.xdna.aie2p.core_schedule_data import CORE_SCHEDULE_TABLE
+@@ -1750,6 +1752,28 @@ def _event_separations() -> tuple[EventSeparation, ...]:
+             )
+     # Cascade transfers: in order on one link, independent across links and of
+     # local memory traffic, which only keeps its issue order around them.
++    # Scalar stream ports: same in-order / independent rule as the cascade links.
++    stream_events = (STREAM_READ_EVENT, STREAM_WRITE_EVENT)
++    for producer in stream_events:
++        for consumer in stream_events:
++            result.append(
++                EventSeparation(
++                    producer,
++                    consumer,
++                    1 if producer == consumer else 0,
++                    ModelQuality.EXACT,
++                )
++            )
++    for memory in _MEMORY_ENDPOINTS:
++        for access in ("read", "write"):
++            memory_event = _memory_event_name(access, memory)
++            for stream_event in stream_events:
++                result.append(
++                    EventSeparation(stream_event, memory_event, 0, ModelQuality.EXACT)
++                )
++                result.append(
++                    EventSeparation(memory_event, stream_event, 0, ModelQuality.EXACT)
++                )
+     cascade_events = (CASCADE_READ_EVENT, CASCADE_WRITE_EVENT)
+     for producer in cascade_events:
+         for consumer in cascade_events:
+diff --git a/loom/py/loom/target/arch/amd/xdna/aie2p/core_stream_descriptors.py b/loom/py/loom/target/arch/amd/xdna/aie2p/core_stream_descriptors.py
+index e0d812c..a92be9a 100644
+--- a/loom/py/loom/target/arch/amd/xdna/aie2p/core_stream_descriptors.py
++++ b/loom/py/loom/target/arch/amd/xdna/aie2p/core_stream_descriptors.py
+@@ -16,13 +16,26 @@ from loom.target.low_descriptors import DescriptorFlag, Effect, EffectKind
+ _TARGET_KEY = "amd.xdna.aie2p"
+ 
+ 
++# Scalar stream transfers keep their protocol order through named timing
++# events like the cascade: the input (SS) and output (MS) ports are independent
++# FIFOs, so a transfer waits only for the previous transfer on its own port to
++# issue, not for a read's result latency.
++STREAM_READ_EVENT = f"{_TARGET_KEY}.stream.read"
++STREAM_WRITE_EVENT = f"{_TARGET_KEY}.stream.write"
++
++
+ def _scalar_stream_descriptor_specs() -> tuple[_DescriptorSpec, ...]:
+     """Exposes scalar streams, packet headers, and their completion status."""
+ 
+     # Stream traffic participates in a device protocol even when the payload
+-    # has no SSA consumer. Preserve its issue order with memory and other
+-    # protocol effects; this annotation does not add a hardware memory fence.
+-    effects = (Effect(EffectKind.BARRIER),)
++    # has no SSA consumer. The barrier effect preserves its issue order with
++    # memory and other protocol effects (the forms are side-effecting, so they
++    # are never merged, hoisted or removed); this annotation does not add a
++    # hardware memory fence. Unlike a descriptor barrier it does not split the
++    # block into source ranges, so independent work can overlap a transfer.
++    def effects_for(event: str) -> tuple[Effect, ...]:
++        return (Effect(EffectKind.BARRIER, producer_event=event, consumer_event=event),)
++
+     result = []
+     for nonblocking in (False, True):
+         form_infix = "nb_" if nonblocking else ""
+@@ -35,8 +48,7 @@ def _scalar_stream_descriptor_specs() -> tuple[_DescriptorSpec, ...]:
+                 f"stream.read{key_suffix}.i32",
+                 f"II_MOV_{form_infix}lda",
+                 asm_mnemonic=f"mov.ss{mnemonic_suffix}",
+-                effects=effects,
+-                flags=(DescriptorFlag.BARRIER,),
++                effects=effects_for(STREAM_READ_EVENT),
+             )
+         )
+         for form_suffix, last_key, last_mnemonic in (
+@@ -60,8 +72,7 @@ def _scalar_stream_descriptor_specs() -> tuple[_DescriptorSpec, ...]:
+                         f"II_{form}_{register_class}",
+                         storage_overrides=(("src", register_class),),
+                         asm_mnemonic=f"mov.ms{mnemonic_suffix}{last_mnemonic}{storage_mnemonic}",
+-                        effects=effects,
+-                        flags=(DescriptorFlag.BARRIER,),
++                        effects=effects_for(STREAM_WRITE_EVENT),
+                     )
+                 )
+             for header, operation in (("PH", "packet"), ("CPH", "control-packet")):
+@@ -74,8 +85,7 @@ def _scalar_stream_descriptor_specs() -> tuple[_DescriptorSpec, ...]:
+                         key,
+                         f"II_{form}",
+                         asm_mnemonic=f"mov.{header.lower()}{mnemonic_suffix}{last_mnemonic}",
+-                        effects=effects,
+-                        flags=(DescriptorFlag.BARRIER,),
++                        effects=effects_for(STREAM_WRITE_EVENT),
+                     )
+                 )
+     for direction, port, register_class in (
