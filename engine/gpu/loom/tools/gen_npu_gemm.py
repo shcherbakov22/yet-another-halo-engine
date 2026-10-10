@@ -1179,49 +1179,24 @@ def fuse_decode(L, cfg, dp, cov):
         e(f"  %fzsrc{i} = add.rr %fzsb2, %fzoo{i}")
         e(f"  %fzsp{i} = mov.scalar-to-address %fzsrc{i}")
         e(f"  %fznr{i} = mov.i32 {sw // fw}")
-        e(f"  low.br ^fze{i}h(%fzE0: reg<aie2p.er>, %fzsp{i}: reg<aie2p.ep>)")
-        e(f"^fze{i}h(%fzei{i}: reg<aie2p.er>, %fzes{i}: reg<aie2p.ep>):")
+        e(f"  %fzpE{i} = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+        e(f"  %fzen{i} = lda %fzpE{i}, 8")               # the egress record count (its parity: the ring slot)
+        e(f"  %fzdl{i} = lda %fzpE{i}, 28")              # the egress ring
+        e(f"  low.br ^fze{i}h(%fzE0: reg<aie2p.er>, %fzsp{i}: reg<aie2p.ep>, %fzen{i}: reg<aie2p.er>)")
+        e(f"^fze{i}h(%fzei{i}: reg<aie2p.er>, %fzes{i}: reg<aie2p.ep>, %fzec{i}: reg<aie2p.er>):")
         e(f"  %fzem{i} = lt %fzei{i}, %fznr{i}")
-        e(f"  low.cond_br %fzem{i}, ^fze{i}b, {x} : reg<aie2p.er>")
+        e(f"  low.cond_br %fzem{i}, ^fze{i}b, ^fze{i}s : reg<aie2p.er>")
         e(f"^fze{i}b:")
         e(f"  acq %fzEm1, {dp}")
-        e(f"  %fzpE{i} = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
-        e(f"  %fzen{i} = lda %fzpE{i}, 8")
-        e(f"  %fzekh{i} = mova.i32 -1")
-        e(f"  %fzeh{i} = lshl %fzen{i}, %fzekh{i}")
-        e(f"  %fzehh{i} = add.rr %fzeh{i}, %fzeh{i}")
-        e(f"  %fzer{i} = sub %fzen{i}, %fzehh{i}")
-        e(f"  %fzerb{i} = mov.i32 {4 * fw}")
-        e(f"  %fzeo{i} = mul %fzer{i}, %fzerb{i}")
-        e(f"  %fzdl{i} = lda %fzpE{i}, 28")
-        e(f"  %fzea{i} = add.rr %fzdl{i}, %fzeo{i}")
-        e(f"  %fzed{i} = mov.scalar-to-address %fzea{i}")
-        if fw == 16:   # one 64-byte copy, straight-line (as a one-trip loop the records came out scrambled: unexplained)
-            for q in range(4):
-                e(f"  %fzsv{i}_{q} = vlda.128.i32x4 %fzes{i}, {16 * q}")
-                e(f"  vst.128.i32x4 %fzsv{i}_{q}, %fzed{i}, {16 * q}")
-            e(f"  %fzcs{i} = padda %fzes{i}, 64")
-            e(f"  low.br ^fzc{i}x")
-        else:
-            e(f"  %fzck{i} = mov.i32 {fw // 16}")
-            e(f"  low.br ^fzc{i}(%fzE0: reg<aie2p.er>, %fzes{i}: reg<aie2p.ep>, %fzed{i}: reg<aie2p.ep>)")
-            e(f"^fzc{i}(%fzci{i}: reg<aie2p.er>, %fzcs{i}: reg<aie2p.ep>, %fzcd{i}: reg<aie2p.ep>):")
-            e(f"  %fzcm{i} = lt %fzci{i}, %fzck{i}")
-            e(f"  low.cond_br %fzcm{i}, ^fzc{i}b, ^fzc{i}x : reg<aie2p.er>")
-            e(f"^fzc{i}b:")
-            for q in range(4):
-                e(f"  %fzcv{i}_{q} = vlda.128.i32x4 %fzcs{i}, {16 * q}")
-                e(f"  vst.128.i32x4 %fzcv{i}_{q}, %fzcd{i}, {16 * q}")
-            e(f"  %fzcs1{i} = padda %fzcs{i}, 64")
-            e(f"  %fzcd1{i} = padda %fzcd{i}, 64")
-            e(f"  %fzci1{i} = add.rr %fzci{i}, %fzE1")
-            e(f"  low.br ^fzc{i}(%fzci1{i}: reg<aie2p.er>, %fzcs1{i}: reg<aie2p.ep>, %fzcd1{i}: reg<aie2p.ep>)")
-        e(f"^fzc{i}x:")
+        sp_, b_ = egress_record(e, f"{i}", f"%fzes{i}", f"%fzec{i}", f"%fzdl{i}", fw)
         e(f"  rel %fzE1, {dp}")
-        e(f"  %fzen1{i} = add.rr %fzen{i}, %fzE1")
-        e(f"  st %fzen1{i}, %fzpE{i}, 8")
+        e(f"  %fzcs{i} = padda {sp_}, {4 * fw - b_}")
+        e(f"  %fzec1{i} = add.rr %fzec{i}, %fzE1")
         e(f"  %fzei1{i} = add.rr %fzei{i}, %fzE1")
-        e(f"  low.br ^fze{i}h(%fzei1{i}: reg<aie2p.er>, %fzcs{i}: reg<aie2p.ep>)")
+        e(f"  low.br ^fze{i}h(%fzei1{i}: reg<aie2p.er>, %fzcs{i}: reg<aie2p.ep>, %fzec1{i}: reg<aie2p.er>)")
+        e(f"^fze{i}s:")
+        e(f"  st %fzec{i}, %fzpE{i}, 8")
+        e(f"  low.br {x}")
         if i + 1 < len(pieces):
             e(f"^fze{i + 1}:")
     e("^fzex:")
@@ -1274,6 +1249,32 @@ def raw_stream_unit(e, D, RW, inb):
     e("^fzrx:")
 
 
+def egress_record(e, t, src, cnt, ring, fw):
+    """One egress record: fw words from src (16-byte aligned: k-blocks are 144 bytes) into the egress ring slot of
+    record count cnt's parity, straight-line in chunks of up to 12 copies (all loads, then all stores), each through
+    pointers 64 bytes in (immediates reach -128 .. 112; padda steps by multiples of 64). Returns (the source pointer
+    now: padda consumes src, its byte offset from src)."""
+    e(f"  %fzk1{t} = mova.i32 1")
+    e(f"  %fzer{t} = and {cnt}, %fzk1{t}")
+    e(f"  %fzerb{t} = mov.i32 {4 * fw}")
+    e(f"  %fzeo{t} = mul %fzer{t}, %fzerb{t}")
+    e(f"  %fzea{t} = add.rr {ring}, %fzeo{t}")
+    off = 0
+    for c, q0 in enumerate(range(0, fw // 4, 12)):
+        o = 16 * q0 + 64
+        e(f"  %fzsx{t}_{c} = padda {src}, {o - off}")
+        src, off = f"%fzsx{t}_{c}", o
+        e(f"  %fzeb{t}_{c} = mov.i32 {o}")
+        e(f"  %fzea{t}_{c} = add.rr %fzea{t}, %fzeb{t}_{c}")
+        e(f"  %fzed{t}_{c} = mov.scalar-to-address %fzea{t}_{c}")
+        qs = range(q0, min(q0 + 12, fw // 4))
+        for q in qs:
+            e(f"  %fzv{t}_{q} = vlda.128.i32x4 {src}, {16 * (q - q0) - 64}")
+        for q in qs:
+            e(f"  vst.128.i32x4 %fzv{t}_{q}, %fzed{t}_{c}, {16 * (q - q0) - 64}")
+    return src, off
+
+
 def fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0):
     """fuse_decode's egress as one record loop (program memory: a loop per slice cost ~300 bytes each): the slices of
     an unpadded cover are a rotation of the decoded k-blocks k0 .. k1 (the filler's own slice last), so the source walks
@@ -1286,63 +1287,34 @@ def fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0):
     e("  %fzsrc = add.rr %fzsb2, %fzoo")
     e(f"  %fzohi = mov.i32 {hi}")
     e("  %fzhi = add.rr %fzsb2, %fzohi")
-    e("  low.br ^fzeh(%fzE0: reg<aie2p.er>, %fzsrc: reg<aie2p.er>, %fzhi: reg<aie2p.er>)")
-    e("^fzeh(%fzei: reg<aie2p.er>, %fzes: reg<aie2p.er>, %fzeH: reg<aie2p.er>):")
+    e("  %fzpE = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzen = lda %fzpE, 8")                         # the egress record count (its parity: the ring slot)
+    e("  %fzdl = lda %fzpE, 28")                        # the egress ring
     e(f"  %fznr = mov.i32 {nrec}")
-    e("  %fzem = lt %fzei, %fznr")
-    e("  low.cond_br %fzem, ^fzeb, ^fzex : reg<aie2p.er>")
-    e("^fzeb:")
+    e(f"  %fzspan = mov.i32 {hi - lo}")
     e("  %fzB1 = mova.i32 1")
     e("  %fzBm1 = mova.i32 -1")
+    e("  low.br ^fzeh(%fzE0: reg<aie2p.er>, %fzsrc: reg<aie2p.er>, %fzen: reg<aie2p.er>)")
+    e("^fzeh(%fzei: reg<aie2p.er>, %fzes: reg<aie2p.er>, %fzec: reg<aie2p.er>):")
+    e("  %fzem = lt %fzei, %fznr")
+    e("  low.cond_br %fzem, ^fzeb, ^fzes : reg<aie2p.er>")
+    e("^fzeb:")
     e(f"  acq %fzBm1, {dp}")
-    e("  %fzpE = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
-    e("  %fzen = lda %fzpE, 8")
-    e("  %fzeh = lshl %fzen, %fzBm1")
-    e("  %fzehh = add.rr %fzeh, %fzeh")
-    e("  %fzer = sub %fzen, %fzehh")
-    e(f"  %fzerb = mov.i32 {4 * fw}")
-    e("  %fzeo = mul %fzer, %fzerb")
-    e("  %fzdl = lda %fzpE, 28")
-    e("  %fzea = add.rr %fzdl, %fzeo")
-    e("  %fzed = mov.scalar-to-address %fzea")
     e("  %fzesp = mov.scalar-to-address %fzes")
-    if fw == 16:   # (straight-line: see fuse_decode)
-        for q in range(4):
-            e(f"  %fzsv_{q} = vlda.128.i32x4 %fzesp, {16 * q}")
-            e(f"  vst.128.i32x4 %fzsv_{q}, %fzed, {16 * q}")
-        e("  low.br ^fzcx")
-    else:
-        e("  %fzB0 = mova.i32 0")
-        e("  low.br ^fzc(%fzB0: reg<aie2p.er>, %fzesp: reg<aie2p.ep>, %fzed: reg<aie2p.ep>)")
-        e("^fzc(%fzci: reg<aie2p.er>, %fzcs: reg<aie2p.ep>, %fzcd: reg<aie2p.ep>):")
-        e(f"  %fzck = mov.i32 {fw // 16}")
-        e("  %fzcm = lt %fzci, %fzck")
-        e("  low.cond_br %fzcm, ^fzcb, ^fzcx : reg<aie2p.er>")
-        e("^fzcb:")
-        for q in range(4):
-            e(f"  %fzcv_{q} = vlda.128.i32x4 %fzcs, {16 * q}")
-            e(f"  vst.128.i32x4 %fzcv_{q}, %fzcd, {16 * q}")
-        e("  %fzcs1 = padda %fzcs, 64")
-        e("  %fzcd1 = padda %fzcd, 64")
-        e("  %fzC1 = mova.i32 1")
-        e("  %fzci1 = add.rr %fzci, %fzC1")
-        e("  low.br ^fzc(%fzci1: reg<aie2p.er>, %fzcs1: reg<aie2p.ep>, %fzcd1: reg<aie2p.ep>)")
-    e("^fzcx:")
-    e("  %fzX1 = mova.i32 1")
-    e(f"  rel %fzX1, {dp}")
-    e("  %fzpX2 = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
-    e("  %fzen2 = lda %fzpX2, 8")
-    e("  %fzen1 = add.rr %fzen2, %fzX1")
-    e("  st %fzen1, %fzpX2, 8")
-    e("  %fzei1 = add.rr %fzei, %fzX1")
+    egress_record(e, "", "%fzesp", "%fzec", "%fzdl", fw)
+    e(f"  rel %fzB1, {dp}")
+    e("  %fzec1 = add.rr %fzec, %fzB1")
+    e("  %fzei1 = add.rr %fzei, %fzB1")
     e(f"  %fzstep = mov.i32 {4 * fw}")
     e("  %fzns = add.rr %fzes, %fzstep")
-    e("  %fzin = lt %fzns, %fzeH")          # 1: below k1's end, 0: wrap to k0
-    e(f"  %fzspan = mov.i32 {hi - lo}")
+    e("  %fzin = lt %fzns, %fzhi")          # 1: below k1's end, 0: wrap to k0
     e("  %fzwr0 = mul %fzin, %fzspan")
     e("  %fzwr1 = sub %fzns, %fzspan")
     e("  %fzns2 = add.rr %fzwr1, %fzwr0")
-    e("  low.br ^fzeh(%fzei1: reg<aie2p.er>, %fzns2: reg<aie2p.er>, %fzeH: reg<aie2p.er>)")
+    e("  low.br ^fzeh(%fzei1: reg<aie2p.er>, %fzns2: reg<aie2p.er>, %fzec1: reg<aie2p.er>)")
+    e("^fzes:")
+    e("  st %fzec, %fzpE, 8")
+    e("  low.br ^fzex")
 
 
 def fill_leaf(L, cfg, nports):
