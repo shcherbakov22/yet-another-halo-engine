@@ -643,7 +643,7 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 # plain encoders, "pk" (Q4_K) by the "_pk" encoders into A's second half. Tensors of other formats stay on the GPU.
 # YAH_NPU_FUSE=1: the same raw-row sets on 8 fused GEMM columns (gen_npu_gemm fuse 2: every GEMM core decodes its own
 # panel slice; no decoder column, no swap images), images "npu_dcol_<fmt>_<K>.xdna" for the formats in FUSE_FMTS, NP 4:
-# 512-row calls (site rows multiples of 512; NP 5 images no longer fit the grid decoders' raw rings).
+# 512-row calls (site rows multiples of 512; NP 5 images no longer fit the grid decoders' raw rings), one replay group.
 NPU_FUSE = os.environ.get("YAH_NPU_FUSE") == "1"
 NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
 FUSE_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q4k")
@@ -998,9 +998,8 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     jobs = []
     for fmt, K in sorted(images):
         if NPU_FUSE:
-            # (rawdma: plain-A calls hang the NPU; their raw rows take the core stream)
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=K,
-                            fmt=DCOL_FMTS[fmt][0], rawdma=0)
+                            fmt=DCOL_FMTS[fmt][0])
         else:
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
                             kraw=K)
@@ -1314,8 +1313,17 @@ def main():
 
     geom.extend(ffn_fused(rows, B, outdir))
     if NPU_SPLIT or NPU_FFNBLK:
-        with GN.np_override(NPU_NP):
-            geom.extend(npu_split(rows, combos, B, outdir))
+        import gen_bfp16_encode as GE
+        import gen_npu_unpack as GU
+        # fused sets: one replay group per call (the fillers' W-DMA raw ring hangs with two), so C is one partial
+        groups, cg = GE.GROUPS, GU.CG
+        if NPU_FUSE:
+            GE.GROUPS, GU.CG = (NPU_PASSES,), 1
+        try:
+            with GN.np_override(NPU_NP):
+                geom.extend(npu_split(rows, combos, B, outdir))
+        finally:
+            GE.GROUPS, GU.CG = groups, cg
 
     # The calibration menu (calibration_menu, for engine/model/prefill_calib.hpp) is shelved with the calibration;
     # YAH_CALIB_MENU=1 still emits it.
