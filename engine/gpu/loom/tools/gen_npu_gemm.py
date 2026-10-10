@@ -1406,8 +1406,11 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None):
     if early:   # (fuse2_entry)
         e("  %fzpL = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
         e("  %conf = lda %fzpL, 16")
-    else:
-        e("  %conf = mova.i32 780")
+    else:   # a load, not a constant: the allocator would rematerialize a constant at every MMA (one MOVA each)
+        e("  %cfs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+        e("  %cfp = storage_address %cfs : low.storage<private> -> reg<aie2p.ep>")
+        e("  %conf0 = mova.i32 780")
+        e("  st %conf0, %cfp, 0")
     e("  %am1 = mova.i32 -1")
     if early:
         e("  acq %am1, 1")
@@ -1418,6 +1421,8 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None):
     e("  %zero = mova.i32 0")
     e(f"  %nmp = mova.i32 {MP // cfg.mu}")
     e(f"  %nnp = mova.i32 {NP}")
+    if not early:
+        e("  %conf = lda %cfp, 0")   # (the store above has settled: a load right after its store reads stale)
     e("  %k144 = mova.i32 16")
     e(f"  %kks = mova.i32 {fa // 16}")
     e("  %fstep = mul %k144, %kks")   # slab stride
