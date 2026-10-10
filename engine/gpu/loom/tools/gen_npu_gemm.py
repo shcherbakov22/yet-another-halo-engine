@@ -86,6 +86,10 @@ class Config:
     rawdma: int = 1     # fuse 2: each filler's raw rows reach it through its W DMA instead of its core stream: the
                         # column's raw stream lands in a memory-tile ring the fillers drain in turn, each queued ahead of
                         # its panel's records, into a ring in its idle W ring (constrain.intake, HRX patch 0022)
+    gwest: int = 0      # gate (fuse 2): the relay is the waiter's east neighbor (column 2, row 1; it loads the waiter's
+                        # memory through its west window) instead of the row below it, so each of the two columns sends
+                        # one gate stream (tick / signal) and has room for two fill egresses (fuse_cover; HRX
+                        # patch 0025)
     dfr: int = 0        # swiglu (mu 1, not paired): each M block's epilogue deferred into the next block's passes: segment s
                         # at pass s, one h block (a push) after sub-tiles DFR_T of each iteration, in the tail's cascade
                         # slack; the C ring's other half (2 MP slots, released in the same order, so the records and
@@ -419,7 +423,7 @@ def array_program(L, cfg):
             e(f"  %ra{c}_{r} = receiver %k{c}_{r}, 0 : reg<aie2p.array.receiver : tile<{arec}>>")
             e(f"  %cha{c}_{r} = channel %a{r}, %ra{c}_{r}, %n{acap}, %arec{r} : reg<aie2p.array.channel : tile<{arec}>>")
             e(f"  constrain.leaf_sync %cha{c}_{r}")
-            e(f"  constrain.stage %cha{c}_{r}, %n{astage(r, cols) if cols > 1 else 2}")
+            e(f"  constrain.stage %cha{c}_{r}, %n{astage(r, cols, cfg.gwest) if cols > 1 else 2}")
     if cfg.gate:
         S = cfg.gate
         e('  %fb = binding 3, "read"')
@@ -429,7 +433,7 @@ def array_program(L, cfg):
         e(f"  %gf_all = sender %fb, 0 : reg<aie2p.array.sender : tile<1x{S}x1x4xi32, #encoding.layout.strided<strides=[4, 0, 0, 1]>>>")
         e("  %gf = partition.sender %gf_all, %origin, %n0, %one : reg<aie2p.array.sender : tile<4xi32>>")
         gw, gr, gc = gate_ports(cfg)["waiter"], gate_ports(cfg)["relay"], gate_ports(cfg)["col"]
-        kw, kr = f"%k{gc}_{gw['row']}", f"%k{gc}_{gr['row']}"
+        kw, kr = f"%k{gc}_{gw['row']}", f"%k{gr.get('col', gc)}_{gr['row']}"
         e(f"  %gpoll = receiver {kw}, {gw['poll']} : reg<aie2p.array.receiver : tile<4xi32>>")
         e("  %chgp = channel %gf, %gpoll, %two, %gsup : reg<aie2p.array.channel : tile<4xi32>>")
         e("  constrain.core_stream %chgp")
@@ -457,8 +461,11 @@ FILL_PER = 2   # GEMM columns per fill worker
 FILL_DIV = 1   # timing emulation: input records frec / FILL_DIV, written FILL_DIV times (raw-sized DRAM reads)
 
 
-def astage(r, cols):
-    """The memory-tile column K-slice row r's activations stage in: one row per column (0, 2, 4, 6; 6 columns: 0, 2, 4, 1)."""
+def astage(r, cols, gwest=0):
+    """The memory-tile column K-slice row r's activations stage in: one row per column (0, 2, 4, 6; 6 columns: 0, 2, 4, 1).
+    gwest: row 1 in column 3 (the gate's columns 1 and 2 have two-filler panels, no descriptors left to stage)."""
+    if gwest and r == 1:
+        return 3
     return 2 * r if 2 * r < cols else (2 * r + 1) % cols
 
 
@@ -573,6 +580,8 @@ def gate_ports(cfg):
     head fills every panel (fuse_cover; the filling cores' stream input carries their raw weights; column 0's memory
     tile also stages an activation row: its northward link has no channel left for the flag stream)."""
     rows = len(cfg.ks)
+    if cfg.fuse and cfg.gwest:   # (the relay's column: "col" is the waiter's)
+        return {"col": 1, "waiter": dict(row=1, poll=2, tick=3, nbr=4), "relay": dict(col=2, row=1, nbr=2, sig=3)}
     if cfg.fuse:
         return {"col": 1 if cfg.cols > 1 else 0, "waiter": dict(row=1, poll=2, tick=3, nbr=4),
                 "relay": dict(row=2, nbr=2, sig=3)}
@@ -586,8 +595,9 @@ def worker_leaf(cfg, c, r):
     cov = fuse_cover(cfg, c).get(r) if cfg.fuse else None
     gp = gate_ports(cfg)
     gate = None
-    if cfg.gate and c == gp["col"]:
-        gate = "waiter" if r == gp["waiter"]["row"] else "relay" if r == gp["relay"]["row"] else None
+    if cfg.gate:
+        gate = ("waiter" if (c, r) == (gp["col"], gp["waiter"]["row"]) else
+                "relay" if (c, r) == (gp["relay"].get("col", gp["col"]), gp["relay"]["row"]) else None)
     if cov is None:
         name = role + ("_n" if cfg.fuse and role != "tail" else "")   # (fuse: a mid whose panel another fills)
     elif cov == fuse_cover(cfg, -1).get(r):
@@ -643,10 +653,13 @@ def fuse_cover(cfg, c):
     """Column c's filling rows: {filler row: the rows whose slices it fills, consecutive rows in panel member order
     (their panels share its fill, interleaved per unit)}. Rows 0 .. rows - 2 fill their own, the second-to-last also
     the last row's. The gate column (fuse 2) has one filler, its head, for every row: four streams at most cross each
-    downward link, and the gate's tick and signal plus C leave room for a single egress. fuse 2 lists the filler last:
+    downward link, and the gate's tick and signal plus C leave room for a single egress. gwest splits the gate over
+    columns 1 and 2 (one gate stream each): their heads fill rows 1 and 0, their rows 2 rows 3 and 2. fuse 2 lists the filler last:
     a member's drain starts once its slice of the group's last unit lands, and the filler's drain overwrites its W ring,
     the decoder's scratch, which the other members' slices are still copied from."""
     rows = len(cfg.ks)
+    if cfg.fuse == 2 and cfg.gate and cfg.gwest and c in (1, 2):   # the gate's rows 1: two fillers, head and row 2
+        return {0: (1, 0), rows - 2: (rows - 1, rows - 2)}
     if cfg.fuse == 2 and cfg.gate and c == gate_ports(cfg)["col"]:
         return {0: tuple(range(1, rows)) + (0,)}
     last = (rows - 1, rows - 2) if cfg.fuse == 2 else (rows - 2, rows - 1)
@@ -764,7 +777,8 @@ def fuse_channels(e, cfg, panel):
     else:
         e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cols}x{units}x{uw}xi32>>")
     covs = list(fuse_cover(cfg, -1).values())   # an ordinary column's covers, then any other column's
-    covs += [cov for c in range(cols) for cov in fuse_cover(cfg, c).values() if cov not in covs]
+    for cov in (cov for c in range(cols) for cov in fuse_cover(cfg, c).values()):
+        covs += [cov] if cov not in covs else []
     tag = lambda cov: str(covs.index(cov)) if cov in covs[:rows - 1] else "f" + "".join(map(str, cov))
     for cov in covs:
         fw, nrec = fuse_record(cfg, cov)

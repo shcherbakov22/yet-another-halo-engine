@@ -1,0 +1,86 @@
+Two Loom AIE2P array fixes for the gate placement that frees the gate column's fill (yah gen_npu_gemm gwest):
+- A worker channel to the sender's east neighbor (same row) is neighbor memory: the receiver loads the sender's
+  memory through its west window, as vertical neighbors do through north / south. It was routed as a DMA stream.
+- An intake multicast's members may have rings of different depth (one filler's compact single-record raw ring, the
+  other's two records). The shared stage ring has the source member's depth; a deeper member's drain indexed stage
+  records past it (another buffer: its decoder read garbage for every other raw record). A member's drain chain now
+  covers both depths and takes the stage records in turn. Equal depths (every earlier image) are byte-identical.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+@@ -1129,8 +1129,14 @@
+           sender_worker->coordinate.column ==
+               receiver_worker->coordinate.column &&
+           (row_delta == -1 || row_delta == 1);
++      // The receiver east of the sender loads the sender's memory through its
++      // west window (a core sees its own, north, south and west memory).
++      const bool receiver_is_east_neighbor =
++          row_delta == 0 && (int)receiver_worker->coordinate.column ==
++                                (int)sender_worker->coordinate.column + 1;
+       // a core stream between two workers is a route (no memory, no DMA)
+-      if (workers_are_vertical_neighbors && !channel->core_stream) {
++      if ((workers_are_vertical_neighbors || receiver_is_east_neighbor) &&
++          !channel->core_stream) {
+         channel->transport = LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_NEIGHBOR_MEMORY;
+         channel->neighbor_receiver_load_address_base =
+             loom_aie2p_array_topology_neighbor_load_address_base(
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -3404,7 +3404,13 @@
+       &stage_state->memory_tile_bd_cursors[panel_drain->dma_channel & 1u];
+   loom_aie2p_array_tile_resources_t* core_resources =
+       &loom_aie2p_array_tile_state(builder, worker->coordinate)->resources;
+-  if (*drain_cursor + capacity > half_capacity ||
++  // The member drains the source's stage records in turn: its chain covers
++  // both its own ring and the stage ring (members' capacities may differ).
++  const uint32_t stage_count =
++      builder->dma_channels[source->intake_fill_dma].buffer_descriptor_count;
++  uint32_t drain_count = capacity;
++  while (drain_count % stage_count != 0) drain_count += capacity;
++  if (*drain_cursor + drain_count > half_capacity ||
+       (uint32_t)core_resources->next_buffer_descriptor + capacity >
+           core_resources->facts->dma.buffer_descriptor_count ||
+       (uint32_t)core_resources->next_lock + 2u >
+@@ -3416,7 +3422,7 @@
+   const uint16_t drain_bd =
+       (uint16_t)((panel_drain->dma_channel & 1u) * half_capacity +
+                  *drain_cursor);
+-  *drain_cursor += capacity;
++  *drain_cursor += drain_count;
+   channel->intake_drain_dma = (uint32_t)builder->dma_channel_cursor;
+   builder->dma_channels[builder->dma_channel_cursor++] =
+       (loom_aie2p_array_dma_plan_t){
+@@ -3427,7 +3433,7 @@
+           .flags = LOOM_AIE2P_ARRAY_DMA_FLAG_MEMORY_TILE |
+                    LOOM_AIE2P_ARRAY_DMA_FLAG_INTAKE,
+           .buffer_descriptor_start = drain_bd,
+-          .buffer_descriptor_count = capacity,
++          .buffer_descriptor_count = (uint16_t)drain_count,
+           .credit_lock_index = source->intake_chain_lock,
+           .stage_record_base = source->stage_first_record,
+       };
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -1028,6 +1028,10 @@
+       release_lock->lock_id, &release_selector));
+   const loom_xdna_tile_facts_t* tile =
+       loom_xdna_array_tile_facts(plan->family, dma->coordinate);
++  // A member's drain chain may be longer than the stage ring (its own ring
++  // is deeper): its descriptors take the stage records in turn.
++  const uint32_t stage_count =
++      plan->dma_channels[source->intake_fill_dma].buffer_descriptor_count;
+   const uint16_t buffer_descriptor =
+       dma->buffer_descriptor_start + (uint16_t)slot_ordinal;
+   const uint16_t indices[] = {buffer_descriptor};
+@@ -1049,7 +1053,8 @@
+   loom_aie2p_program_encode_admitted_field(
+       LOOM_XDNA_REGISTER_FIELD_MEMORY_TILE_DMA_BD_WORD1_BASE_ADDRESS,
+       (tile->memory.local_load_base +
+-       plan->stage_record_offsets[dma->stage_record_base + slot_ordinal]) >>
++       plan->stage_record_offsets[dma->stage_record_base +
++                                  slot_ordinal % stage_count]) >>
+           tile->dma.address_encoding_shift,
+       &words[1]);
+   const bool last = slot_ordinal + 1u == dma->buffer_descriptor_count;

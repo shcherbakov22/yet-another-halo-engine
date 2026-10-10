@@ -1002,7 +1002,7 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     jobs = []
     for fmt, K in sorted(images):
         if NPU_FUSE:
-            cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=K,
+            cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1, fuse=2, kraw=K,
                             fmt=DCOL_FMTS[fmt][0])
         else:
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
@@ -1074,7 +1074,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             if NPU_FUSE:
                 dfr = fmt in NPU_DFR_FMTS
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, mu=1,
-                                       gate=GN.GATE_SUPPLY, fuse=2, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32,
+                                       gate=GN.GATE_SUPPLY, gwest=1, fuse=2, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32,
                                        hpass=F // 1024, hord=hord, fmt=DCOL_FMTS[fmt][0], dfr=int(dfr)), name, None, 4))
                 continue
             jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2,
@@ -1086,7 +1086,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                                    {l["ffn_down"] + ((l["ffn_down"][2] * 256 - PF) // 256,) for l in pairs}):
         if NPU_FUSE and NPU_FFNRES:   # the GPU's K window as the residual GEMM, adding the NPU's down partials
             with GN.np_override(4):
-                dcfg = GN.Config(NPU_COLS, B // 64, NPU_KS, parts[0][1], mu=1, gate=GN.GATE_SUPPLY, fuse=2,
+                dcfg = GN.Config(NPU_COLS, B // 64, NPU_KS, parts[0][1], mu=1, gate=GN.GATE_SUPPLY, gwest=1, fuse=2,
                                  kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0])
                 cp, tn, calls = GN.stream_bytes(dcfg)[2], GN.TN, -(-5120 // rows)
             assert rows == NPU_COLS * tn and 5120 % rows == 0
@@ -1117,7 +1117,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     for fmt, mt, kb in sorted({l["ffn_down"] for l in ok} | {l["ffn_down"] for l in pairs}):
         for passes in sorted({p for _, p in parts + (ffnblk_parts(PF) if pairs else ())}):
             if NPU_FUSE:
-                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
+                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, mu=1, gate=GN.GATE_SUPPLY, gwest=1, fuse=2,
                                        kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0]),
                              "npu_ffndn%d_%s" % (passes, fmt), None, 4))
                 continue
@@ -1132,7 +1132,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), PF)
         name = "npu_ffnsp_%s_%s%s" % (gf, uf, hord and "_" + hord.lower())
         if NPU_FUSE:   # pair u: gate column 2 u, up column 2 u + 1, features 256 j + 64 u + [0, 64) of call j
-            jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, swiglu=True,
+            jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, gwest=1, fuse=2, swiglu=True,
                                    swcol=64, hpass=F // 1024, hord=hord, fmt=DCOL_FMTS[gf][0], ufmt=DCOL_FMTS[uf][0]),
                          name, None, (4, True)))
             continue
