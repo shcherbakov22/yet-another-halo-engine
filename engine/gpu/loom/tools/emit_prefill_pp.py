@@ -646,7 +646,9 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 NPU_FUSE = os.environ.get("YAH_NPU_FUSE") == "1"
 NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
 FUSE_FMTS = ("iq4xs",)
-FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s")   # the fused FFN block's (NP 4 images: room for a grid decoder's tables)
+FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs")   # the fused FFN block's gate / up (NP 4 images:
+# room for a grid decoder's tables; Q4_K's own k-block order would need its own activation stream)
+FUSE_FFN_DOWN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q4k")
 DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3_XXS", "p4"), "q4k": ("Q4_K", "pk"),
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
              "iq2xs": ("IQ2_XS", "p4")}
@@ -1042,7 +1044,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         p = nm.split(".")
         if len(p) > 2 and p[0] == "blk" and p[2] in ("ffn_gate", "ffn_up", "ffn_down") and E.FMT.get(ty):
             by.setdefault(p[1], {})[p[2]] = (E.FMT[ty][0], dims[1] // 16, dims[0] // E.FMT[ty][2])
-    fmts, dfmts = (FUSE_FFN_FMTS, FUSE_FFN_FMTS) if NPU_FUSE else (FFNBLK_FMTS, FFNBLK_DOWN_FMTS)
+    fmts, dfmts = (FUSE_FFN_FMTS, FUSE_FFN_DOWN_FMTS) if NPU_FUSE else (FFNBLK_FMTS, FFNBLK_DOWN_FMTS)
     # H's k-block order: the down decoder's (fused: P4 but Q4_K's)
     hord_of = (lambda d: "Q4K" if d == "q4k" else "P4") if NPU_FUSE else (lambda d: FFNBLK_HORD.get(d, ""))
     rows = NPU_COLS * 64 if NPU_FUSE else NPU_ROWS   # down rows per call (fused: NP 4)

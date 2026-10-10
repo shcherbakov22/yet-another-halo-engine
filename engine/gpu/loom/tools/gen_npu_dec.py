@@ -53,6 +53,7 @@ XS2 = FMT == "IQ2_XS"
 # as C = -K T0 - K T1, + T0 X, + T1 X: every step exact (T = d (sc - 32) has 16 significant bits), so w is exactly
 # d (sc - 32) (v - 4) in f32. T: IQ4_XS's chain (the same formula) for sub-blocks 0-7 and 8-15 (one per record).
 Q3K = FMT == "Q3_K"
+HROLL = os.environ.get("DQ_HROLL", "1") == "1"   # Q3_K, IQ2_XS, IQ2_XXS inlined: the scale prep rolled (program memory)
 GORD = os.environ.get("DQ_GORD", "P4")       # Q3_K pushes any k-block order: "P4", "N" or "PK" (Q4_K's, for its pairs)
 RECROW = 576                    # record row bytes, the same for every format (Q4_K's 4 x 144): image switches between
                                 # formats then re-program only the decoder tiles (the staging buffers stay identical)
@@ -398,6 +399,56 @@ def leaf(name="dec", nports=1):
         e.L.append(f"^{nm}x:")
 
 
+    def q3k_scales(x, ra, hb, h=None, r=None):
+        """Q3_K row at scalar ra: d (+108) and the 12 scale bytes (+96) by u16 loads; sc (6 bit, 16) by the K-quant SWAR
+        -> d at HDR [row], sc at SCM [c][row][8 B]. hb: the row's region scalar (spa + half HS + 8 row: the rolled
+        loop's own pointers), else the unrolled half h row r through the half's store pointers."""
+        rb_ = x.t("rb")
+        x(f"{rb_} = add.rr {ra}, {k(96)}")
+        pr2 = Pr(x, rb_)
+        hw_ = []
+        for i_ in range(6):
+            hw_.append(x.t("hw"))
+            x(f"{hw_[-1]} = lda.u16 {pr2}, {2 * i_}")
+        dw = x.t("dw")
+        x(f"{dw} = lda.u16 {pr2}, 12")
+        aux = []
+        for i_ in range(3):
+            hs_, a_ = x.t("hs"), x.t("aux")
+            x(f"{hs_} = lshl {hw_[2 * i_ + 1]}, {k(16)}")
+            x(f"{a_} = or {hw_[2 * i_]}, {hs_}")
+            aux.append(a_)
+        ws = []
+        for i_, (src, lsh, hsh) in enumerate(((0, 0, 4), (1, 0, 2), (0, -4, 0), (1, -4, -2))):
+            lo_, hi_, h2_, w_ = x.t("lo"), x.t("hi"), x.t("h2"), x.t("sw")
+            if lsh:
+                sh_ = x.t("ls")
+                x(f"{sh_} = lshl {aux[src]}, {k(lsh)}")
+                x(f"{lo_} = and {sh_}, {k(0x0F0F0F0F)}")
+            else:
+                x(f"{lo_} = and {aux[src]}, {k(0x0F0F0F0F)}")
+            if hsh:
+                x(f"{hi_} = lshl {aux[2]}, {k(hsh)}")
+                x(f"{h2_} = and {hi_}, {k(0x30303030)}")
+            else:
+                x(f"{h2_} = and {aux[2]}, {k(0x30303030)}")
+            x(f"{w_} = or {lo_}, {h2_}")
+            ws.append(w_)
+        if hb is None:
+            x(f"st {dw}, %hdp_{h}, {8 * r - 32}")
+            for i_, w_ in enumerate(ws):              # sub-blocks 4 i .. 4 i + 3: [c = i // 2][row][8 B]
+                x(f"st {w_}, %{'hsa' if i_ < 2 else 'hsb'}_{h}, {8 * r + 4 * (i_ % 2) - 32}")
+            return
+        da_, sa_ = x.t("hda"), x.t("hsc")
+        x(f"{da_} = add.rr {hb}, {k(HR + HDR)}")
+        pd_ = Pr(x, da_)
+        x(f"st {dw}, {pd_}, 0")
+        for c_ in range(2):   # sub-blocks 8 c ..: SCM + 64 c (scalar store offsets -32 .. 28)
+            x(f"{sa_}{c_} = add.rr {hb}, {k(HR + SCM + 64 * c_ + 32)}")
+            ps_ = Pr(x, f"{sa_}{c_}")
+            for i_ in range(2):
+                x(f"st {ws[2 * c_ + i_]}, {ps_}, {4 * i_ - 32}")
+
     def aux_words(x, base_scalar, row0, sel=None):
         """8 rows' aux words (realigned 64 B at base + 576 row) transposed: O[i] = words [2 i, 2 i + 1][row 0..7]
         (zips 16, 14 / 15, 12 / 13 on 4-byte units). sel: a shuffle mode applied to each row first (IQ2_XXS: 4 / 5,
@@ -453,10 +504,11 @@ def leaf(name="dec", nports=1):
         x(f"{r_} = vsrs.2x.c-to-x.unsigned {a2}, {shreg}")
         return r_
 
-    def xxs_scales(x, h, b8):
-        """IQ3_XXS: ls = 33 + 2 s (s = aux >> 28, one per sub-block) in the lane order [s'][row][f]."""
+    def xxs_scales(x, hin, b8):
+        """IQ3_XXS: ls = 33 + 2 s (s = aux >> 28, one per sub-block) in the lane order [s'][row][f] (hin: the half's
+        first row, scalar)."""
         ab = x.t("xab")
-        x(f"{ab} = add.rr %hin_{h}, {k(2 if X2 else 66)}")
+        x(f"{ab} = add.rr {hin}, {k(2 if X2 else 66)}")
         O = aux_words(x, ab, 0, 5 if X2 else None)
         sh28 = x.t("s28")
         x(f"{sh28} = mov.shift 28")
@@ -522,7 +574,59 @@ def leaf(name="dec", nports=1):
             e(f"%hdp_{h} = mov.scalar-to-address %hdpa_{h}")
     # header words -> HDR [row][8 B]
     rows_s = []
-    for h in range(2):
+    hroll = (Q3K or XS2 or FMT == "Q4_K") and HROLL and INLINE[0]
+    if hroll:   # Q3_K, IQ2_XS: the 16 rows' scale words in a loop (program memory; the rows ran one at a time anyway)
+        rr_, _ = loop_begin("hl", 16)
+        x = e.stream()
+        ro_, ra, hh_, hm_, r8_, rq_, hq_, hb_ = (x.t(n) for n in ("ro", "ra", "hh", "hm", "r8", "rq", "hq", "hb"))
+        x(f"{ro_} = mul {rr_}, {k(ROWB)}")
+        x(f"{ra} = add.rr %jin, {ro_}")
+        x(f"{hh_} = lshl {rr_}, {k(-3)}")                  # half R / 8, row R % 8 of its region
+        x(f"{hm_} = mul {hh_}, {k(HS)}")
+        x(f"{r8_} = and {rr_}, {k(7)}")
+        x(f"{rq_} = lshl {r8_}, {k(3)}")
+        x(f"{hq_} = add.rr {hm_}, {rq_}")
+        x(f"{hb_} = add.rr %spa, {hq_}")
+        if Q3K:
+            q3k_scales(x, ra, hb_)
+        elif FMT == "Q4_K":   # 4 words -> word planes [k][row] (4 B a row): HDR + 32 k + 4 row
+            pr_, ws = Pr(x, ra), [x.t("w") for _ in range(4)]
+            for kk in range(4):
+                x(f"{ws[kk]} = lda {pr_}, {4 * kk}")
+            r4_, q4_ = x.t("q4s"), x.t("q4r")
+            x(f"{r4_} = lshl {r8_}, {k(2)}")                 # (rows 4 B apart)
+            x(f"{q4_} = add.rr %spa, {hm_}")
+            x(f"{q4_}b = add.rr {q4_}, {r4_}")
+            for c_ in range(2):                             # planes 2 c, 2 c + 1 (scalar store offsets -32 .. 28)
+                pa_ = x.t("q4a")
+                x(f"{pa_} = add.rr {q4_}b, {k(HR + HDR + 64 * c_ + 32)}")
+                pq_ = Pr(x, pa_)
+                for i_ in range(2):
+                    x(f"st {ws[2 * c_ + i_]}, {pq_}, {32 * i_ - 32}")
+        else:   # IQ2_XS: d | 0 -> HDR [row], the 8 scale bytes (+66, u16 loads) -> SCM [row]
+            pr_ = Pr(x, ra)
+            dw, da_, sa_, rb_ = x.t("dw"), x.t("hda"), x.t("hsc"), x.t("rb")
+            x(f"{dw} = lda.u16 {pr_}, 0")
+            x(f"{rb_} = add.rr {ra}, {k(66)}")
+            pr2 = Pr(x, rb_)
+            hs_ = []
+            for i_ in range(4):
+                hs_.append(x.t("hs"))
+                x(f"{hs_[-1]} = lda.u16 {pr2}, {2 * i_}")
+            x(f"{da_} = add.rr {hb_}, {k(HR + HDR)}")
+            pd_ = Pr(x, da_)
+            x(f"st {dw}, {pd_}, 0")
+            x(f"st {k(0)}, {pd_}, 4")
+            x(f"{sa_} = add.rr {hb_}, {k(HR + SCM)}")
+            ps_ = Pr(x, sa_)
+            for i_ in range(2):
+                sh_, w_ = x.t("s1h"), x.t("sw")
+                x(f"{sh_} = lshl {hs_[2 * i_ + 1]}, {k(16)}")
+                x(f"{w_} = or {hs_[2 * i_]}, {sh_}")
+                x(f"st {w_}, {ps_}, {4 * i_}")
+        run([x], 1)
+        loop_end("hl")
+    for h in range(2 if not hroll else 0):
         if GRID:                                # one run per half (pointer budget)
             e(f"%hdpa_{h} = add.rr %hb0_{h}, {k(HDR + 32)}")
             e(f"%hdp_{h} = mov.scalar-to-address %hdpa_{h}")
@@ -585,40 +689,7 @@ def leaf(name="dec", nports=1):
                     run(rows_s, int(os.environ.get("DQ_HDRWIN", "2")))
                 continue
             if Q3K:   # d (+108) and the 12 scale bytes (+96) by u16 loads; sc (6 bit, 16) by the K-quant SWAR
-                rb_ = x.t("rb")
-                x(f"{rb_} = add.rr {ra}, {k(96)}")
-                pr2 = Pr(x, rb_)
-                hw_ = []
-                for i_ in range(6):
-                    hw_.append(x.t("hw"))
-                    x(f"{hw_[-1]} = lda.u16 {pr2}, {2 * i_}")
-                dw = x.t("dw")
-                x(f"{dw} = lda.u16 {pr2}, 12")
-                aux = []
-                for i_ in range(3):
-                    hs_, a_ = x.t("hs"), x.t("aux")
-                    x(f"{hs_} = lshl {hw_[2 * i_ + 1]}, {k(16)}")
-                    x(f"{a_} = or {hw_[2 * i_]}, {hs_}")
-                    aux.append(a_)
-                ws = []
-                for i_, (src, lsh, hsh) in enumerate(((0, 0, 4), (1, 0, 2), (0, -4, 0), (1, -4, -2))):
-                    lo_, hi_, h2_, w_ = x.t("lo"), x.t("hi"), x.t("h2"), x.t("sw")
-                    if lsh:
-                        sh_ = x.t("ls")
-                        x(f"{sh_} = lshl {aux[src]}, {k(lsh)}")
-                        x(f"{lo_} = and {sh_}, {k(0x0F0F0F0F)}")
-                    else:
-                        x(f"{lo_} = and {aux[src]}, {k(0x0F0F0F0F)}")
-                    if hsh:
-                        x(f"{hi_} = lshl {aux[2]}, {k(hsh)}")
-                        x(f"{h2_} = and {hi_}, {k(0x30303030)}")
-                    else:
-                        x(f"{h2_} = and {aux[2]}, {k(0x30303030)}")
-                    x(f"{w_} = or {lo_}, {h2_}")
-                    ws.append(w_)
-                x(f"st {dw}, %hdp_{h}, {8 * r - 32}")
-                for i_, w_ in enumerate(ws):              # sub-blocks 4 i .. 4 i + 3: [c = i // 2][row][8 B]
-                    x(f"st {w_}, %{'hsa' if i_ < 2 else 'hsb'}_{h}, {8 * r + 4 * (i_ % 2) - 32}")
+                q3k_scales(x, ra, None, h, r)
                 if r == 7:                                  # one row at a time: 3 store pointers (pointer budget)
                     run(rows_s, int(os.environ.get("DQ_HDRWIN", "1")))
                 continue
@@ -642,13 +713,31 @@ def leaf(name="dec", nports=1):
         e("%ctp = mov.scalar-to-address %ctpa")          # one constant-table pointer shared by both halves
         CTP["on"] = True
     halves_s = []
-    for h in range(2):
+    vroll = hroll or ((X2 or FMT == "Q4_K") and HROLL and INLINE[0])   # Q3_K, IQ2_XS, IQ2_XXS, Q4_K: the halves in a loop (program memory) instead of two interleaved streams
+    if vroll:
+        hv_i, _ = loop_begin("vl", 2)
+    for h in range(1 if vroll else 2):
         x = e.stream()
         halves_s.append(x)
-        hb0 = f"%hb0_{h}"
+        hb0, hin_ = f"%hb0_{h}", f"%hin_{h}"
         hbp, pph1, pph = x.t("hbp"), x.t("pph"), x.t("pph")
-        x(f"{hbp} = mov.scalar-to-address {hb0}")
-        x(f"{pph1} = add.rr %spb, {k(PARTSS + h * NPARTS * 64)}")
+        if vroll:   # half hv_i: its region, rows and parts lines from half 0's
+            hm_, pm_, pq_ = x.t("hvm"), x.t("ppm"), x.t("ppq")
+            x(f"{hm_} = mul {hv_i}, {k(HS)}")
+            hb0 = x.t("hva")
+            x(f"{hb0} = add.rr %hb0_0, {hm_}")
+            x(f"{pm_} = mul {hv_i}, {k(NPARTS * 64)}")
+            x(f"{pq_} = add.rr %spb, {pm_}")
+            x(f"{hbp} = mov.scalar-to-address {hb0}")
+            x(f"{pph1} = add.rr {pq_}, {k(PARTSS)}")
+            if XXS:
+                hr_ = x.t("hvr")
+                hin_ = x.t("hvi")
+                x(f"{hr_} = mul {hv_i}, {k(8 * ROWB)}")
+                x(f"{hin_} = add.rr %jin, {hr_}")
+        else:
+            x(f"{hbp} = mov.scalar-to-address {hb0}")
+            x(f"{pph1} = add.rr %spb, {k(PARTSS + h * NPARTS * 64)}")
         x(f"{pph} = mov.scalar-to-address {pph1}")
         BASEV[0] = hbp
         # ---- headers, vectorized: ls [row][j] = low bits from the scales_l nibbles | high bits from scales_h, then
@@ -784,7 +873,7 @@ def leaf(name="dec", nports=1):
             x(f"{ho1} = vband {ho}, {mod}")
             x(f"{hp} = vbor {he1}, {ho1}")
             if XXS:
-                a = xxs_scales(x, h, b8)
+                a = xxs_scales(x, hin_, b8)
             else:
                 if GRID:                                     # IQ3_S: T = d (1 + 2 s) = d (ls - 32), ls = 33 + 2 s
                     n2_ = x.t("n2")
@@ -915,6 +1004,8 @@ def leaf(name="dec", nports=1):
             if p < 1:
                 res = mac(x, res, part, wide(x, splat16(x, 0xBF80)))
     run(halves_s, 2)
+    if vroll:
+        loop_end("vl")
     CTP["on"] = False
 
 

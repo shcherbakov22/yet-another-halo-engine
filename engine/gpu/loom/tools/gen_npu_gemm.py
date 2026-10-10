@@ -745,10 +745,12 @@ def fuse_channels(e, cfg, panel):
     elif cfg.fuse == 2:   # raw rows [N][kraw / 256][136]: per column, per (pass, slab) unit [16 rows][4 super-blocks]
         BLK = fuse_blk(cfg)
         RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * BLK // 4   # row stride in words
-        if cfg.swiglu:   # column c: gate rows swcol c .. (its NP / 2 slabs), then the same up rows dgu bytes on
-            assert cfg.dgu % 4 == 0 and NP % 2 == 0 and cfg.hord in ("", "P4")
+        if cfg.swiglu:   # column c: gate rows swcol c .. (its NP / 2 slabs), then the same up rows dgu bytes on; Q4K:
+            # its 2 slabs 32 rows apart (fuse_rows)
+            assert cfg.dgu % 4 == 0 and NP % 2 == 0 and cfg.hord in ("", "P4", "Q4K")
             e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x2x{NP // 2}x16x{uw // 16}xi32, "
-              f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {cfg.dgu // 4}, {16 * RS}, {RS}, 1]>>>")
+              f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {cfg.dgu // 4}, "
+              f"{(32 if cfg.hord == 'Q4K' else 16) * RS}, {RS}, 1]>>>")
         else:
             e(f"  %fru_all = sender %frb, 0 : reg<aie2p.array.sender : tile<{cfg.passes}x{NP}x16x{uw // 16}xi32, "
               f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {16 * RS}, {RS}, 1]>>>")
@@ -768,8 +770,10 @@ def fuse_channels(e, cfg, panel):
             RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * fuse_blk(cc) // 4
             e(f"  %fro{c} = constant.u64 {c // 2 * cfg.swcol * RS * 4} : reg<aie2p.array.offset : offset>")
             e(f"  %fru{c} = view.sender %fru_all{c % 2}, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
-        elif cfg.fuse == 2:   # column c: rows TN c .. (swiglu: gate rows swcol c ..)
-            e(f"  %fro{c} = constant.u64 {c * (cfg.swcol if cfg.swiglu else TN) * RS * 4} : reg<aie2p.array.offset : offset>")
+        elif cfg.fuse == 2:   # column c: rows TN c .. (swiglu: gate rows swcol c ..; Q4K: 64 (c / 2) + 16 (c % 2) ..)
+            r0 = (64 * (c // 2) + 16 * (c % 2) if cfg.swiglu and cfg.hord == "Q4K" else
+                  c * (cfg.swcol if cfg.swiglu else TN))
+            e(f"  %fro{c} = constant.u64 {r0 * RS * 4} : reg<aie2p.array.offset : offset>")
             e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
         else:
             e(f"  %fru{c} = partition.sender %fru_all, %origin, %n{c}, %ncols : reg<aie2p.array.sender : tile<{uw}xi32>>")
