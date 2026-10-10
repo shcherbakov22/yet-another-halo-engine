@@ -1,0 +1,84 @@
+A Loom AIE2P setup fix for images of other layouts sharing a context (LOOM_EXP_ROUTE_RESET; yah gen_npu_gemm ghelp
+images next to images without it):
+- A core reset does not withdraw an acquire the core was stalled in. The request stays pending in the lock's module
+  and takes the first token that lock gets under the next image. Seen: the gate relay, parked on its west neighbor's
+  handoff lock, was reset by the next image's setup, where that lock id is the neighbor's raw intake ready lock; the
+  stale request took a raw record and the column hung on the first call. Every lock of the core and memory tiles in
+  the image's columns is now raised to its maximum (granting any such request while cores and tile DMAs are held in
+  reset) before the lock initialization writes the real values. Shim locks are left alone (their DMA channels cannot
+  be reset). Kernel behavior is otherwise unchanged.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+index 39ca848e3..8fa276590 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/program.c
+@@ -2317,7 +2317,7 @@ static iree_status_t loom_aie2p_program_count_storage(
+     }
+     IREE_RETURN_IF_ERROR(loom_aie2p_program_add_scaled_capacity(
+         (iree_host_size_t)plan->family->column_count * plan->family->row_count,
+-        masters + 4 * 64 + 2 * 2 * 16, &array_record_capacity));
++        masters + 4 * 64 + 2 * 2 * 16 + 64, &array_record_capacity));
+     reset_words = (iree_host_size_t)plan->family->column_count *
+                   plan->family->row_count * (masters + 4 * 64);
+   }
+@@ -2389,6 +2389,51 @@ static iree_status_t loom_aie2p_program_count_storage(
+   return iree_ok_status();
+ }
+ 
++// LOOM_EXP_ROUTE_RESET: raises every lock of the core and memory tiles in the
++// image's columns to its maximum before the lock initialization. A core reset
++// does not withdraw an acquire the core was stalled in: the request stays
++// pending in the lock's module (also a neighbor's: a core stalled on its west
++// neighbor's lock) and takes the first token that lock receives under the next
++// image, where the same lock may belong to another channel (a record lost, the
++// consumer stalls). The raised value grants every such request while all cores
++// and tile DMAs are held in reset; the initialization then writes the real
++// values.
++static iree_status_t loom_aie2p_program_drain_lock_requests(
++    loom_aie2p_array_program_builder_t* builder) {
++  const loom_aie2p_array_plan_t* plan = builder->plan;
++  const loom_xdna_array_family_t* family = plan->family;
++  uint16_t columns = 0;
++  for (iree_host_size_t i = 0; i < plan->route_count; ++i) {
++    columns = iree_max(columns, (uint16_t)(plan->routes[i].coordinate.column + 1));
++  }
++  for (iree_host_size_t i = 0; i < plan->worker_plan_count; ++i) {
++    columns = iree_max(columns,
++                       (uint16_t)(plan->worker_plans[i].coordinate.column + 1));
++  }
++  for (uint16_t column = 0; column < columns; ++column) {
++    for (uint16_t row = 0; row < family->row_count; ++row) {
++      const loom_xdna_tile_coordinate_t coordinate = {.column = column,
++                                                      .row = row};
++      const loom_xdna_tile_facts_t* tile =
++          loom_xdna_array_tile_facts(family, coordinate);
++      if (!tile || (tile->kind != LOOM_XDNA_TILE_KIND_COMPUTE &&
++                    tile->kind != LOOM_XDNA_TILE_KIND_MEMORY)) {
++        continue;
++      }
++      for (uint16_t lock = 0; lock < tile->lock_count; ++lock) {
++        const loom_aie2p_array_lock_plan_t raised = {
++            .coordinate = coordinate,
++            .lock_id = (uint8_t)lock,
++            .initial_value = tile->lock_value_maximum,
++        };
++        IREE_RETURN_IF_ERROR(loom_aie2p_program_append_lock_initialization(
++            builder, &builder->array, &raised));
++      }
++    }
++  }
++  return iree_ok_status();
++}
++
+ static iree_status_t loom_aie2p_program_build_array(
+     loom_aie2p_array_program_builder_t* builder) {
+   for (iree_host_size_t i = 0; i < builder->plan->worker_plan_count; ++i) {
+@@ -2401,6 +2446,9 @@ static iree_status_t loom_aie2p_program_build_array(
+       builder, LOOM_AIE2P_COMPUTE_DMA_RESET_ASSERTED));
+   IREE_RETURN_IF_ERROR(loom_aie2p_program_append_memory_tile_dma_resets(
+       builder, LOOM_AIE2P_COMPUTE_DMA_RESET_ASSERTED));
++  if (getenv("LOOM_EXP_ROUTE_RESET")) {
++    IREE_RETURN_IF_ERROR(loom_aie2p_program_drain_lock_requests(builder));
++  }
+   for (iree_host_size_t i = 0; i < builder->plan->lock_count; ++i) {
+     IREE_RETURN_IF_ERROR(loom_aie2p_program_append_lock_initialization(
+         builder, &builder->array, &builder->plan->locks[i]));

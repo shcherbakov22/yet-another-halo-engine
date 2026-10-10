@@ -90,6 +90,8 @@ class Config:
                         # memory through its west window) instead of the row below it, so each of the two columns sends
                         # one gate stream (tick / signal) and has room for two fill egresses (fuse_cover; HRX
                         # patch 0025)
+    ghelp: int = 0      # gwest: the gate's cores (row 1 of columns 1, 2), idle while their heads decode rows 1 and 0,
+                        # decode row 1 themselves and hand its records to the head over neighbor memory (fuse_helper)
     dfr: int = 0        # swiglu (mu 1, not paired): each M block's epilogue deferred into the next block's passes: segment s
                         # at pass s, one h block (a push) after sub-tiles DFR_T of each iteration, in the tail's cascade
                         # slack; the C ring's other half (2 MP slots, released in the same order, so the records and
@@ -384,7 +386,7 @@ def array_program(L, cfg):
             e(f"  constrain.stage %chw{c}_{r}, %n{c if cols > 1 else 1}")
             if cfg.fuse:   # each panel filled by its row's filler (fuse_cover); a filler's own W is leaf-synced
                 f, _ = fuse_filler(cfg, c, r)
-                if f == r:
+                if f == r or fuse_helper(cfg, c) == r:
                     e(f"  constrain.leaf_sync %chw{c}_{r}")
                 e(f"  constrain.fill %chw{c}_{r}, %chd{c}_{f}")
         if cfg.dcol:
@@ -394,7 +396,9 @@ def array_program(L, cfg):
         e(f"  %firows = constant.u32 16 : reg<aie2p.array.scalar : index>")
         e(f"  %fipitch = constant.u32 {D.RECROW} : reg<aie2p.array.scalar : index>")
         for c in range(cols):
-            for r, cov in fuse_cover(cfg, c).items():
+            h = fuse_helper(cfg, c)
+            for r in list(fuse_cover(cfg, c)) + ([h] if h is not None else []):
+                cov = fuse_dcov(cfg, c, r)
                 e(f"  %fioff{c}_{r} = constant.u32 {fuse_raw_ring(colcfg(cfg, c), cov)[0]} : reg<aie2p.array.scalar : index>")
                 e(f"  constrain.intake %chr{c}_{r}, %chw{c}_{r}, %fioff{c}_{r}, %firows, %fipitch")
     if cfg.dcol:
@@ -598,12 +602,15 @@ def worker_leaf(cfg, c, r):
     if cfg.gate:
         gate = ("waiter" if (c, r) == (gp["col"], gp["waiter"]["row"]) else
                 "relay" if (c, r) == (gp["relay"].get("col", gp["col"]), gp["relay"]["row"]) else None)
-    if cov is None:
+    h = fuse_helper(cfg, c)
+    if h is not None and r == h:
+        name = role + "_h"   # (ghelp: decodes its row for the head)
+    elif cov is None:
         name = role + ("_n" if cfg.fuse and role != "tail" else "")   # (fuse: a mid whose panel another fills)
     elif cov == fuse_cover(cfg, -1).get(r):
         name = "mid_l" if len(cov) > 1 else role   # the last mid also fills the tail's slice
     else:
-        name = role + "_f" + "".join(map(str, cov))
+        name = role + "_f" + "".join(map(str, cov)) + ("h" if h is not None else "")
     if cfg.ufmt and cfg.fuse == 2:   # column pairs: the gate tails send, the up columns' fillers decode cfg.ufmt
         if role == "tail" and not pair_up(cfg, c):
             name = "tail_s"
@@ -676,6 +683,30 @@ def fuse_order(cfg, c):
 def fuse_filler(cfg, c, r):
     """(filler row, its cover) of row r's panel in column c."""
     return next((f, cov) for f, cov in fuse_cover(cfg, c).items() if r in cov)
+
+
+HELP_RAW, HELP_SEND, HELP_RECV = 5, 6, 4   # ghelp ports: the helper's raw intake and record sender, the head's receiver
+
+
+def fuse_helper(cfg, c):
+    """ghelp: column c's helper row, else None. The column's head fills rows (1, 0) but decodes only row 0; row 1's core
+    (no egress: four streams at most cross each downward link) takes the column's raw intake too, decodes row 1 like a
+    filler and sends its records to the head over a leaf-synced neighbor channel instead of an egress, and the head
+    copies them into its egress ahead of row 0's."""
+    if cfg.fuse == 2 and cfg.ghelp and c >= 0 and fuse_cover(cfg, c).get(0) == (1, 0):
+        assert cfg.rawdma
+        return 1
+    return None
+
+
+def fuse_dcov(cfg, c, r):
+    """The rows worker (c, r) decodes (fuse_cover less a helper's row; None: it decodes nothing)."""
+    cov, h = fuse_cover(cfg, c).get(r), fuse_helper(cfg, c)
+    if h is None:
+        return cov
+    if r == h:
+        return (h,)
+    return tuple(j for j in cov if j != h) if cov is not None else None
 
 
 def fuse_record(cfg, cov):
@@ -809,13 +840,29 @@ def fuse_channels(e, cfg, panel):
             ut = f"16x{uw // 16}" if cfg.fuse == 2 else f"{uw}"
             e(f"  %frr{c}_{r} = receiver %k{c}_{r}, {sp} : reg<aie2p.array.receiver : tile<{ut}xi32>>")
             if cfg.rawdma:   # staged in the column's memory tile; intake ring depth fuse_raw_ring
-                cap = fuse_raw_ring(colcfg(cfg, c), cov)[1]
+                cap = fuse_raw_ring(colcfg(cfg, c), fuse_dcov(cfg, c, r))[1]
                 e(f"  %chr{c}_{r} = channel %fru{c}, %frr{c}_{r}, %n{cap}, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
                 e(f"  constrain.stage %chr{c}_{r}, %n{c if cols > 1 else 1}")
                 e(f"  constrain.leaf_sync %chr{c}_{r}")
             else:
                 e(f"  %chr{c}_{r} = channel %fru{c}, %frr{c}_{r}, %two, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
                 e(f"  constrain.core_stream %chr{c}_{r}")
+        h = fuse_helper(cfg, c)
+        if h is not None:   # the helper: its raw intake, its records to the head (the head's record size)
+            ut = f"16x{uw // 16}"
+            fw, _ = fuse_record(cfg, fuse_cover(cfg, c)[0])
+            assert fuse_record(cfg, (h,))[0] == fw
+            nrec = cfg.passes * NP * (slab(cfg.ks[h]) // 4) // fw
+            e(f"  %frr{c}_{h} = receiver %k{c}_{h}, {HELP_RAW} : reg<aie2p.array.receiver : tile<{ut}xi32>>")
+            cap = fuse_raw_ring(colcfg(cfg, c), (h,))[1]
+            e(f"  %chr{c}_{h} = channel %fru{c}, %frr{c}_{h}, %n{cap}, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
+            e(f"  constrain.stage %chr{c}_{h}, %n{c if cols > 1 else 1}")
+            e(f"  constrain.leaf_sync %chr{c}_{h}")
+            e(f"  %fhn{c} = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
+            e(f"  %fhs{c} = sender %k{c}_{h}, {HELP_SEND} : reg<aie2p.array.sender : tile<{fw}xi32>>")
+            e(f"  %fhr{c} = receiver %k{c}_0, {HELP_RECV} : reg<aie2p.array.receiver : tile<{fw}xi32>>")
+            e(f"  %chh{c} = channel %fhs{c}, %fhr{c}, %two, %fhn{c} : reg<aie2p.array.channel : tile<{fw}xi32>>")
+            e(f"  constrain.leaf_sync %chh{c}")
 
 
 class _Fill:
@@ -915,7 +962,7 @@ class _Fill:
         e(f"^fzlx{t}:")
 
 
-def fuse_prologue(L, cfg, role, ks, cov):
+def fuse_prologue(L, cfg, role, ks, cov, helper=None, gate=None):
     """A filling worker's firing (row r < rows - 1): the firing counter (private), the W slot by parity (leaf-synced
     W, acquired here and released at the exit); at each replay group's first firing (firings run group, M block,
     pass), that group's fill: per unit, skip the rows before its own, take its slab (row rows - 2 also the last
@@ -924,7 +971,7 @@ def fuse_prologue(L, cfg, role, ks, cov):
     assert len(groups(cfg)) > 1 or cfg.fuse == 2, "fuse 1: the interleaved last-two-rows panel needs streamed groups"
     e = L.append
     rows = len(cfg.ks)
-    dp, _ = fuse_ports(role)
+    dp = HELP_SEND if helper == "M" else fuse_ports(role)[0]
     wrec = NP * slab(ks)
     sw = [slab(k) // 4 for k in cfg.ks]
     pre = sum(sw[:min(cov)])
@@ -933,7 +980,7 @@ def fuse_prologue(L, cfg, role, ks, cov):
     e("  %fzs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e("  %fzp = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     if cfg.fuse == 2:
-        fuse2_entry(L, cfg, dp, cov, wrec)
+        fuse2_entry(L, cfg, dp, cov, wrec, helper, gate)
         return
     e("  %fzjs = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
     e("  %fzjp = storage_address %fzjs : low.storage<private> -> reg<aie2p.ep>")
@@ -981,7 +1028,7 @@ def fuse_prologue(L, cfg, role, ks, cov):
     e("  acq %am1, 1")
 
 
-def fuse2_entry(L, cfg, dp, cov, wrec):
+def fuse2_entry(L, cfg, dp, cov, wrec, helper=None, gate=None):
     """fuse 2's entry: the firing counter and W slot parity, the leaf's pointers and the W slot offset parked in
     private storage (nothing lives across the decoding fill: it needs every register), the group dispatch, the fill
     (fuse_decode), then ^fzgemm rebuilds the pointers (W is acquired after the GEMM's constants)."""
@@ -999,6 +1046,13 @@ def fuse2_entry(L, cfg, dp, cov, wrec):
     for o, nm in ((20, "%a_r"), (24, "%w0_r"), (28, "%fzd_r")):
         e(f"  %fzps{o} = mov.address-to-scalar {nm}")
         e(f"  st %fzps{o}, %fzp, {o}")
+    if helper == "H" or gate:   # %fzx: 0 the helper's ring, 4 the helper record count (the head), 8 the gate's
+        # neighbor
+        e("  %fzx = storage {byte_alignment = 64, byte_length = 64} : low.storage<private>")
+        e("  %fzxp = storage_address %fzx : low.storage<private> -> reg<aie2p.ep>")
+        for o, nm in (((0, "%fzh_r"),) if helper == "H" else ()) + (((8, "%gn1_r"),) if gate else ()):
+            e(f"  %fzxs{o} = mov.address-to-scalar {nm}")
+            e(f"  st %fzxs{o}, %fzxp, {o}")
     e("  st %fzwo, %fzp, 4")   # (fuse 1's in-record word count slot)
     e("  %fzcf = mov.i32 780")                         # the GEMM's MMA config, loaded after the fill: as a constant,
     e("  st %fzcf, %fzp, 16")                          # the allocator's pressure repairs (for the decoder) cloned it at
@@ -1025,7 +1079,7 @@ def fuse2_entry(L, cfg, dp, cov, wrec):
         e(f"^fzgo{i}:")
         e(f"  %fzgn{i} = mov.i32 {len(g) * NP}")
         e(f"  low.br ^fzdq(%fzgn{i}: reg<aie2p.er>)")
-    fuse_decode(L, cfg, dp, cov)
+    fuse_decode(L, cfg, dp, cov, helper)
     e("^fzgemm:")
     e("  %fzpG = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     for o, nm in ((20, "a"), (24, "w0"), (28, "fzd")):
@@ -1097,7 +1151,7 @@ def fuse_scratch(cfg, cov):
     return sp, in_, sp2, out
 
 
-def fuse_decode(L, cfg, dp, cov):
+def fuse_decode(L, cfg, dp, cov, helper=None):
     """fuse 2: a replay group's fill (^fzdq(units)): per (pass, slab) unit, the raw stream's [16 rows][4 super-blocks]
     -> the decoder's input record (all 4 super-blocks: a record row holds them), the inlined cfg.fmt decoder on this
     row's super-blocks, then its k-blocks (panel order [kb][h]) copied record by record into the egress ring. Scratch
@@ -1106,18 +1160,20 @@ def fuse_decode(L, cfg, dp, cov):
     (the decoder needs every register)."""
     e = L.append
     D = decoder(cfg.fmt, cfg.gord)
-    k0, k1, s0, nsb = fuse_span(cfg, cov)
+    hrow = 1 if helper == "H" else None                # (fuse_helper's row: the head copies its records)
+    dcov = tuple(j for j in cov if j != hrow)
+    k0, k1, s0, nsb = fuse_span(cfg, dcov)
     fw, _ = fuse_record(cfg, cov)
     RW = FUSE_SB * D.BLK // 4                          # words per row of a unit (its super-blocks need not align)
     pieces = fuse_pieces(cfg, cov)
     assert FUSE_SB * D.BLK <= D.RECROW and FUSE_SB * D.BLK % 4 == 0
-    SP, IN, SP2, OUT = fuse_scratch(cfg, cov)
+    SP, IN, SP2, OUT = fuse_scratch(cfg, dcov)
     assert fw % 16 == 0
     e("^fzdq(%fzN: reg<aie2p.er>):")
     e("  %fzpD = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     e("  st %fzN, %fzpD, 12")                       # the units left
-    _, rawport = fuse_ports("")
-    cap = fuse_raw_ring(cfg, cov)[1] if cfg.rawdma else 0
+    rawport = HELP_RAW if helper == "M" else fuse_ports("")[1]
+    cap = fuse_raw_ring(cfg, dcov)[1] if cfg.rawdma else 0
     if cfg.rawdma:   # the W ring is idle: grant the raw ring's records
         # an acquire of 0 first: a core reset while the core stalls in an acquire (this head, parked at the end of
         # a call) leaves the lock request behind, and the restarted core's first release also lands on that lock
@@ -1190,8 +1246,12 @@ def fuse_decode(L, cfg, dp, cov):
     e("  %fzwb2 = add.rr %fzw0l2, %fzk2047b")
     e("  %fzkm2048b = mov.i32 -2048")
     e("  %fzsb2 = and %fzwb2, %fzkm2048b")
-    if all(4 * sw == 144 * cfg.ks[j] for j, (_, sw) in zip(cov, pieces)) and len(pieces) > 1:
+    if all(4 * sw == 144 * cfg.ks[j] for j, (_, sw) in zip(cov, pieces)) and len(pieces) > 1 and hrow is None:
         fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0)
+        pieces = []
+    if hrow is not None:
+        assert len(cov) == 2 and cov[0] == hrow and pieces[0][1] == pieces[1][1]
+        fuse_egress_helped(e, dp, pieces[1][1] // fw, fw, OUT + (pieces[1][0] - 32 * s0) * 144)
         pieces = []
     for i, (kb0, sw) in enumerate(pieces):
         x = f"^fze{i + 1}" if i + 1 < len(pieces) else "^fzex"
@@ -1295,6 +1355,60 @@ def egress_record(e, t, src, cnt, ring, fw):
     return src, off
 
 
+def fuse_egress_helped(e, dp, nr, fw, own):
+    """fuse_decode's egress for a helped head (ghelp): per unit, the helper's nr records (each copied from the helper's
+    channel ring, slot: the helper record count's parity), then its own nr from the decoded super-blocks at own (bytes
+    from the scratch base), one record loop around a single copy (program memory)."""
+    e(f"  %fzmn = mov.i32 {nr}")
+    e(f"  %fzm2n = mov.i32 {2 * nr}")
+    e(f"  %fzmb = mov.i32 {4 * fw}")
+    e(f"  %fzmoo = mov.i32 {own}")
+    e("  %fzmo0 = add.rr %fzsb2, %fzmoo")
+    e("  %fzpE = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzen = lda %fzpE, 8")                         # the egress record count (its parity: the ring slot)
+    e("  %fzdl = lda %fzpE, 28")                        # the egress ring
+    e("  %fzxE = storage_address %fzx : low.storage<private> -> reg<aie2p.ep>")
+    e("  %fzhn = lda %fzxE, 4")                         # the helper record count
+    e("  %fzhl = lda %fzxE, 0")                         # the helper's ring
+    e("  low.br ^fzm(%fzE0: reg<aie2p.er>, %fzen: reg<aie2p.er>, %fzhn: reg<aie2p.er>, %fzmo0: reg<aie2p.er>)")
+    e("^fzm(%fzmi: reg<aie2p.er>, %fzmc: reg<aie2p.er>, %fzmh: reg<aie2p.er>, %fzmo: reg<aie2p.er>):")
+    e("  %fzmm = lt %fzmi, %fzm2n")
+    e("  low.cond_br %fzmm, ^fzmb, ^fzms : reg<aie2p.er>")
+    e("^fzmb:")
+    e(f"  acq %fzEm1, {dp}")
+    e("  %fzmw = lt %fzmi, %fzmn")
+    e("  low.cond_br %fzmw, ^fzmhh, ^fzmoo : reg<aie2p.er>")
+    e("^fzmhh:")                                        # a helper record: its slot
+    e(f"  acq %fzEm1, {HELP_RECV}")
+    e("  %fzmhp = and %fzmh, %fzE1")
+    e("  %fzmho = mul %fzmhp, %fzmb")
+    e("  %fzmha = add.rr %fzhl, %fzmho")
+    e("  %fzmh1 = add.rr %fzmh, %fzE1")
+    e("  low.br ^fzmcp(%fzmha: reg<aie2p.er>, %fzmh1: reg<aie2p.er>, %fzmo: reg<aie2p.er>)")
+    e("^fzmoo:")                                        # an own record
+    e("  %fzmo1 = add.rr %fzmo, %fzmb")
+    e("  low.br ^fzmcp(%fzmo: reg<aie2p.er>, %fzmh: reg<aie2p.er>, %fzmo1: reg<aie2p.er>)")
+    e("^fzmcp(%fzmsrc: reg<aie2p.er>, %fzmh2: reg<aie2p.er>, %fzmo2: reg<aie2p.er>):")
+    e("  %fzmsp = mov.scalar-to-address %fzmsrc")
+    egress_record(e, "m", "%fzmsp", "%fzmc", "%fzdl", fw)
+    e("  %fzmw2 = lt %fzmi, %fzmn")
+    e("  low.cond_br %fzmw2, ^fzmrh, ^fzmj : reg<aie2p.er>")
+    e("^fzmrh:")
+    e(f"  rel %fzE1, {HELP_RECV}")
+    e("  low.br ^fzmj")
+    e("^fzmj:")
+    e(f"  rel %fzE1, {dp}")
+    e("  %fzmc1 = add.rr %fzmc, %fzE1")
+    e("  %fzmi1 = add.rr %fzmi, %fzE1")
+    e("  low.br ^fzm(%fzmi1: reg<aie2p.er>, %fzmc1: reg<aie2p.er>, %fzmh2: reg<aie2p.er>, %fzmo2: reg<aie2p.er>)")
+    e("^fzms:")   # (the storage pointers re-derived: none lives across the copies)
+    e("  %fzpF = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+    e("  st %fzmc, %fzpF, 8")
+    e("  %fzxF = storage_address %fzx : low.storage<private> -> reg<aie2p.ep>")
+    e("  st %fzmh, %fzxF, 4")
+    e("  low.br ^fzex")
+
+
 def fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0):
     """fuse_decode's egress as one record loop (program memory: a loop per slice cost ~300 bytes each): the slices of
     an unpadded cover are a rotation of the decoded k-blocks k0 .. k1 (the filler's own slice last), so the source walks
@@ -1363,7 +1477,7 @@ def fill_leaf(L, cfg, nports):
     e("")
 
 
-def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None):
+def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None, helper=None):
     e = L.append
     tail = role == "tail"
     fa = slab(ks)
@@ -1377,14 +1491,18 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None):
     e(f"low.func.def schedule(locked) target<amd.xdna.aie2p.core>(@core_target) abi(object_function) @{name}() asm {{")
     rs = "_r" if fills and cfg.fuse == 2 else ""   # fuse 2: parked as scalars across the decoding fill (^fzgemm)
     e(f"  %a{rs} = resource<native_pointer> {{index = 0, source_type = buffer}} : reg<aie2p.ep>")
-    if fills:   # the W ring's first slot and the fused fill's egress ring (fuse_prologue)
+    if fills:   # the W ring's first slot and the fused fill's egress ring (fuse_prologue; a helper's: its channel to
+        # the head, whose ring the head reads it from)
         e(f"  %w0{rs} = resource<native_pointer> {{index = 1, source_type = buffer}} : reg<aie2p.ep>")
-        e(f"  %fzd{rs} = resource<native_pointer> {{index = {fuse_ports(role)[0]}, source_type = buffer}} : reg<aie2p.ep>")
+        dp = HELP_SEND if helper == "M" else fuse_ports(role)[0]
+        e(f"  %fzd{rs} = resource<native_pointer> {{index = {dp}, source_type = buffer}} : reg<aie2p.ep>")
+        if helper == "H":
+            e(f"  %fzh{rs} = resource<native_pointer> {{index = {HELP_RECV}, source_type = buffer}} : reg<aie2p.ep>")
     else:
         e("  %w = resource<native_pointer> {index = 1, source_type = buffer} : reg<aie2p.ep>")
-    if gate:   # the neighbor channel to / from the relay (leaf-synchronized)
+    if gate:   # the neighbor channel to / from the relay (leaf-synchronized; a filling gate core parks it: fuse2_entry)
         gp = gate_ports(cfg)[gate]
-        e(f"  %gn1 = resource<native_pointer> {{index = {gp['nbr']}, source_type = buffer}} : reg<aie2p.ep>")
+        e(f"  %gn1{rs} = resource<native_pointer> {{index = {gp['nbr']}, source_type = buffer}} : reg<aie2p.ep>")
     if tail:
         e("  %o = resource<native_pointer> {index = 2, source_type = buffer} : reg<aie2p.ep>")
     if role != "head":
@@ -1395,7 +1513,7 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None):
         e("  set.rounding 12")   # round to nearest even (the bf16 C)
     early = fills and cfg.fuse == 2   # the decoding fill first: nothing of the GEMM's lives across the decoder
     if early:
-        fuse_prologue(L, cfg, role, ks, cov)
+        fuse_prologue(L, cfg, role, ks, cov, helper, gate)
     if early:   # (fuse2_entry)
         e("  %fzpL = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
         e("  %conf = lda %fzpL, 16")
@@ -1534,10 +1652,15 @@ def leaf(L, cfg, role, ks, gate=None, pair=None, cov=None, name=None):
     body(L, cfg, role, ks, a_adv, acap, gate, pair, fills)
 
 
-def gate_epilogue(L, cfg, gate):
-    """The gated leaves' end of firing (see GATE): job accounting, background supply drain, the wait, the relay."""
+def gate_epilogue(L, cfg, gate, parked=False):
+    """The gated leaves' end of firing (see GATE): job accounting, background supply drain, the wait, the relay.
+    parked: the neighbor channel's pointer is in the fill's private storage (fuse2_entry)."""
     e = L.append
     S, FPC = cfg.gate, cfg.nb * cfg.passes
+    if parked:
+        e("  %gnpP = storage_address %fzx : low.storage<private> -> reg<aie2p.ep>")
+        e("  %gnpl = lda %gnpP, 8")
+        e("  %gn1 = mov.scalar-to-address %gnpl")
     e("  %g0 = mov.i32 0")
     e("  %g1 = mov.i32 1")
     e("  %g2 = mov.i32 2")
@@ -2576,7 +2699,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
     if fills:
         e("  rel %one, 1")
     if gate:
-        gate_epilogue(L, cfg, gate)
+        gate_epilogue(L, cfg, gate, parked=fills and cfg.fuse == 2)
         e("}\n")
     else:
         e("  return\n}\n")
@@ -2619,9 +2742,13 @@ def gen(cfg):
                 name, role, cov, gate = (worker_leaf(cfg, c, r) if c >= 0 else
                                          (lambda w: (w[0], w[1], w[2], None))(worker_leaf(cfg, -1, r)))
                 pair = (("recv" if pair_up(cfg, c) else "send") if fpair(cfg) and role == "tail" else None)
+                h = fuse_helper(cfg, c)
+                helper = None if h is None else "M" if r == h else "H" if r == 0 else None
+                if helper == "M":
+                    cov = (h,)
                 if name not in seen:
                     seen.add(name)
-                    leaf(L, colcfg(cfg, c), role, cfg.ks[r], gate=gate, pair=pair, cov=cov, name=name)
+                    leaf(L, colcfg(cfg, c), role, cfg.ks[r], gate=gate, pair=pair, cov=cov, name=name, helper=helper)
     else:
         leaf(L, cfg, "head", cfg.ks[0])
         leaf(L, cfg, "mid", cfg.ks[1])

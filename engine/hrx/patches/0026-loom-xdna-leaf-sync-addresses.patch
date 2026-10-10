@@ -1,0 +1,241 @@
+Two Loom AIE2P array fixes for leaf-synchronized channels (yah gen_npu_gemm ghelp: a helper core decodes a K row and
+sends its records to the head through a leaf-synced neighbor-memory ring):
+- A leaf-synchronized port's ring address never changes across firings (the leaf walks the slots itself), but the
+  resident wrapper carried it as firing-loop state like any other port's. Every such address then held a pointer
+  register through the whole leaf; a leaf with a few of them plus its own pointers ran out (pointer peak 10 / 8). The
+  address is now rematerialized where the leaf imports the resource and is no longer loop state.
+- A leaf-synced neighbor-memory ring was placed like a DMA ring, slot by slot round-robin over the banks (slot 1 at
+  +16384), while the leaf steps its slots by the record length. It is now one contiguous allocation, as leaf-synced
+  compute rings already are. Images without leaf-synced neighbor channels are unchanged in layout.
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+index 2dd295b34..f94965fae 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.c
+@@ -109,7 +109,7 @@ loom_aie2p_array_channel_resource_failure_t
+ loom_aie2p_array_channel_resources_propose_neighbor(
+     const loom_aie2p_array_tile_resources_t* resources,
+     loom_xdna_tile_coordinate_t coordinate, uint32_t load_address_base,
+-    uint8_t record_count, uint32_t record_byte_length,
++    uint8_t record_count, uint32_t record_byte_length, bool contiguous,
+     loom_aie2p_array_ring_resource_proposal_t* out_proposal) {
+   uint32_t probe_bank_cursors[LOOM_AIE2P_ARRAY_CHANNEL_PROPOSAL_MAX_BANK_COUNT];
+   loom_aie2p_array_tile_resources_t probe;
+@@ -117,7 +117,7 @@ loom_aie2p_array_channel_resources_propose_neighbor(
+       resources, probe_bank_cursors, &probe);
+   return loom_aie2p_array_channel_resources_propose_ring_from_probe(
+       &probe, coordinate, load_address_base, record_count, record_byte_length,
+-      /*contiguous=*/false, /*bank_stride=*/0, /*slot_pitch=*/0, out_proposal);
++      contiguous, /*bank_stride=*/0, /*slot_pitch=*/0, out_proposal);
+ }
+ 
+ // Experimental LOOM_EXP_LS_BANK_STRIDE: banked layout for leaf-synchronized
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.h b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.h
+index 2a40402bc..1fb595032 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.h
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources.h
+@@ -149,12 +149,14 @@ typedef struct loom_aie2p_array_shim_endpoint_proposal_t {
+ } loom_aie2p_array_shim_endpoint_proposal_t;
+ 
+ // Selects one neighbor-memory ring and lock pair without mutating |resources|.
+-// The output is defined only when NONE is returned.
++// |contiguous| places the records back to back (a leaf-synchronized ring: the
++// leaf steps its slots by the record length). The output is defined only when
++// NONE is returned.
+ loom_aie2p_array_channel_resource_failure_t
+ loom_aie2p_array_channel_resources_propose_neighbor(
+     const loom_aie2p_array_tile_resources_t* resources,
+     loom_xdna_tile_coordinate_t coordinate, uint32_t load_address_base,
+-    uint8_t record_count, uint32_t record_byte_length,
++    uint8_t record_count, uint32_t record_byte_length, bool contiguous,
+     loom_aie2p_array_ring_resource_proposal_t* out_proposal);
+ 
+ // Selects one compute DMA endpoint without mutating |resources|. When
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources_test.cc b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources_test.cc
+index e50ffd350..32a65312e 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources_test.cc
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/channel_resources_test.cc
+@@ -147,7 +147,7 @@ TEST(Aie2pArrayChannelResourcesTest, NeighborReportsOwningResource) {
+                 &resources, {0, 2}, ComputeFacts()->memory.local_load_base,
+                 /*record_count=*/2,
+                 /*record_byte_length=*/ComputeFacts()->memory.local_capacity,
+-                &proposal),
++                /*contiguous=*/false, &proposal),
+             LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_RING_STORAGE);
+   EXPECT_EQ(resources.next_lock, 0u);
+   for (uint32_t cursor : bank_cursors) {
+@@ -157,7 +157,8 @@ TEST(Aie2pArrayChannelResourcesTest, NeighborReportsOwningResource) {
+   resources.next_lock = ComputeFacts()->lock_count - 1u;
+   EXPECT_EQ(loom_aie2p_array_channel_resources_propose_neighbor(
+                 &resources, {0, 2}, ComputeFacts()->memory.local_load_base,
+-                /*record_count=*/1, /*record_byte_length=*/64, &proposal),
++                /*record_count=*/1, /*record_byte_length=*/64,
++                /*contiguous=*/false, &proposal),
+             LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_LOCK_PAIR);
+   EXPECT_EQ(resources.next_lock, ComputeFacts()->lock_count - 1u);
+   for (uint32_t cursor : bank_cursors) {
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+index 0be92a659..0c1eb562e 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/plan.c
+@@ -2500,6 +2500,7 @@ static iree_status_t loom_aie2p_array_plan_stage(
+           channel->stage_panel_owner == channel_index
+               ? channel->stage_panel_record_bytes
+               : channel->record_byte_length * channel->stage_group,
++          /*contiguous=*/false,
+           &ring) != LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_NONE) {
+     return loom_aie2p_array_reject_channel_resources(
+         builder, channel_index, coordinate,
+@@ -3128,7 +3129,8 @@ static iree_status_t loom_aie2p_array_plan_neighbor_channel(
+       loom_aie2p_array_channel_resources_propose_neighbor(
+           &owner_state->resources, owner,
+           owner_state->resources.facts->memory.local_load_base,
+-          (uint8_t)channel->capacity, channel->record_byte_length, &proposal);
++          (uint8_t)channel->capacity, channel->record_byte_length,
++          /*contiguous=*/channel->leaf_sync, &proposal);
+   if (failure != LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_NONE) {
+     const iree_string_view_t reason =
+         failure == LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_RING_STORAGE
+@@ -3319,7 +3321,7 @@ static iree_status_t loom_aie2p_array_plan_intake_channel(
+     uint16_t* fill_cursor = &stage_state->memory_tile_bd_cursors[fill_channel & 1u];
+     if (loom_aie2p_array_channel_resources_propose_neighbor(
+             stage_resources, stage, /*load_address_base=*/0, capacity,
+-            channel->record_byte_length,
++            channel->record_byte_length, /*contiguous=*/false,
+             &ring) != LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FAILURE_NONE ||
+         fill_channel >= stage_resources->facts->dma.channel_count_per_direction ||
+         *fill_cursor + capacity > half_capacity ||
+diff --git a/loom/src/loom/target/arch/amd/xdna/aie2p/array/resident.c b/loom/src/loom/target/arch/amd/xdna/aie2p/array/resident.c
+index 9e11ced87..3be93ba7a 100644
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/resident.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/resident.c
+@@ -250,6 +250,16 @@ static bool loom_aie2p_array_resident_direction_selected(
+   return iree_any_bit_set(flags, direction_flag);
+ }
+ 
++// A leaf-synchronized ring is walked by the leaf itself from its first slot,
++// so its address never changes across firings: it is rematerialized where the
++// leaf imports it instead of riding the firing loop as state, which would hold
++// a pointer register through the whole leaf.
++static bool loom_aie2p_array_resident_port_carries_address(
++    const loom_aie2p_array_plan_t* plan,
++    const loom_aie2p_array_worker_port_plan_t* port) {
++  return !plan->channels[port->channel_index].leaf_sync;
++}
++
+ static iree_host_size_t loom_aie2p_array_resident_state_argument_count(
+     const loom_aie2p_array_plan_t* plan,
+     const loom_aie2p_array_resident_port_state_t* port_states,
+@@ -258,7 +268,11 @@ static iree_host_size_t loom_aie2p_array_resident_state_argument_count(
+   for (iree_host_size_t i = 0; i < port_state_count; ++i) {
+     const loom_aie2p_array_channel_t* channel =
+         &plan->channels[port_states[i].port->channel_index];
+-    count += channel->capacity > 2 ? 2 : 1;
++    count += (loom_aie2p_array_resident_port_carries_address(
++                  plan, port_states[i].port)
++                  ? 1
++                  : 0) +
++             (channel->capacity > 2 ? 1 : 0);
+   }
+   return count;
+ }
+@@ -1064,9 +1078,11 @@ static iree_status_t loom_aie2p_array_resident_initialize_port_state(
+       .next_address = LOOM_VALUE_ID_INVALID,
+       .next_slot = LOOM_VALUE_ID_INVALID,
+   };
+-  IREE_RETURN_IF_ERROR(loom_builder_define_block_arg(
+-      ir_builder, firing_header, builder->endpoint_address_type,
+-      &port_state->current_address));
++  if (loom_aie2p_array_resident_port_carries_address(builder->plan, port)) {
++    IREE_RETURN_IF_ERROR(loom_builder_define_block_arg(
++        ir_builder, firing_header, builder->endpoint_address_type,
++        &port_state->current_address));
++  }
+   if (channel->capacity > 2) {
+     IREE_RETURN_IF_ERROR(loom_builder_define_block_arg(
+         ir_builder, firing_header, builder->lock_delta_type,
+@@ -1103,11 +1119,21 @@ static iree_status_t loom_aie2p_array_resident_bind_resources(
+       // updates. Keep that value identity separate from the ring address used
+       // by the latch; allocation can coalesce copies that remain read-only.
+       loom_builder_set_before(ir_builder, op);
+-      loom_op_t* copy_op = NULL;
+-      IREE_RETURN_IF_ERROR(loom_low_copy_build(
+-          ir_builder, port_state->current_address, /*detached=*/false,
+-          builder->endpoint_address_type, op->location, &copy_op));
+-      const loom_value_id_t local_address = loom_low_copy_result(copy_op);
++      loom_value_id_t local_address = LOOM_VALUE_ID_INVALID;
++      if (loom_aie2p_array_resident_port_carries_address(builder->plan,
++                                                         port)) {
++        loom_op_t* copy_op = NULL;
++        IREE_RETURN_IF_ERROR(loom_low_copy_build(
++            ir_builder, port_state->current_address, /*detached=*/false,
++            builder->endpoint_address_type, op->location, &copy_op));
++        local_address = loom_low_copy_result(copy_op);
++      } else {
++        IREE_RETURN_IF_ERROR(loom_aie2p_array_resident_build_address(
++            builder, ir_builder, builder->endpoint_address_type,
++            loom_aie2p_array_resident_port_slot_address(builder->plan, port,
++                                                        0),
++            op->location, &local_address));
++      }
+       IREE_RETURN_IF_ERROR(loom_module_move_value_name(
+           builder->module, resource_value, local_address));
+       IREE_RETURN_IF_ERROR(loom_value_replace_all_uses_with(
+@@ -1153,9 +1179,13 @@ static iree_status_t loom_aie2p_array_resident_define_state_arguments(
+     const loom_aie2p_array_channel_t* channel =
+         &builder->plan->channels[source_states[i].port->channel_index];
+     out_states[i] = source_states[i];
+-    IREE_RETURN_IF_ERROR(loom_builder_define_block_arg(
+-        ir_builder, block, builder->endpoint_address_type,
+-        &out_states[i].current_address));
++    out_states[i].current_address = LOOM_VALUE_ID_INVALID;
++    if (loom_aie2p_array_resident_port_carries_address(builder->plan,
++                                                       source_states[i].port)) {
++      IREE_RETURN_IF_ERROR(loom_builder_define_block_arg(
++          ir_builder, block, builder->endpoint_address_type,
++          &out_states[i].current_address));
++    }
+     out_states[i].current_slot = LOOM_VALUE_ID_INVALID;
+     if (channel->capacity > 2) {
+       IREE_RETURN_IF_ERROR(loom_builder_define_block_arg(
+@@ -1193,13 +1223,16 @@ static iree_status_t loom_aie2p_array_resident_build_initial_state(
+   iree_host_size_t argument_index = 0;
+   for (iree_host_size_t i = 0; i < port_state_count; ++i) {
+     loom_aie2p_array_resident_port_state_t* port_state = &port_states[i];
+-    loom_value_id_t address = LOOM_VALUE_ID_INVALID;
+-    IREE_RETURN_IF_ERROR(loom_aie2p_array_resident_build_address(
+-        builder, ir_builder, builder->endpoint_address_type,
+-        loom_aie2p_array_resident_port_slot_address(builder->plan,
+-                                                    port_state->port, 0),
+-        location, &address));
+-    arguments[argument_index++] = address;
++    if (loom_aie2p_array_resident_port_carries_address(builder->plan,
++                                                       port_state->port)) {
++      loom_value_id_t address = LOOM_VALUE_ID_INVALID;
++      IREE_RETURN_IF_ERROR(loom_aie2p_array_resident_build_address(
++          builder, ir_builder, builder->endpoint_address_type,
++          loom_aie2p_array_resident_port_slot_address(builder->plan,
++                                                      port_state->port, 0),
++          location, &address));
++      arguments[argument_index++] = address;
++    }
+     const loom_aie2p_array_channel_t* channel =
+         &builder->plan->channels[port_state->port->channel_index];
+     if (channel->capacity > 2) {
+@@ -1411,10 +1444,13 @@ static iree_status_t loom_aie2p_array_resident_build_state_branch(
+   iree_host_size_t argument_index = 0;
+   for (iree_host_size_t i = 0; i < port_state_count; ++i) {
+     const loom_aie2p_array_resident_port_state_t* port_state = &port_states[i];
+-    arguments[argument_index++] =
+-        value_kind == LOOM_AIE2P_ARRAY_STATE_VALUE_NEXT
+-            ? port_state->next_address
+-            : port_state->current_address;
++    if (loom_aie2p_array_resident_port_carries_address(builder->plan,
++                                                       port_state->port)) {
++      arguments[argument_index++] =
++          value_kind == LOOM_AIE2P_ARRAY_STATE_VALUE_NEXT
++              ? port_state->next_address
++              : port_state->current_address;
++    }
+     const loom_aie2p_array_channel_t* channel =
+         &builder->plan->channels[port_state->port->channel_index];
+     if (channel->capacity > 2) {
