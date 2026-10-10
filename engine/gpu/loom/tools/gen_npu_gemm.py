@@ -2025,7 +2025,7 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
             L2E = 1 / math.log(2)
             e(f"  {p}amk = mov.i32 32767")                      # bf16 |x| mask
             e(f"  {p}amv = vbcst.16 {p}amk")
-            C2, C1, C3 = bf16_round(math.log(2) ** 2 / 2), bf16_round(math.log(2)), math.log(2) ** 3 / 6
+            SQ1, SQ2 = 0.703125, 0.2412109375                  # 2^r ~ 1 + SQ1 r + SQ2 r^2 (bf16, searched)
             if pair:   # the gate buffer's address as a scalar
                 e(f"  {p}gba = storage_address %gbs : low.storage<private> -> reg<aie2p.ep>")
                 e(f"  {p}gbs0 = mov.address-to-scalar {p}gba")
@@ -2170,46 +2170,49 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                         return q0, q1, r2
 
                     def silu(h):
-                        """silu(g) as bf16 from {n}gb{h}. sigmoid(g): e = e^-|g| = 2^n 2^r (n = round(-|g| log2 e);
-                        vexp2 is Mitchell's 2^floor(z) (1 + frac(z)), exact only at integers; 2^r by a cubic), y =
-                        1 / (1 + e) by two Newton steps from 1.5 - d / 2, sigmoid = y for g >= 0, e y for g < 0."""
+                        """silu(g) as bf16 from {n}gb{h}, a shallow chain (the woven pair's latency is the cost).
+                        e = e^-|g| = 2^n 2^r: n = round(-|g| log2 e) by the magic constant in the product's own
+                        accumulation, 2^n by vexp2 (Mitchell's 2^floor(z) (1 + frac(z)): exact only at integers), 2^r a
+                        quadratic (Estrin). 1 / (1 + e) from y0 = 16/17 - 8/17 e (6%) and one second-order step on
+                        err = 1 - y0 - e y0: y0 (1 + err + err^2). sigmoid(g) = y (g >= 0), e y (g < 0), so silu =
+                        w + w t with w = (g or g e) y0, t = err + err^2. Exhaustive over bf16 g vs exact silu: max
+                        1.64 ulp, mean 0.048 (the two-Newton chain: 2.87, 0.067)."""
                         def bf(v, tag):                         # the 32 f32 lanes of an x4 accumulator as bf16
                             return f"{n}{tag}b{h}", e(f"  {n}{tag}b{h} = vconv.bf16.fp32 {lo32(v, f'{tag}q{h}')[2]}")
                         e(f"  {n}ga{h} = vband {n}gb{h}, {p}amv")                     # |g|
+                        e(f"  {n}t1{h} = vmac.bf16x32 {kacc(12582912.0)}, {n}ga{h}, {kbf(-bf16_round(L2E))}, {p}c")
                         e(f"  {n}z0{h} = vmul.bf16x32 {n}ga{h}, {kbf(-bf16_round(L2E))}, {p}c")
-                        e(f"  {n}z{h} = vmac.bf16x32 {n}z0{h}, {n}ga{h}, {kbf(-(L2E - bf16_round(L2E)))}, {p}c")   # z = -|g| log2 e (f32)
-                        e(f"  {n}t1{h} = vadd.f32x64 {n}z{h}, {kacc(12582912.0)}, {p}c")
-                        e(f"  {n}nf{h} = vsub.f32x64 {n}t1{h}, {kacc(12582912.0)}, {p}c")    # n = round(z)
-                        e(f"  {n}r{h} = vsub.f32x64 {n}z{h}, {n}nf{h}, {p}c")     # r = z - n, |r| <= 1/2
-                        rb = bf(f"{n}r{h}", "r")[0]
+                        e(f"  {n}nf{h} = vsub.f32x64 {n}t1{h}, {kacc(12582912.0)}, {p}c")    # n
+                        e(f"  {n}z{h} = vmac.bf16x32 {n}z0{h}, {n}ga{h}, {kbf(-(L2E - bf16_round(L2E)))}, {p}c")   # z = -|g| log2 e
                         n0, n1, _ = lo32(f"{n}nf{h}", f"nq{h}")
                         e(f"  {n}x{h}0 = vexp2.bf16x16 {n0}")                    # 2^n, exact
                         e(f"  {n}x{h}1 = vexp2.bf16x16 {n1}")
                         e(f"  {n}xx{h} = concat({n}x{h}0, {n}x{h}1) : ({V1}, {V1}) -> {V2}")
-                        e(f"  {n}h0{h} = vmac.bf16x32 {kacc(C2)}, {rb}, {kbf(C3)}, {p}c")
-                        hb = bf(f"{n}h0{h}", "hh0")[0]
-                        e(f"  {n}h1{h} = vmac.bf16x32 {kacc(C1)}, {rb}, {hb}, {p}c")
-                        hb = bf(f"{n}h1{h}", "hh1")[0]
-                        e(f"  {n}h2{h} = vmac.bf16x32 {kacc(1.0)}, {rb}, {hb}, {p}c")    # 2^r
-                        pb = bf(f"{n}h2{h}", "hh2")[0]
+                        e(f"  {n}r{h} = vsub.f32x64 {n}z{h}, {n}nf{h}, {p}c")     # r = z - n, |r| <= 1/2 + |g| 2^-8.6
+                        rb = bf(f"{n}r{h}", "r")[0]
+                        e(f"  {n}pa{h} = vmac.bf16x32 {kacc(1.0)}, {rb}, {kbf(SQ1)}, {p}c")
+                        e(f"  {n}r2{h} = vmul.bf16x32 {rb}, {rb}, {p}c")
+                        r2b = bf(f"{n}r2{h}", "r2")[0]
+                        e(f"  {n}pp{h} = vmac.bf16x32 {n}pa{h}, {r2b}, {kbf(SQ2)}, {p}c")   # 2^r
+                        pb = bf(f"{n}pp{h}", "pp")[0]
                         e(f"  {n}ee{h} = vmul.bf16x32 {n}xx{h}, {pb}, {p}c")       # e = e^-|g|
                         eb = bf(f"{n}ee{h}", "e")[0]
-                        e(f"  {n}d{h} = vmac.bf16x32 {kacc(1.0)}, {eb}, {kbf(1.0)}, {p}c")  # d = 1 + e
-                        db = bf(f"{n}d{h}", "dd")[0]
-                        e(f"  {n}y0{h} = vmac.bf16x32 {kacc(1.5)}, {db}, {kbf(-0.5)}, {p}c")  # y0 = 1.5 - d / 2
+                        e(f"  {n}ne{h} = vneg.f32x64 {n}ee{h}, {p}c")
+                        neb = bf(f"{n}ne{h}", "ne")[0]
+                        e(f"  {n}y0{h} = vmac.bf16x32 {kacc(16 / 17)}, {eb}, {kbf(-8 / 17)}, {p}c")
                         yb = bf(f"{n}y0{h}", "y0")[0]
-                        e(f"  {n}nd{h} = vneg.f32x64 {n}d{h}, {p}c")
-                        ndb = bf(f"{n}nd{h}", "nd")[0]
-                        for it in range(2):                     # y <- y (2 - d y)
-                            e(f"  {n}w{it}{h} = vmac.bf16x32 {kacc(2.0)}, {ndb}, {yb}, {p}c")
-                            wb = bf(f"{n}w{it}{h}", f"w{it}")[0]
-                            e(f"  {n}y{it + 1}{h} = vmul.bf16x32 {yb}, {wb}, {p}c")
-                            yb = bf(f"{n}y{it + 1}{h}", f"y{it + 1}")[0]
-                        e(f"  {n}sn{h} = vmul.bf16x32 {eb}, {yb}, {p}c")           # e y: sigmoid(g) for g < 0
-                        snb = bf(f"{n}sn{h}", "sn")[0]
+                        e(f"  {n}ge{h} = vmul.bf16x32 {n}gb{h}, {eb}, {p}c")       # g e
+                        geb = bf(f"{n}ge{h}", "ge")[0]
+                        e(f"  {n}om{h} = vmac.bf16x32 {kacc(1.0)}, {yb}, {kbf(-1.0)}, {p}c")
+                        e(f"  {n}er{h} = vmac.bf16x32 {n}om{h}, {neb}, {yb}, {p}c")    # err = 1 - (1 + e) y0
+                        erb = bf(f"{n}er{h}", "er")[0]
+                        e(f"  {n}tt{h} = vmac.bf16x32 {n}er{h}, {erb}, {erb}, {p}c")   # t = err + err^2
+                        tb = bf(f"{n}tt{h}", "tt")[0]
                         e(f"  {n}lt{h} = vlt.s16x32.el.low32 {n}gb{h}, {kbf(0.0)}")      # g < 0 (sign bit)
-                        e(f"  {n}sgb{h} = vsel.16.mask64 {yb}, {snb}, {n}lt{h}")
-                        e(f"  {n}si{h} = vmul.bf16x32 {n}gb{h}, {n}sgb{h}, {p}c")      # silu(g)
+                        e(f"  {n}gs{h} = vsel.16.mask64 {n}gb{h}, {geb}, {n}lt{h}")
+                        e(f"  {n}w{h} = vmul.bf16x32 {n}gs{h}, {yb}, {p}c")
+                        wb = bf(f"{n}w{h}", "w")[0]
+                        e(f"  {n}si{h} = vmac.bf16x32 {n}w{h}, {wb}, {tb}, {p}c")      # silu(g)
                         e(f"  {n}sib{h} = vconv.bf16.fp32 {lo32(f'{n}si{h}', f'siq{h}')[2]}")
                         return f"{n}sib{h}"
                     if kind in ("graw", "gsig"):   # the gate tail: g or silu(g) to the buffer, (r, h) blocks of 32 bf16
