@@ -981,7 +981,19 @@ class LoomPrefill {
     }
     std::vector<std::uint32_t> csw;
     std::vector<std::vector<std::uint32_t>> cdn(parts.size());
-    if (pair) {   // 32 calls of 192 features: call j's up column u writes passes 2 u + j / 16, k-blocks 8 (j % 16) ..
+    if (pair && FfnBlkFused()) {   // F / 256 calls: call j's pair u (gate column 2 u, up column 2 u + 1) takes features
+                                   // 256 j + 64 u + [0, 64), its records at H k-blocks 32 j + 8 u .. (gen_npu_gemm swcol 64)
+      const NpuBytes bs = NpuBytesOf("npubytes_ffnsp");
+      for (std::uint32_t j = 0; j < F / 256; ++j) {
+        const std::size_t r0 = f0 + 256 * j;
+        csw.push_back(npu_->BindRawPair(
+            sw + ".xdna", SwapOf(sw), 16 + 8 * DecoderId(f.name) + DecoderId(fu.name), ag,
+            base + tg->offset + r0 * rb, 255 * rb + 16 * blk + kDcolRecordRow,
+            base + tu->offset + r0 * rbu, 255 * rbu + 16 * blku + kDcolRecordRow,
+            {(j / 4) * 4 * 128 * 144 + (j % 4) * 32 * 144, bs.c}, 4 * (B_ / 64) * 4 * 1152,
+            "ffnsp_" + std::string(f.name) + "_" + fu.name + hord));
+      }
+    } else if (pair) {   // 32 calls of 192 features: call j's up column u writes passes 2 u + j / 16, k-blocks 8 (j % 16) ..
       const NpuBytes bs = NpuBytesOf("npubytes_ffnsp");
       for (std::uint32_t j = 0; j < F / 192; ++j) {
         const std::size_t r0 = f0 + 1024 * (j / 16) + 64 * (j % 16);

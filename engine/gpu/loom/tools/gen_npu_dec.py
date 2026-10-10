@@ -1667,15 +1667,15 @@ def leaf(name="dec", nports=1):
     return "\n".join(pre_ + e.L[:hdr_end] + place_consts(e.pre, e.L[hdr_end:]))
 
 
-def leaf_inline(nsb):
+def leaf_inline(nsb, name="inl"):
     """The leaf's body for inlining into another core function: decodes nsb super-blocks of an input record
     ([16 rows][RECROW]) at %in into OUT_B records at %out (2 per super-block, no output ring), storages at %sp
     (SCR_B, 2048-aligned) and %sp2 (SCR2_B), all defined by the caller (the table is rebuilt each call). Returns the
     lines (not renamed; the caller prefixes its values and labels). Grid formats gather from module rodata
-    (inline_rodata, defined once by the caller's module)."""
+    (inline_rodata(name), defined once by the caller's module)."""
     INLINE[0] = nsb
     try:
-        txt = leaf("inl", 1)
+        txt = leaf(name, 1)
     finally:
         INLINE[0] = 0
     out = []
@@ -1688,9 +1688,9 @@ def leaf_inline(nsb):
     return out
 
 
-def inline_rodata():
-    """The module rodata leaf_inline's code reads (grid formats' tables), else []."""
-    return grid_rodata("inl") if GRID else []
+def inline_rodata(name="inl"):
+    """The module rodata leaf_inline(.., name)'s code reads (grid formats' tables), else []."""
+    return grid_rodata(name) if GRID else []
 
 
 def place_consts(pre, body):

@@ -1048,9 +1048,11 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     rows = NPU_COLS * 64 if NPU_FUSE else NPU_ROWS   # down rows per call (fused: NP 4)
     ok = [l for l in by.values() if l.get("ffn_gate") == l.get("ffn_up") and l["ffn_gate"][0] in fmts
           and l["ffn_gate"][0] in AF_FFN and l.get("ffn_down", ("",))[0] in dfmts]
+    # gate and up of two formats: column pairs (gen_npu_gemm ufmt; fused sets: F features like the others)
+    pfmts, pdfmts, PF = (fmts, dfmts, F) if NPU_FUSE else (FFNBLK_FMTS, FFNBLK_DOWN_FMTS, FFNBLK_PAIR)
     pairs = [l for l in by.values() if l.get("ffn_gate") and l.get("ffn_up") and l["ffn_gate"][0] != l["ffn_up"][0]
-             and l["ffn_gate"][0] in FFNBLK_FMTS and l["ffn_up"][0] in FFNBLK_FMTS
-             and l.get("ffn_down", ("",))[0] in FFNBLK_DOWN_FMTS and not NPU_FUSE]
+             and l["ffn_gate"][1:] == l["ffn_up"][1:] and l["ffn_gate"][0] in pfmts and l["ffn_up"][0] in pfmts
+             and l.get("ffn_down", ("",))[0] in pdfmts]
     jobs = []
     for fmt, mt, kb in sorted({l["ffn_gate"] for l in ok}):
         hords = sorted({hord_of(l["ffn_down"][0]) for l in ok if l["ffn_gate"] == (fmt, mt, kb)})
@@ -1072,7 +1074,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             jobs.append((jobs[-1][0], name + ".swap", "swap", 4))
     parts = ffnblk_parts(F)
     for fmt, mt, kb, kbw in sorted({l["ffn_down"] + ((l["ffn_down"][2] * 256 - F) // 256,) for l in ok} |
-                                   {l["ffn_down"] + ((l["ffn_down"][2] * 256 - FFNBLK_PAIR) // 256,) for l in pairs}):
+                                   {l["ffn_down"] + ((l["ffn_down"][2] * 256 - PF) // 256,) for l in pairs}):
         if NPU_FUSE and NPU_FFNRES:   # the GPU's K window as the residual GEMM, adding the NPU's down partials
             with GN.np_override(4):
                 dcfg = GN.Config(NPU_COLS, B // 64, NPU_KS, parts[0][1], mu=1, gate=GN.GATE_SUPPLY, fuse=2,
@@ -1104,7 +1106,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
         out.append(_emit_gen(gen_rem, tr.bn, fmt, mt, kbw, B, "npuffnrem_%s_%d.hal" % (fmt, kbw), outdir, "kstore",
                              tr.rowgrp, kfull=kb))
     for fmt, mt, kb in sorted({l["ffn_down"] for l in ok} | {l["ffn_down"] for l in pairs}):
-        for passes in sorted({p for _, p in parts + (ffnblk_parts(FFNBLK_PAIR) if pairs else ())}):
+        for passes in sorted({p for _, p in parts + (ffnblk_parts(PF) if pairs else ())}):
             if NPU_FUSE:
                 jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, passes, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
                                        kraw=kb * 256, ain="h", hpass=F // 1024, fmt=DCOL_FMTS[fmt][0]),
@@ -1114,12 +1116,17 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
                                    kraw=kb * 256, ain="h", hpass=F // 1024, gord="N"), "npu_ffndn%d_%s" % (passes, fmt),
                          None, GN.NP))
             jobs.append((jobs[-1][0], "npu_ffndn%d_%s.swap" % (passes, fmt), "swap", GN.NP))
-    for (gf, mt, kb), (uf, _, _), hord in sorted({(l["ffn_gate"], l["ffn_up"], FFNBLK_HORD.get(l["ffn_down"][0], ""))
-                                                  for l in pairs}):
-        # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = FFNBLK_PAIR)
-        variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), FFNBLK_PAIR)
-        variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), FFNBLK_PAIR)
+    for (gf, mt, kb), (uf, _, _), hord in sorted({(l["ffn_gate"], l["ffn_up"], hord_of(l["ffn_down"][0]) if NPU_FUSE
+                                                   else FFNBLK_HORD.get(l["ffn_down"][0], "")) for l in pairs}):
+        # the GPU's other features: gate kstore and up swiglu, split (".npu.hal", nn = PF)
+        variants(gf, "kstore", mt, kb, "gemm_kstore_%s_%d_%d.hal" % (gf, mt, kb), PF)
+        variants(uf, "swiglu", mt, kb, "gemm_swiglu_%s_%d_%d.hal" % (uf, mt, kb), PF)
         name = "npu_ffnsp_%s_%s%s" % (gf, uf, hord and "_" + hord.lower())
+        if NPU_FUSE:   # pair u: gate column 2 u, up column 2 u + 1, features 256 j + 64 u + [0, 64) of call j
+            jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, swiglu=True,
+                                   swcol=64, hpass=F // 1024, hord=hord, fmt=DCOL_FMTS[gf][0], ufmt=DCOL_FMTS[uf][0]),
+                         name, None, (4, True)))
+            continue
         jobs.append((GN.Config(6, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[gf][0],
                                ufmt=DCOL_FMTS[uf][0], swiglu=True, swcol=2048, hpass=F // 1024, hord=hord),
                      name, None, (4, True)))
@@ -1127,7 +1134,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     # hidden + the GPU's window + the NPU's down partials (per K part, calls of rows rows, one replay group each); fused
     # sets add them in the GPU window's residual epilogue (npuffnres) unless NPU_FFNRES is off
     N, calls = 5120, -(-5120 // rows)
-    assert not pairs or len(ffnblk_parts(FFNBLK_PAIR)) == len(parts)
+    assert not pairs or len(ffnblk_parts(PF)) == len(parts)
     if not (NPU_FUSE and NPU_FFNRES):
         cg = GU.CG
         GU.CG = 1
@@ -1158,7 +1165,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
     with GN.np_override(4):
         out.append(("npubytes_ffnsw",) + tuple(GN.stream_bytes(sw[0])))
-    for passes in sorted({p for _, p in parts + (ffnblk_parts(FFNBLK_PAIR) if pairs else ())}):
+    for passes in sorted({p for _, p in parts + (ffnblk_parts(PF) if pairs else ())}):
         dn = next(j for j in jobs if j[1].startswith("npu_ffndn%d_" % passes))
         with GN.np_override(dn[3]):
             out.append(("npubytes_ffndn%d" % passes,) + tuple(GN.stream_bytes(dn[0])))
@@ -1166,7 +1173,7 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     if sp:
         with GN.np_override(4, True):
             out.append(("npubytes_ffnsp",) + tuple(GN.stream_bytes(sp[0])))
-        out.append(("npuffnpair", FFNBLK_PAIR, 0, 0))
+        out.append(("npuffnpair", PF, 0, 0))
     return jobs
 
 

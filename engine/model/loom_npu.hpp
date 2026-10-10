@@ -554,7 +554,7 @@ class LoomNpu {
     std::size_t used = 0;
     std::uint64_t last = 0;   // the last command built into it (its submission count)
   };
-  static constexpr std::size_t kArenaBytes = 8u << 20, kCommandAlign = 32768, kArenas = 3;
+  static constexpr std::size_t kArenaBytes = 8u << 20, kCommandAlign = 32768, kArenas = 5;
   static const std::uint8_t* CommandBytes(const Kernel& k, const amdf_xdna_kernel_command_t& c) {
     for (const auto& st : k.storage)
       if (st.memory == c.memory) return static_cast<const std::uint8_t*>(st.mapping.data) + (c.byte_offset - st.memory_byte_offset);

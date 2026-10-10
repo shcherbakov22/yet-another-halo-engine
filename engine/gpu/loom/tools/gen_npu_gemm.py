@@ -219,7 +219,8 @@ def h_col_stride(cfg):
     if cfg.swcol >= 1024:
         assert cfg.swcol % 1024 == 0 and cfg.hpass >= cfg.cols * cfg.swcol // 1024
         return cfg.swcol // 1024 * MP * 128 * 144
-    assert 1024 % (cfg.swcol * cfg.cols) == 0 and cfg.swcol == 8 * NP
+    n, per = (cfg.cols // 2, 16 * NP) if fpair(cfg) else (cfg.cols, 8 * NP)   # (pairs: swcol features a pair)
+    assert 1024 % (cfg.swcol * n) == 0 and cfg.swcol == per
     return cfg.swcol // 8 * 144
 
 
@@ -236,7 +237,8 @@ def stream_bytes(cfg):
     w = cfg.cols * sum(cfg.passes * NP * slab(k) for k in cfg.ks)
     if cfg.swiglu:   # the receiver's extent in H: the last 16-token row's columns
         # the last column's (pass's) last record in H (column pairs: up column u writes passes 2 u, 2 u + 1)
-        last = 2 * (cfg.cols // 2 - 1) * MP * 128 * 144 if cfg.ufmt else (cfg.cols - 1) * h_col_stride(cfg)
+        last = (2 * (cfg.cols // 2 - 1) * MP * 128 * 144 if cfg.ufmt and not cfg.fuse else
+                (cfg.cols // 2 - 1 if cfg.ufmt else cfg.cols - 1) * h_col_stride(cfg))
         return a, w, ((cfg.nb - 1) * cfg.hpass * MP * 128 * 144 + (MP - 1) * 128 * 144 + last + SW_REC)
     return a, w, max(1, len(groups(cfg))) * cfg.cols * cfg.nb * MP * NP * 2 * 256
 
@@ -291,7 +293,7 @@ def array_program(L, cfg):
         for r, role in enumerate(roles):
             e(f"  %lane{c}_{r} = constant.u32 {c * rows + r} : reg<aie2p.array.scalar : index>")
             grole = worker_leaf(cfg, c, r)[0]
-            if cfg.ufmt and role == "tail" and c < cols // 2:
+            if cfg.ufmt and not cfg.fuse and role == "tail" and c < cols // 2:
                 grole = "tail_s"   # a gate column's tail: it streams its C to the up column's tail
             e(f"  %k{c}_{r} = worker %workers, %lane{c}_{r}, @{grole}")
             e(f"  constrain.location %k{c}_{r}, %n{c}, %n{2 + rows - 1 - r}")
@@ -303,7 +305,14 @@ def array_program(L, cfg):
     if cfg.swiglu:
         # column c's record (NP k-blocks of 16 tokens) at k-block NP c of its 16-token row in H
         rec = f"{SW_REC // 4}"   # column c: pass c of H [M block][pass][slab][128 k-blocks]
-        if cfg.ufmt:   # up column u: passes 2 u, 2 u + 1 (j // 16 of the call); gate columns: a junk binding
+        if fpair(cfg):   # up column 2 u + 1: pair u's record (h_col_stride); gate columns: a junk binding
+            h = cols // 2
+            e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{h}x{nb}x{MP}x{rec}xi32, "
+              f"#encoding.layout.strided<strides=[{h_col_stride(cfg) // 4}, {cfg.hpass * MP * 128 * 36}, {128 * 36}, 1]>>>")
+            e(f"  %jb = binding {9 if cfg.gate else 6}, \"write\"")
+            e(f"  %j_all = receiver %jb, 0 : reg<aie2p.array.receiver : tile<{h}x{nb * MP}x{rec}xi32>>")
+            e(f"  %nhalf = constant.u32 {h} : reg<aie2p.array.scalar : index>")
+        elif cfg.ufmt:   # up column u: passes 2 u, 2 u + 1 (j // 16 of the call); gate columns: a junk binding
             h = cols // 2
             e(f"  %c_all = receiver %cb, 0 : reg<aie2p.array.receiver : tile<{h}x{nb}x{MP}x{rec}xi32, "
               f"#encoding.layout.strided<strides=[{2 * MP * 128 * 36}, {cfg.hpass * MP * 128 * 36}, {128 * 36}, 1]>>>")
@@ -329,8 +338,8 @@ def array_program(L, cfg):
         stype = f"tile<{rec}xi32>"
     for c in range(cols):
         if cfg.ufmt:
-            u = c % (cols // 2)
-            src = "%c_all" if c >= cols // 2 else "%j_all"
+            u = c // 2 if cfg.fuse else c % (cols // 2)
+            src = "%c_all" if (pair_up(cfg, c) if cfg.fuse else c >= cols // 2) else "%j_all"
             e(f"  %cr{c} = partition.receiver {src}, %origin, %n{u}, %nhalf : reg<aie2p.array.receiver : tile<{rec}xi32>>")
         else:
             e(f"  %cr{c} = partition.receiver %c_all, %origin, %n{c}, %ncols : reg<aie2p.array.receiver : tile<{rec}xi32>>")
@@ -340,8 +349,9 @@ def array_program(L, cfg):
     if cfg.ufmt:   # gate tail u -> up tail u + 3: its C segment as bf16 (core streams, 512 words a segment)
         e(f"  %nxs = constant.u32 {nb * MP * 512} : reg<aie2p.array.scalar : index>")
         for u in range(cols // 2):
-            e(f"  %xs{u} = sender %k{u}_{rows - 1}, 3 : reg<aie2p.array.sender : tile<1xi32>>")
-            e(f"  %xr{u} = receiver %k{u + cols // 2}_{rows - 1}, 3 : reg<aie2p.array.receiver : tile<1xi32>>")
+            g_, u_ = (2 * u, 2 * u + 1) if cfg.fuse else (u, u + cols // 2)
+            e(f"  %xs{u} = sender %k{g_}_{rows - 1}, 3 : reg<aie2p.array.sender : tile<1xi32>>")
+            e(f"  %xr{u} = receiver %k{u_}_{rows - 1}, 3 : reg<aie2p.array.receiver : tile<1xi32>>")
             e(f"  %chx{u} = channel %xs{u}, %xr{u}, %two, %nxs : reg<aie2p.array.channel : tile<1xi32>>")
             e(f"  constrain.core_stream %chx{u}")
     if cfg.dcol:
@@ -374,7 +384,7 @@ def array_program(L, cfg):
         e(f"  %fipitch = constant.u32 {D.RECROW} : reg<aie2p.array.scalar : index>")
         for c in range(cols):
             for r, cov in fuse_cover(cfg, c).items():
-                e(f"  %fioff{c}_{r} = constant.u32 {fuse_raw_ring(cfg, cov)[0]} : reg<aie2p.array.scalar : index>")
+                e(f"  %fioff{c}_{r} = constant.u32 {fuse_raw_ring(colcfg(cfg, c), cov)[0]} : reg<aie2p.array.scalar : index>")
                 e(f"  constrain.intake %chr{c}_{r}, %chw{c}_{r}, %fioff{c}_{r}, %firows, %fipitch")
     if cfg.dcol:
         fill_inputs(e, cfg, panel)
@@ -577,12 +587,39 @@ def worker_leaf(cfg, c, r):
         name = "mid_l" if len(cov) > 1 else role   # the last mid also fills the tail's slice
     else:
         name = role + "_f" + "".join(map(str, cov))
+    if cfg.ufmt and cfg.fuse == 2:   # column pairs: the gate tails send, the up columns' fillers decode cfg.ufmt
+        if role == "tail" and not pair_up(cfg, c):
+            name = "tail_s"
+        elif cov is not None and pair_up(cfg, c):
+            name += "_u"
     return name + ("" if not gate else "_g" + gate[0] if cfg.fuse else "_g"), role, cov, gate
 
 
 def fuse_ports(role):
     """(egress port, core stream port) of a filling worker: after its A and W ports."""
     return 2, 3
+
+
+def fpair(cfg):
+    """fuse 2 column pairs (cfg.ufmt): pair u is gate column 2 u (fmt rows) and up column 2 u + 1 (ufmt rows) of the
+    same 16 NP features; the gate tail streams its C segment (bf16) to its east neighbor, the up tail, which writes
+    silu(gate) * up. Every filler decodes its own column's format."""
+    return bool(cfg.ufmt) and cfg.fuse == 2
+
+
+def pair_up(cfg, c):
+    """fuse 2 column pairs: column c computes up rows."""
+    return fpair(cfg) and c % 2 == 1
+
+
+def colcfg(cfg, c):
+    """Column c's config: fuse 2 column pairs decode the up columns' rows in cfg.ufmt."""
+    return dataclasses.replace(cfg, fmt=cfg.ufmt) if pair_up(cfg, c) else cfg
+
+
+def dec_tag(cfg):
+    """The inlined decoder's rodata name: column pairs' up fillers (colcfg: fmt = ufmt) their own."""
+    return "inlu" if cfg.ufmt and cfg.fmt == cfg.ufmt else "inl"
 
 
 def fuse_groups(cfg):
@@ -696,7 +733,16 @@ def fuse_channels(e, cfg, panel):
     e(f"  %frb = binding {7 if cfg.gate else 4}, \"read\"")
     e(f"  %fdl = constant.u32 {rows * cols} : reg<aie2p.array.scalar : index>")
     e(f"  %fun = constant.u32 {units} : reg<aie2p.array.scalar : index>")
-    if cfg.fuse == 2:   # raw rows [N][kraw / 256][136]: per column, per (pass, slab) unit [16 rows][4 super-blocks]
+    if fpair(cfg):   # gate columns' rows from %frb (fmt), the up columns' from their own binding (ufmt)
+        e(f"  %frbu = binding {8 if cfg.gate else 5}, \"read\"")
+        for up in (0, 1):
+            cc = colcfg(cfg, up)
+            BLK, uwp = fuse_blk(cc), fuse_unit_raw(cc) // 4
+            RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * BLK // 4
+            e(f"  %fru_all{up} = sender {'%frbu' if up else '%frb'}, 0 : reg<aie2p.array.sender : "
+              f"tile<{cfg.passes}x{NP}x16x{uwp // 16}xi32, "
+              f"#encoding.layout.strided<strides=[{FUSE_SB * BLK // 4}, {16 * RS}, {RS}, 1]>>>")
+    elif cfg.fuse == 2:   # raw rows [N][kraw / 256][136]: per column, per (pass, slab) unit [16 rows][4 super-blocks]
         BLK = fuse_blk(cfg)
         RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * BLK // 4   # row stride in words
         if cfg.swiglu:   # column c: gate rows swcol c .. (its NP / 2 slabs), then the same up rows dgu bytes on
@@ -716,7 +762,13 @@ def fuse_channels(e, cfg, panel):
         e(f"  %fdn{tag(cov)} = constant.u32 {nrec} : reg<aie2p.array.scalar : index>")
         e(f"  %fd_all{tag(cov)} = receiver %fdb, 0 : reg<aie2p.array.receiver : tile<{rows * cols}x{nrec}x{fw}xi32>>")
     for c in range(cols):
-        if cfg.fuse == 2:   # column c: rows TN c .. (swiglu: gate rows swcol c ..)
+        if fpair(cfg):   # pair c // 2: rows swcol (c // 2) .. of its column's binding
+            cc = colcfg(cfg, c)
+            uw = fuse_unit_raw(cc) // 4
+            RS = (cfg.kraw or 8 * cfg.passes * sum(cfg.ks)) // 256 * fuse_blk(cc) // 4
+            e(f"  %fro{c} = constant.u64 {c // 2 * cfg.swcol * RS * 4} : reg<aie2p.array.offset : offset>")
+            e(f"  %fru{c} = view.sender %fru_all{c % 2}, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
+        elif cfg.fuse == 2:   # column c: rows TN c .. (swiglu: gate rows swcol c ..)
             e(f"  %fro{c} = constant.u64 {c * (cfg.swcol if cfg.swiglu else TN) * RS * 4} : reg<aie2p.array.offset : offset>")
             e(f"  %fru{c} = view.sender %fru_all, %fro{c} : reg<aie2p.array.sender : tile<16x{uw // 16}xi32>>")
         else:
@@ -732,7 +784,7 @@ def fuse_channels(e, cfg, panel):
             ut = f"16x{uw // 16}" if cfg.fuse == 2 else f"{uw}"
             e(f"  %frr{c}_{r} = receiver %k{c}_{r}, {sp} : reg<aie2p.array.receiver : tile<{ut}xi32>>")
             if cfg.rawdma:   # staged in the column's memory tile; intake ring depth fuse_raw_ring
-                cap = fuse_raw_ring(cfg, cov)[1]
+                cap = fuse_raw_ring(colcfg(cfg, c), cov)[1]
                 e(f"  %chr{c}_{r} = channel %fru{c}, %frr{c}_{r}, %n{cap}, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
                 e(f"  constrain.stage %chr{c}_{r}, %n{c if cols > 1 else 1}")
                 e(f"  constrain.leaf_sync %chr{c}_{r}")
@@ -1088,7 +1140,7 @@ def fuse_decode(L, cfg, dp, cov):
         e(f"  %dq_{nm} = mov.scalar-to-address {inb if nm == 'in' else '%fza_' + nm}")
     # the decoder (its values and labels prefixed)
     ren = lambda m: m.group(1) + "dq_" + m.group(2)
-    for ln in D.leaf_inline(nsb):
+    for ln in D.leaf_inline(nsb, dec_tag(cfg)):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
     if cfg.rawdma:   # the raw record is consumed: back to the DMA, but for the last cap units (the panel follows them)
@@ -2283,21 +2335,23 @@ def gen(cfg):
     array_program(L, cfg)
     assert len(set(cfg.ks[1:-1])) == 1, "the mids share one leaf"
     if cfg.fuse:   # every worker's leaf, once (worker_leaf)
-        if cfg.fuse == 2:   # the inlined decoder's tables (grid formats)
-            L.extend(decoder(cfg.fmt, cfg.gord).inline_rodata())
+        if cfg.fuse == 2:   # the inlined decoders' tables (grid formats)
+            for cc in [cfg] + ([colcfg(cfg, 1)] if fpair(cfg) else []):
+                L.extend(decoder(cc.fmt, cc.gord).inline_rodata(dec_tag(cc)))
         seen = set()
         for c in [-1] + list(range(cfg.cols)):   # (-1: an ordinary column first: head, mid, mid_l, tail)
             for r in range(len(cfg.ks)):
                 name, role, cov, gate = (worker_leaf(cfg, c, r) if c >= 0 else
                                          (lambda w: (w[0], w[1], w[2], None))(worker_leaf(cfg, -1, r)))
+                pair = (("recv" if pair_up(cfg, c) else "send") if fpair(cfg) and role == "tail" else None)
                 if name not in seen:
                     seen.add(name)
-                    leaf(L, cfg, role, cfg.ks[r], gate=gate, cov=cov, name=name)
+                    leaf(L, colcfg(cfg, c), role, cfg.ks[r], gate=gate, pair=pair, cov=cov, name=name)
     else:
         leaf(L, cfg, "head", cfg.ks[0])
         leaf(L, cfg, "mid", cfg.ks[1])
         leaf(L, cfg, "tail", cfg.ks[-1], pair="recv" if cfg.ufmt else None)
-    if cfg.ufmt:
+    if cfg.ufmt and not cfg.fuse:
         leaf(L, cfg, "tail", cfg.ks[-1], pair="send")
     if cfg.dcol:
         for n, fmt in sorted(set(fill_map(cfg)[1])):

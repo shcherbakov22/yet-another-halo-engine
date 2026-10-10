@@ -1,0 +1,15 @@
+Core-to-core streams own no DMA (Loom AIE2P array plans): a routed channel between two workers' core stream ports
+(constrain.core_stream) took a compute memory-to-stream and stream-to-memory channel from the array's budget although
+only its route is planned. Fused FFN column pairs (a gate tail streaming its bf16 values to the up tail) ran 4 channels
+past the 64 their GEMM workers' activation and weight rings already use.
+--- a/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
++++ b/loom/src/loom/target/arch/amd/xdna/aie2p/array/topology.c
+@@ -123,6 +123,8 @@
+     case LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_NEIGHBOR_MEMORY:
+       return LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_NEIGHBOR_RING;
+     case LOOM_AIE2P_ARRAY_CHANNEL_TRANSPORT_ROUTED_DMA:
++      // Two workers' core stream ports: a route, no DMA on either end.
++      if (channel->core_stream) return 0;
+       return LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_COMPUTE_STREAM_TO_MEMORY |
+              (owns_source
+                   ? LOOM_AIE2P_ARRAY_CHANNEL_RESOURCE_FLAG_OWNS_COMPUTE_MEMORY_TO_STREAM
