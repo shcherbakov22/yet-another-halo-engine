@@ -1977,18 +1977,25 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
             e(f"  {p}ss = add.rr {p}ds, {p}so")
             e(f"  {p}c = mova.i32 60")
 
-            kn = [0]
+            kn, kmemo, kch = [0], {}, [None]   # kmemo: a chain's constants, made once (per chain: sharing them
+            # across the body's four chains pins too many accumulators)
 
-            def kbf(x):                                         # a bf16 constant in 32 lanes, made at its use
+            def kbf(x):                                         # a bf16 constant in 32 lanes
+                if ("b", x, kch[0]) in kmemo:
+                    return kmemo[("b", x, kch[0])]
                 kn[0] += 1
                 e(f"  {p}kc{kn[0]} = mov.i32 {bf16_bits(x)}")
                 e(f"  {p}kv{kn[0]} = vbcst.16 {p}kc{kn[0]}")
+                kmemo[("b", x, kch[0])] = f"{p}kv{kn[0]}"
                 return f"{p}kv{kn[0]}"
 
             def kacc(x):                                        # an f32 constant (exact in bf16) in 32 accumulator lanes
+                if ("a", x, kch[0]) in kmemo:
+                    return kmemo[("a", x, kch[0])]
                 kn[0] += 1
                 nm, one_, x_ = f"{p}ka{kn[0]}", kbf(1.0), kbf(x)
                 e(f"  {nm} = vmul.bf16x32 {one_}, {x_}, {p}c")
+                kmemo[("a", x, kch[0])] = nm
                 return nm
             L2E = 1 / math.log(2)
             e(f"  {p}amk = mov.i32 32767")                      # bf16 |x| mask
@@ -1998,23 +2005,6 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                 e(f"  {p}gba = storage_address %gbs : low.storage<private> -> reg<aie2p.ep>")
                 e(f"  {p}gbs0 = mov.address-to-scalar {p}gba")
                 e(f"  {p}k32 = mov.i32 32")
-                e(f"  {p}k64n = mova.i32 {NP * 16}")   # 512-bit vector loops: 32 bytes x NP * 16 per segment
-            if pair == "recv":   # the gate tail's segment: NP * 512 bytes of bf16 from the core stream
-                e(f"  {p}rq0 = mova.i32 0")
-                e(f"  low.br ^rv{t}({p}rq0: {ER})")
-                e(f"^rv{t}({p}rq: {ER}):")
-                e(f"  {p}rqm = lt {p}rq, {p}k64n")
-                e(f"  low.cond_br {p}rqm, ^rvb{t}, ^rvx{t} : {ER}")
-                e(f"^rvb{t}:")
-                e(f"  {p}rqo = mul {p}rq, {p}k32")
-                e(f"  {p}rqa = add.rr {p}gbs0, {p}rqo")
-                e(f"  {p}rqp = mov.scalar-to-address {p}rqa")
-                for w in range(8):
-                    e(f"  {p}rw{w} = mov.ss")
-                    e(f"  st {p}rw{w}, {p}rqp, {4 * w}")
-                e(f"  {p}rq1 = add.rr {p}rq, %one")
-                e(f"  low.br ^rv{t}({p}rq1: {ER})")
-                e(f"^rvx{t}:")
             e(f"  {p}sp = mov.scalar-to-address {p}ss")
             e(f"  {p}sl = vlda.store-fifo.low512 {p}sp, 0")
             e(f"  {p}f0 = vlda.store-fifo.high512 {p}sp, {p}sl, 64")
@@ -2030,133 +2020,116 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                 return q_
             nf = 0
             MF, MP_, MS = "reg<aie2p.mstfifo>", "reg<aie2p.mpfs>", "reg<aie2p.mr26_fifo_st>"
-            e(f"  {p}i0 = mova.i32 0")
-            e(f"  {p}k1024 = mov.i32 1024")
-            # outer loop j over the gate slabs (column pairs: every slab), inner i over their two 8-row halves
-            e(f"  {p}nj = mova.i32 {NP if pair else NP // 2}")
-            e(f"  low.br ^swj{t}({p}i0: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
-            e(f"^swj{t}({p}j: {ER}, {p}JF: {MF}, {p}JO: {MP_}, {p}JP: {MS}):")
-            e(f"  {p}jm = lt {p}j, {p}nj")
-            e(f"  low.cond_br {p}jm, ^swjb{t}, ^swjx{t} : {ER}")
-            e(f"^swjb{t}:")
-            if pair == "recv":   # the record as two store streams (one stream lost its 18th line): the second at 576
-                h = NP // 2
-                e(f"  {p}kh1 = mova.i32 {h - 1}")
-                e(f"  {p}kh3 = mova.i32 {h + 1}")
-                e(f"  {p}ja1 = lt {p}kh1, {p}j")
-                e(f"  {p}jb3 = lt {p}j, {p}kh3")
-                e(f"  {p}jeq = mul {p}ja1, {p}jb3")
-                e(f"  low.cond_br {p}jeq, ^swre{t}, ^swno{t} : {ER}")
-                e(f"^swno{t}:")
-                e(f"  low.br ^swin{t}({p}JF: {MF}, {p}JO: {MP_}, {p}JP: {MS})")
-                e(f"^swre{t}:")
-                e(f"  {p}rf, {p}rp, {p}rq_ = vst.flush.512 {p}JF, {p}JO, {p}JP")
-                e(f"  {p}k576 = mov.i32 {2 * h * 144}")
-                e(f"  {p}s2 = add.rr {p}ss, {p}k576")
-                e(f"  {p}sp2 = mov.scalar-to-address {p}s2")
-                e(f"  {p}sl2 = vlda.store-fifo.low512 {p}sp2, 0")
-                e(f"  {p}f2 = vlda.store-fifo.high512 {p}sp2, {p}sl2, 64")
-                e(f"  {p}op2 = copy {p}sp2 : reg<aie2p.ep> -> reg<aie2p.mpfs>")
-                e(f"  {p}ps2 = mova.fifo.store.position 0")
-                e(f"  low.br ^swin{t}({p}f2: {MF}, {p}op2: {MP_}, {p}ps2: {MS})")
-                e(f"^swin{t}({p}NF: {MF}, {p}NO: {MP_}, {p}NP: {MS}):")
-                e(f"  {p}ji0 = mova.i32 0")
-                e(f"  low.br ^swi{t}({p}ji0: {ER}, {p}NF: {MF}, {p}NO: {MP_}, {p}NP: {MS})")
-            else:
-                e(f"  {p}ji0 = mova.i32 0")
-                e(f"  low.br ^swi{t}({p}ji0: {ER}, {p}JF: {MF}, {p}JO: {MP_}, {p}JP: {MS})")
-            e(f"^swi{t}({p}i: {ER}, {p}F: {MF}, {p}O: {MP_}, {p}P: {MS}):")
-            e(f"  {p}nbk = mova.i32 2")
-            e(f"  {p}im = lt {p}i, {p}nbk")
-            e(f"  low.cond_br {p}im, ^swib{t}, ^swix{t} : {ER}")
-            e(f"^swib{t}:")
-            # gate rows: slab j, half i (sub-tiles at 256 i, 512 + 256 i); up: NP / 2 slabs on. The record takes the
-            # 8-feature blocks 2 j + i in loop order; P4 (and Q4K's 4 gate k-blocks of one format, its slabs 32 rows
-            # apart): per two slabs blocks 0, 2, 1, 3, so the loop's (j, i) stand for slab (j & ~1) | i, half j & 1;
-            # Q4K over 4 slabs (pairs): blocks 0, 4, 1, 5, 2, 6, 3, 7, slab (j >> 1) + 2 i, half j & 1
-            jj, ii, jstep = f"{p}j", f"{p}i", 1
-            if cfg.hord == "Q4K" and pair:
-                e(f"  {p}hk1 = mov.i32 1")
-                e(f"  {p}hk2 = mov.i32 2")
-                e(f"  {p}jod = and {p}j, {p}hk1")
-                e(f"  {p}jev = sub {p}j, {p}jod")
-                e(f"  {p}jhf = mul {p}i, {p}hk2")
-                e(f"  {p}jh2 = add.rr {p}jev, {p}jhf")
-                e(f"  {p}jpe = add.rr {p}jh2, {p}jhf")      # 2 slab: the slab offsets below take half the step
-                jj, ii, jstep = f"{p}jpe", f"{p}jod", 2
-            elif cfg.hord:
-                e(f"  {p}hk1 = mov.i32 1")
-                e(f"  {p}jod = and {p}j, {p}hk1")
-                e(f"  {p}jev = sub {p}j, {p}jod")
-                e(f"  {p}jpe = add.rr {p}jev, {p}i")
-                jj, ii = f"{p}jpe", f"{p}jod"
-            e(f"  {p}jsl = mov.i32 {1024 // jstep}")
-            e(f"  {p}jo = mul {jj}, {p}jsl")
-            e(f"  {p}k256 = mov.i32 256")
-            e(f"  {p}io = mul {ii}, {p}k256")
-            e(f"  {p}ja = add.rr {p}ss, {p}jo")
-            e(f"  {p}ia = add.rr {p}ja, {p}io")
-            e(f"  {p}k512 = mov.i32 512")
-            e(f"  {p}gib = add.rr {p}ia, {p}k512")
-            if pair:   # the slab is up (recv) or gate (send) rows; the gate values' buffer block (j, i): 256 bytes
-                e(f"  {p}uib = add.rr {p}gib, %zero")
-                e(f"  {p}kj512 = mov.i32 {512 // jstep}")
-                e(f"  {p}gjo = mul {jj}, {p}kj512")
-                e(f"  {p}gio = mul {ii}, {p}k256")
-                e(f"  {p}gja = add.rr {p}gbs0, {p}gjo")
-                e(f"  {p}gbb = add.rr {p}gja, {p}gio")
-            else:
-                e(f"  {p}kup = mov.i32 {1024 * NP // 2}")
-                e(f"  {p}uib = add.rr {p}gib, {p}kup")
-            fifo = (f"{p}F", f"{p}O", f"{p}P")
-            for i in (0,):                                  # one 8-feature block per loop body
+
+            def stream(lo, hi, tag):
+                """Column pairs: the gate buffer's 32-byte rows lo .. hi - 1 over the core stream (gate tail: out, up
+                tail: in), 8 words at a time."""
+                s_ = "sd" if pair == "send" else "rv"
+                q = f"{p}{s_}{tag}"
+                e(f"  {q}0 = mova.i32 {lo}")
+                e(f"  {q}n = mova.i32 {hi}")
+                e(f"  low.br ^{s_}{t}{tag}({q}0: {ER})")
+                e(f"^{s_}{t}{tag}({q}: {ER}):")
+                e(f"  {q}m = lt {q}, {q}n")
+                e(f"  low.cond_br {q}m, ^{s_}b{t}{tag}, ^{s_}x{t}{tag} : {ER}")
+                e(f"^{s_}b{t}{tag}:")
+                e(f"  {q}o = mul {q}, {p}k32")
+                e(f"  {q}a = add.rr {p}gbs0, {q}o")
+                e(f"  {q}p = mov.scalar-to-address {q}a")
+                # all 8 loads (reads) before the 8 writes: stream ops keep their order with memory ops, so a
+                # word-at-a-time load -> write chain pays the full latency per word
+                for w in range(8):
+                    e(f"  {q}w{w} = lda {q}p, {4 * w}" if pair == "send" else f"  {q}w{w} = mov.ss")
+                for w in range(8):
+                    e(f"  mov.ms {q}w{w}" if pair == "send" else f"  st {q}w{w}, {q}p, {4 * w}")
+                e(f"  {q}1 = add.rr {q}, %one")
+                e(f"  low.br ^{s_}{t}{tag}({q}1: {ER})")
+                e(f"^{s_}x{t}{tag}:")
+
+            def jloop(lo, hi, kind, tag, fifo):
+                """j over the gate slabs lo .. hi - 1, i over their two 8-row halves; kind "sw": g and u from this C, h
+                pushed; "graw" / "gsig" (gate tail): g / silu(g) to the gate buffer; "usig" / "umul" (up tail): h from
+                the buffer's g / silu(g). Returns the exit's store fifo."""
+                nonlocal nf
+                q, T = p + tag, f"{t}{tag}"
+                e(f"  {q}j0 = mova.i32 {lo}")
+                e(f"  {q}nj = mova.i32 {hi}")
+                e(f"  low.br ^swj{T}({q}j0: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
+                e(f"^swj{T}({q}j: {ER}, {q}JF: {MF}, {q}JO: {MP_}, {q}JP: {MS}):")
+                e(f"  {q}jm = lt {q}j, {q}nj")
+                e(f"  low.cond_br {q}jm, ^swjb{T}, ^swjx{T} : {ER}")
+                e(f"^swjb{T}:")
+                e(f"  {q}ji0 = mova.i32 0")
+                e(f"  low.br ^swi{T}({q}ji0: {ER}, {q}JF: {MF}, {q}JO: {MP_}, {q}JP: {MS})")
+                e(f"^swi{T}({q}i: {ER}, {q}F: {MF}, {q}O: {MP_}, {q}P: {MS}):")
+                e(f"  {q}nbk = mova.i32 2")
+                e(f"  {q}im = lt {q}i, {q}nbk")
+                e(f"  low.cond_br {q}im, ^swib{T}, ^swix{T} : {ER}")
+                e(f"^swib{T}:")
+                # gate rows: slab j, half i (sub-tiles at 256 i, 512 + 256 i); up: NP / 2 slabs on. The record takes the
+                # 8-feature blocks 2 j + i in loop order; P4 (and Q4K's 4 gate k-blocks of one format, its slabs 32 rows
+                # apart): per two slabs blocks 0, 2, 1, 3, so the loop's (j, i) stand for slab (j & ~1) | i, half j & 1;
+                # Q4K over 4 slabs (pairs): blocks 0, 4, 1, 5, 2, 6, 3, 7, slab (j >> 1) + 2 i, half j & 1
+                jj, ii, jstep = f"{q}j", f"{q}i", 1
+                if cfg.hord == "Q4K" and pair:
+                    e(f"  {q}hk1 = mov.i32 1")
+                    e(f"  {q}hk2 = mov.i32 2")
+                    e(f"  {q}jod = and {q}j, {q}hk1")
+                    e(f"  {q}jev = sub {q}j, {q}jod")
+                    e(f"  {q}jhf = mul {q}i, {q}hk2")
+                    e(f"  {q}jh2 = add.rr {q}jev, {q}jhf")
+                    e(f"  {q}jpe = add.rr {q}jh2, {q}jhf")      # 2 slab: the slab offsets below take half the step
+                    jj, ii, jstep = f"{q}jpe", f"{q}jod", 2
+                elif cfg.hord:
+                    e(f"  {q}hk1 = mov.i32 1")
+                    e(f"  {q}jod = and {q}j, {q}hk1")
+                    e(f"  {q}jev = sub {q}j, {q}jod")
+                    e(f"  {q}jpe = add.rr {q}jev, {q}i")
+                    jj, ii = f"{q}jpe", f"{q}jod"
+                e(f"  {q}jsl = mov.i32 {1024 // jstep}")
+                e(f"  {q}jo = mul {jj}, {q}jsl")
+                e(f"  {q}k256 = mov.i32 256")
+                e(f"  {q}io = mul {ii}, {q}k256")
+                e(f"  {q}ja = add.rr {p}ss, {q}jo")
+                e(f"  {q}ia = add.rr {q}ja, {q}io")
+                e(f"  {q}k512 = mov.i32 512")
+                e(f"  {q}gib = add.rr {q}ia, {q}k512")
+                if pair:   # the slab is up (up tail) or gate (gate tail) rows; the gate buffer's block (j, i): 256 bytes in
+                    # loop order (the pair's tails share the loop's slab order), so a run of slabs is a run of rows
+                    e(f"  {q}uib = add.rr {q}gib, %zero")
+                    e(f"  {q}gjo = mul {q}j, {q}k512")
+                    e(f"  {q}gio = mul {q}i, {q}k256")
+                    e(f"  {q}gja = add.rr {p}gbs0, {q}gjo")
+                    e(f"  {q}gbb = add.rr {q}gja, {q}gio")
+                else:
+                    e(f"  {q}kup = mov.i32 {1024 * NP // 2}")
+                    e(f"  {q}uib = add.rr {q}gib, {q}kup")
+                fifo = (f"{q}F", f"{q}O", f"{q}P")
+                kmemo.clear()   # (constants made before the body stay in their own blocks)
                 for r in range(2):                              # token half: chain row bit
-                    n = f"{p}b{r}"
+                    n = f"{q}b{r}"
 
                     def load(sub, tag):
                         pp = ptr(sub)
                         q4 = []
-                        for q in range(4):
-                            x = f"{n}{tag}l{q}"
-                            e(f"  {x} = vlda.acc {pp}, {512 * r + 64 * q - 512}")
+                        for q_ in range(4):
+                            x = f"{n}{tag}l{q_}"
+                            e(f"  {x} = vlda.acc {pp}, {512 * r + 64 * q_ - 512}")
                             q4.append(x)
                         return q4
-                    if pair == "send":   # the gate values to the buffer, (r, h) blocks of 32 bf16
-                        g4 = load(f"{p}gib", "g")
-                        for h in range(2):
-                            g2 = f"{n}g2{h}"
-                            e(f"  {g2} = concat({g4[2 * h]}, {g4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
-                            e(f"  {n}gb{h} = vconv.bf16.fp32 {g2}")
-                            e(f"  {n}gp{h} = mov.scalar-to-address {p}gbb")   # short-lived (the ep budget is 8)
-                            e(f"  vst.512.bf16x32 {n}gb{h}, {n}gp{h}, {64 * (2 * r + h)}")
-                        continue
-                    if pair == "recv":
-                        u4 = load(f"{p}uib", "u")
-                    else:
-                        g4, u4 = load(f"{p}gib", "g"), load(f"{p}uib", "u")
-                    hs = []
-                    for h in range(2):
-                        u2 = f"{n}u2{h}"
-                        e(f"  {u2} = concat({u4[2 * h]}, {u4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
-                        if pair == "recv":
-                            e(f"  {n}gp{h} = mov.scalar-to-address {p}gbb")
-                            e(f"  {n}gb{h} = vlda.512.bf16x32 {n}gp{h}, {64 * (2 * r + h)}")
-                        else:
-                            g2 = f"{n}g2{h}"
-                            e(f"  {g2} = concat({g4[2 * h]}, {g4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
-                            e(f"  {n}gb{h} = vconv.bf16.fp32 {g2}")
-                        e(f"  {n}ub{h} = vconv.bf16.fp32 {u2}")
 
-                        # vmul / vmac.bf16x32: 32 f32 lanes in the first two units of the x4 accumulator
-                        def lo32(v, tag):
-                            q0, q1, r2 = f"{n}{tag}0", f"{n}{tag}1", f"{n}{tag}2"
-                            e(f"  {q0} = slice {v}[0] : {M4} -> {M1}")
-                            e(f"  {q1} = slice {v}[1] : {M4} -> {M1}")
-                            e(f"  {r2} = concat({q0}, {q1}) : ({M1}, {M1}) -> {M2}")
-                            return q0, q1, r2
-                        # sigmoid(g): e = e^-|g| = 2^n 2^r (n = round(-|g| log2 e); vexp2 is Mitchell's 2^floor(z)
-                        # (1 + frac(z)), exact only at integers; 2^r by a cubic), y = 1 / (1 + e) by two Newton steps
-                        # from 1.5 - d / 2, sigmoid = y for g >= 0, e y for g < 0
+                    # vmul / vmac.bf16x32: 32 f32 lanes in the first two units of the x4 accumulator
+                    def lo32(v, tag):
+                        q0, q1, r2 = f"{n}{tag}0", f"{n}{tag}1", f"{n}{tag}2"
+                        e(f"  {q0} = slice {v}[0] : {M4} -> {M1}")
+                        e(f"  {q1} = slice {v}[1] : {M4} -> {M1}")
+                        e(f"  {r2} = concat({q0}, {q1}) : ({M1}, {M1}) -> {M2}")
+                        return q0, q1, r2
+
+                    def silu(h):
+                        """silu(g) as bf16 from {n}gb{h}. sigmoid(g): e = e^-|g| = 2^n 2^r (n = round(-|g| log2 e);
+                        vexp2 is Mitchell's 2^floor(z) (1 + frac(z)), exact only at integers; 2^r by a cubic), y =
+                        1 / (1 + e) by two Newton steps from 1.5 - d / 2, sigmoid = y for g >= 0, e y for g < 0."""
                         def bf(v, tag):                         # the 32 f32 lanes of an x4 accumulator as bf16
                             return f"{n}{tag}b{h}", e(f"  {n}{tag}b{h} = vconv.bf16.fp32 {lo32(v, f'{tag}q{h}')[2]}")
                         e(f"  {n}ga{h} = vband {n}gb{h}, {p}amv")                     # |g|
@@ -2195,7 +2168,37 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                         e(f"  {n}sgb{h} = vsel.16.mask64 {yb}, {snb}, {n}lt{h}")
                         e(f"  {n}si{h} = vmul.bf16x32 {n}gb{h}, {n}sgb{h}, {p}c")      # silu(g)
                         e(f"  {n}sib{h} = vconv.bf16.fp32 {lo32(f'{n}si{h}', f'siq{h}')[2]}")
-                        e(f"  {n}h{h} = vmul.bf16x32 {n}sib{h}, {n}ub{h}, {p}c")       # silu(g) * u
+                        return f"{n}sib{h}"
+                    if kind in ("graw", "gsig"):   # the gate tail: g or silu(g) to the buffer, (r, h) blocks of 32 bf16
+                        g4 = load(f"{q}gib", "g")
+                        for h in range(2):
+                            kch[0] = (r, h)
+                            g2 = f"{n}g2{h}"
+                            e(f"  {g2} = concat({g4[2 * h]}, {g4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
+                            e(f"  {n}gb{h} = vconv.bf16.fp32 {g2}")
+                            v = silu(h) if kind == "gsig" else f"{n}gb{h}"
+                            e(f"  {n}gp{h} = mov.scalar-to-address {q}gbb")   # short-lived (the ep budget is 8)
+                            e(f"  vst.512.bf16x32 {v}, {n}gp{h}, {64 * (2 * r + h)}")
+                        continue
+                    if kind == "sw":
+                        g4, u4 = load(f"{q}gib", "g"), load(f"{q}uib", "u")
+                    else:
+                        u4 = load(f"{q}uib", "u")
+                    hs = []
+                    for h in range(2):
+                        kch[0] = (r, h)
+                        u2 = f"{n}u2{h}"
+                        e(f"  {u2} = concat({u4[2 * h]}, {u4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
+                        if kind == "sw":
+                            g2 = f"{n}g2{h}"
+                            e(f"  {g2} = concat({g4[2 * h]}, {g4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
+                            e(f"  {n}gb{h} = vconv.bf16.fp32 {g2}")
+                        else:   # g (usig) or silu(g) (umul) from the buffer
+                            e(f"  {n}gp{h} = mov.scalar-to-address {q}gbb")
+                            e(f"  {n}gb{h} = vlda.512.bf16x32 {n}gp{h}, {64 * (2 * r + h)}")
+                        e(f"  {n}ub{h} = vconv.bf16.fp32 {u2}")
+                        sib = f"{n}gb{h}" if kind == "umul" else silu(h)
+                        e(f"  {n}h{h} = vmul.bf16x32 {sib}, {n}ub{h}, {p}c")       # silu(g) * u
                         q0, q1, _ = lo32(f"{n}h{h}", f"hq{h}")
                         hs += [q0, q1]
                     e(f"  {n}H = concat({hs[0]}, {hs[1]}, {hs[2]}, {hs[3]}) : ({M1}, {M1}, {M1}, {M1}) -> {M4}")
@@ -2203,30 +2206,38 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                     nxt = (f"{p}xf{nf}", f"{p}xp{nf}", f"{p}xq{nf}")
                     e(f"  {nxt[0]}, {nxt[1]}, {nxt[2]} = vst.push.bfp16ebs8.from.fp32 {fifo[0]}, {n}H, {fifo[1]}, {fifo[2]}")
                     fifo = nxt
-            e(f"  {p}i1 = add.rr {p}i, %one")
-            e(f"  low.br ^swi{t}({p}i1: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
-            e(f"^swix{t}:")
-            fifo = (f"{p}F", f"{p}O", f"{p}P")
-            e(f"  {p}j1 = add.rr {p}j, %one")
-            e(f"  low.br ^swj{t}({p}j1: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
-            e(f"^swjx{t}:")
-            fifo = (f"{p}JF", f"{p}JO", f"{p}JP")
-            if pair == "send":   # the buffer out on the core stream, 8 words at a time
-                e(f"  {p}sq0 = mova.i32 0")
-                e(f"  low.br ^sd{t}({p}sq0: {ER})")
-                e(f"^sd{t}({p}sq: {ER}):")
-                e(f"  {p}sqm = lt {p}sq, {p}k64n")
-                e(f"  low.cond_br {p}sqm, ^sdb{t}, ^sdx{t} : {ER}")
-                e(f"^sdb{t}:")
-                e(f"  {p}sqo = mul {p}sq, {p}k32")
-                e(f"  {p}sqa = add.rr {p}gbs0, {p}sqo")
-                e(f"  {p}sqp = mov.scalar-to-address {p}sqa")
-                for w in range(8):
-                    e(f"  {p}sw{w} = lda {p}sqp, {4 * w}")
-                    e(f"  mov.ms {p}sw{w}")
-                e(f"  {p}sq1 = add.rr {p}sq, %one")
-                e(f"  low.br ^sd{t}({p}sq1: {ER})")
-                e(f"^sdx{t}:")
+                e(f"  {q}i1 = add.rr {q}i, %one")
+                e(f"  low.br ^swi{T}({q}i1: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
+                e(f"^swix{T}:")
+                fifo = (f"{q}F", f"{q}O", f"{q}P")
+                e(f"  {q}j1 = add.rr {q}j, %one")
+                e(f"  low.br ^swj{T}({q}j1: {ER}, {fifo[0]}: {MF}, {fifo[1]}: {MP_}, {fifo[2]}: {MS})")
+                e(f"^swjx{T}:")
+                return (f"{q}JF", f"{q}JO", f"{q}JP")
+            # column pairs split the sigmoid: the gate tail sends slabs 0 .. NP / 2 - 1 as g, makes silu(g) of the rest
+            # while the up tail works on the first, then sends those (both tails round silu(g) to bf16: bit-exact)
+            H2 = NP // 2
+            if pair == "send":
+                fifo = jloop(0, H2, "graw", "a", fifo)
+                stream(0, 8 * NP, "a")
+                fifo = jloop(H2, NP, "gsig", "b", fifo)
+                stream(8 * NP, 16 * NP, "b")
+            elif pair == "recv":
+                stream(0, 8 * NP, "a")
+                fifo = jloop(0, H2, "usig", "a", fifo)
+                # the record as two store streams (one stream lost its 18th line): the second at 576
+                e(f"  {p}rf, {p}rp, {p}rq_ = vst.flush.512 {fifo[0]}, {fifo[1]}, {fifo[2]}")
+                e(f"  {p}k576 = mov.i32 {2 * H2 * 144}")
+                e(f"  {p}s2 = add.rr {p}ss, {p}k576")
+                e(f"  {p}sp2 = mov.scalar-to-address {p}s2")
+                e(f"  {p}sl2 = vlda.store-fifo.low512 {p}sp2, 0")
+                e(f"  {p}f2 = vlda.store-fifo.high512 {p}sp2, {p}sl2, 64")
+                e(f"  {p}op2 = copy {p}sp2 : reg<aie2p.ep> -> reg<aie2p.mpfs>")
+                e(f"  {p}ps2 = mova.fifo.store.position 0")
+                stream(8 * NP, 16 * NP, "b")
+                fifo = jloop(H2, NP, "umul", "b", (f"{p}f2", f"{p}op2", f"{p}ps2"))
+            else:
+                fifo = jloop(0, H2, "sw", "", fifo)
             if pair != "send":
                 # the flush writes whole 64-byte lines only, and drops the last one when the stream ends on a 128-byte
                 # boundary: pad with zero fragments (72 B each) until it ends at 64 mod 128 (the slot's bytes below
