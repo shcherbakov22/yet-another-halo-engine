@@ -2173,10 +2173,10 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                         e(f"  {r2} = concat({q0}, {q1}) : ({M1}, {M1}) -> {M2}")
                         return q0, q1, r2
 
-                    def silu(h):
-                        """silu(g) as bf16 from {n}gb{h} by table: t = sigmoid(-|g|) gathered at |g|'s bits (clamped:
-                        silu_rodata), silu = g t (g < 0), g - g t (g >= 0): one multiply-accumulate. Exhaustive over bf16
-                        g on the core: max 1.59 ulp, mean 0.075; NaN, inf -> NaN (yah-scratch/npu/silu/lprobe.py)."""
+                    def lut_t(h, fill=()):
+                        """t = sigmoid(-|g|) (bf16) of {n}gb{h} from the table (silu_rodata), gathered at |g|'s bits
+                        (clamped). fill: independent instructions (emitters) spread between the gathers, whose load slot
+                        leaves the vector units free. Returns t."""
                         g_ = f"{n}gb{h}"
                         e(f"  {n}la{h} = vband {g_}, {p}amv")                       # |g|
                         # clamped as integers (a float compare lets NaN through: an address past the table)
@@ -2187,36 +2187,75 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                             kn[0] += 1
                             e(f"  {p}kv{kn[0]} = vbcst.32 {p}tls")
                             kmemo[("t", kch[0])] = f"{p}kv{kn[0]}"
-                        ads = []
-                        for q in range(2):                          # 16 lanes each: 8 lane addresses x 2
+                        fill, tv = list(fill), []
+
+                        def addr(q):   # 16 lanes' 8 lane addresses x 2
                             e(f"  {n}lq{h}{q} = slice {n}lu{h}[{q}] : {M2} -> {M1}")
                             e(f"  {n}lv{h}{q} = vmov.accumulator512.to.vector512 {n}lq{h}{q}")
                             e(f"  {n}ld{h}{q} = vadd.32 {n}lv{h}{q}, {kmemo[('t', kch[0])]}")
-                            for w in range(2):
-                                e(f"  {n}l{h}{q}{w}a = slice {n}ld{h}{q}[{w}] : {V2} -> {V1}")
-                                ads.append(f"{n}l{h}{q}{w}")
-                        for x_ in ads:                              # the 8 gathers back to back
-                            e(f"  {x_}l = vldb.4x16.lo {x_}a")
-                            e(f"  {x_}h = vldb.4x16.hi {x_}a")
-                        tv = []
-                        for q in range(2):                          # each 8-byte piece's first value
+                        addr(0)
+                        for q in range(2):   # 4 gathers, the next half's addresses (gather latency), the 16 values
                             pr = []
+                            for w in range(2):
+                                x_ = f"{n}l{h}{q}{w}"
+                                e(f"  {x_}a = slice {n}ld{h}{q}[{w}] : {V2} -> {V1}")
+                                e(f"  {x_}l = vldb.4x16.lo {x_}a")
+                                if fill:
+                                    fill.pop(0)()
+                                e(f"  {x_}h = vldb.4x16.hi {x_}a")
+                                if fill:
+                                    fill.pop(0)()
+                            if q == 0:
+                                addr(1)
                             for w in range(2):
                                 x_ = f"{n}l{h}{q}{w}"
                                 e(f"  {x_}c = concat({x_}l, {x_}h) : ({V1}, {V1}) -> {V2}")
                                 pr.append(f"{x_}c")
-                            e(f"  {n}ls{h}{q} = vshuffle {pr[0]}, {pr[1]}, {p}m24")
+                            e(f"  {n}ls{h}{q} = vshuffle {pr[0]}, {pr[1]}, {p}m24")   # each piece's first value
                             e(f"  {n}lt{h}{q} = slice {n}ls{h}{q}[0] : {V2} -> {V1}")
                             tv.append(f"{n}lt{h}{q}")
+                        for f_ in fill:
+                            f_()
                         e(f"  {n}lt{h} = concat({tv[0]}, {tv[1]}) : ({V1}, {V1}) -> {V2}")
-                        e(f"  {n}ln{h} = vbor {n}lt{h}, {kbf(-0.0)}")                # -t
+                        return f"{n}lt{h}"
+
+                    def silu(h):
+                        """silu(g) as bf16 from {n}gb{h}: silu = g t (g < 0), g - g t (g >= 0), t = lut_t: one
+                        multiply-accumulate. Exhaustive over bf16 g on the core: max 1.59 ulp, mean 0.075; NaN, inf -> NaN
+                        (yah-scratch/npu/silu/lprobe.py)."""
+                        g_ = f"{n}gb{h}"
+                        t_ = lut_t(h)
+                        e(f"  {n}ln{h} = vbor {t_}, {kbf(-0.0)}")                     # -t
                         e(f"  {n}lg{h} = vlt.s16x32.el.low32 {g_}, {kbf(0.0)}")      # g < 0 (sign bit)
                         e(f"  {n}lm{h} = vsel.16.mask64 {kbf(1.0)}, {kbf(0.0)}, {n}lg{h}")
-                        e(f"  {n}lst{h} = vsel.16.mask64 {n}ln{h}, {n}lt{h}, {n}lg{h}")
+                        e(f"  {n}lst{h} = vsel.16.mask64 {n}ln{h}, {t_}, {n}lg{h}")
                         e(f"  {n}lp{h} = vmul.bf16x32 {g_}, {n}lm{h}, {p}c")             # g [g >= 0]
                         e(f"  {n}si{h} = vmac.bf16x32 {n}lp{h}, {g_}, {n}lst{h}, {p}c")  # silu(g)
                         e(f"  {n}sib{h} = vconv.bf16.fp32 {lo32(f'{n}si{h}', f'siq{h}')[2]}")
                         return f"{n}sib{h}"
+
+                    def swiglu_h(h):
+                        """{n}h{h} = silu(g) u = max(g, 0) u + t (-|g| u), t = lut_t: both products wait on nothing but
+                        g and u (they fill the gathers' slots), then one multiply-accumulate after the table. -|g| u
+                        rounds to bf16 (the t term's operand); max(g, 0) u is exact."""
+                        g_, u_ = f"{n}gb{h}", f"{n}ub{h}"
+
+                        def f1():
+                            e(f"  {n}fg{h}, {n}fgm{h} = vmax_lt.bf16 {g_}, {kbf(0.0)}")   # max(g, 0)
+
+                        def f2():
+                            e(f"  {n}fn{h} = vbor {g_}, {kbf(-0.0)}")                      # -|g|
+
+                        def f3():
+                            e(f"  {n}fp{h} = vmul.bf16x32 {n}fg{h}, {u_}, {p}c")
+
+                        def f4():
+                            e(f"  {n}fq{h} = vmul.bf16x32 {n}fn{h}, {u_}, {p}c")
+
+                        def f5():
+                            e(f"  {n}fqb{h} = vconv.bf16.fp32 {lo32(f'{n}fq{h}', f'fqq{h}')[2]}")
+                        t_ = lut_t(h, fill=(f1, f3, f2, f4, f5))
+                        e(f"  {n}h{h} = vmac.bf16x32 {n}fp{h}, {t_}, {n}fqb{h}, {p}c")
                     if kind in ("graw", "gsig"):   # the gate tail: g or silu(g) to the buffer, (r, h) blocks of 32 bf16
                         g4 = load(f"{q}gib", "g")
 
@@ -2248,8 +2287,10 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                             e(f"  {n}gp{h} = mov.scalar-to-address {q}gbb")
                             e(f"  {n}gb{h} = vlda.512.bf16x32 {n}gp{h}, {64 * (2 * r + h)}")
                         e(f"  {n}ub{h} = vconv.bf16.fp32 {u2}")
-                        sib = f"{n}gb{h}" if kind == "umul" else silu(h)
-                        e(f"  {n}h{h} = vmul.bf16x32 {sib}, {n}ub{h}, {p}c")       # silu(g) * u
+                        if kind == "umul":   # silu(g) * u
+                            e(f"  {n}h{h} = vmul.bf16x32 {n}gb{h}, {n}ub{h}, {p}c")
+                        else:
+                            swiglu_h(h)
                         hs[h] = lo32(f"{n}h{h}", f"hq{h}")[:2]
                     weave(lambda: hbody(0), lambda: hbody(1))
                     hs = hs[0] + hs[1]
