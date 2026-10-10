@@ -83,6 +83,9 @@ class Config:
                         # leaf-synced egress ring into its memory-tile panel, constrain.fill; HRX patch 0020); W is
                         # leaf-synchronized. 2: the raw stream is IQ4_XS GGUF rows (kraw): every filling core decodes
                         # the super-blocks covering its slice (gen_npu_dec.leaf_inline, in its idle W ring)
+    rawdma: int = 1     # fuse 2: each filler's raw rows reach it through its W DMA instead of its core stream: the
+                        # column's raw stream lands in a memory-tile ring the fillers drain in turn, each queued ahead of
+                        # its panel's records, into a ring in its idle W ring (constrain.intake, HRX patch 0022)
     ofeat: int = 0      # final f32 output, fragment-major into [token / 16][ofeat / 16][16][16]: column c's 80 features are
                         # fragments 5c .. 5c + 4; needs one replay group (GE.GROUPS = (passes,)) and
                         # LOOM_EXP_LS_SEND_PITCH=1 (the whole f32 slot is sent)
@@ -365,6 +368,14 @@ def array_program(L, cfg):
                 e(f"  constrain.fill %chw{c}_{r}, %chd{c}_{f}")
         if cfg.dcol:
             e(f"  constrain.fill %chw{c}_0, %chf{c}")
+    if cfg.rawdma:   # each filler's raw ring in its W ring (fuse_raw_ring), records [16 rows][RECROW bytes]
+        D = decoder(cfg.fmt, cfg.gord)
+        e(f"  %firows = constant.u32 16 : reg<aie2p.array.scalar : index>")
+        e(f"  %fipitch = constant.u32 {D.RECROW} : reg<aie2p.array.scalar : index>")
+        for c in range(cols):
+            for r, cov in fuse_cover(cfg, c).items():
+                e(f"  %fioff{c}_{r} = constant.u32 {fuse_raw_ring(cfg, cov)[0]} : reg<aie2p.array.scalar : index>")
+                e(f"  constrain.intake %chr{c}_{r}, %chw{c}_{r}, %fioff{c}_{r}, %firows, %fipitch")
     if cfg.dcol:
         fill_inputs(e, cfg, panel)
     # activations: one stream per row, one slab per record, multicast along the row (first branch rotates)
@@ -720,8 +731,14 @@ def fuse_channels(e, cfg, panel):
             e(f"  constrain.leaf_sync %chd{c}_{r}")
             ut = f"16x{uw // 16}" if cfg.fuse == 2 else f"{uw}"
             e(f"  %frr{c}_{r} = receiver %k{c}_{r}, {sp} : reg<aie2p.array.receiver : tile<{ut}xi32>>")
-            e(f"  %chr{c}_{r} = channel %fru{c}, %frr{c}_{r}, %two, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
-            e(f"  constrain.core_stream %chr{c}_{r}")
+            if cfg.rawdma:   # staged in the column's memory tile; intake ring depth fuse_raw_ring
+                cap = fuse_raw_ring(cfg, cov)[1]
+                e(f"  %chr{c}_{r} = channel %fru{c}, %frr{c}_{r}, %n{cap}, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
+                e(f"  constrain.stage %chr{c}_{r}, %n{c if cols > 1 else 1}")
+                e(f"  constrain.leaf_sync %chr{c}_{r}")
+            else:
+                e(f"  %chr{c}_{r} = channel %fru{c}, %frr{c}_{r}, %two, %fun : reg<aie2p.array.channel : tile<{ut}xi32>>")
+                e(f"  constrain.core_stream %chr{c}_{r}")
 
 
 class _Fill:
@@ -970,11 +987,30 @@ FZ_COMPACT = 0, 28992, 21760, 3264   # (SP, IN, SP2, OUT) where a ring is too sm
 # the output right after storage A, then B (still a bank apart from A) and the input record
 
 
+FZ_RAW = 0, 3264, 21760, 28992   # rawdma: (SP, IN, SP2, OUT), IN two raw records (fuse_raw_ring)
+FZ_RAW_COMPACT = 0, 28992, 21760, 3264   # rawdma, 4 super-blocks a row: one raw record (the compact layout)
+
+
+def fuse_raw_ring(cfg, cov):
+    """rawdma: (byte offset from the W ring's first 2048-aligned byte, records) of the filler's raw ring: two
+    [16][RECROW] records where the decoder output allows (FZ_RAW), else one (FZ_RAW_COMPACT)."""
+    sp, in_, sp2, out = fuse_scratch(cfg, cov)
+    return in_, (2 if (sp, in_, sp2, out) == FZ_RAW else 1)
+
+
 def fuse_scratch(cfg, cov):
     """fuse 2: the filler's scratch offsets (SP, IN, SP2, OUT) in its W ring (its 2 NP slabs)."""
     D = decoder(cfg.fmt, cfg.gord)
     _, _, _, nsb = fuse_span(cfg, cov)
     ring = 2 * NP * slab(cfg.ks[cov[-1]]) - 2047   # (the scratch starts at the ring's first 2048-aligned byte)
+    if cfg.rawdma:
+        sp, in_, sp2, out = FZ_RAW
+        if out + nsb * 2 * D.OUT_B <= ring:
+            assert sp + D.SCR_B <= in_ and in_ + 2 * 16 * D.RECROW <= sp2 and sp2 + D.SCR2_B <= out
+            return FZ_RAW
+        sp, in_, sp2, out = FZ_RAW_COMPACT
+        assert out + nsb * 2 * D.OUT_B <= sp2 and sp2 + D.SCR2_B <= in_ and in_ + 16 * D.RECROW <= ring
+        return FZ_RAW_COMPACT
     sp, in_, sp2, out = FZ_SP, FZ_IN, FZ_SP2, FZ_OUT
     if out + nsb * 2 * D.OUT_B > ring:
         sp, in_, sp2, out = FZ_COMPACT
@@ -1003,6 +1039,16 @@ def fuse_decode(L, cfg, dp, cov):
     e("^fzdq(%fzN: reg<aie2p.er>):")
     e("  %fzpD = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
     e("  st %fzN, %fzpD, 12")                       # the units left
+    _, rawport = fuse_ports("")
+    cap = fuse_raw_ring(cfg, cov)[1] if cfg.rawdma else 0
+    if cfg.rawdma:   # the W ring is idle: grant the raw ring's records
+        # an acquire of 0 first: a core reset while the core stalls in an acquire (this head, parked at the end of
+        # a call) leaves the lock request behind, and the restarted core's first release also lands on that lock
+        # (+cap phantom raw records after a re-setup); a first acquire clears it
+        e("  %fzZ0 = mova.i32 0")
+        e(f"  acq %fzZ0, {rawport}")
+        e(f"  %fzG = mova.i32 {cap}")
+        e(f"  rel %fzG, {rawport}")
     e("  low.br ^fzu")
     e("^fzu:")
     e("  %fzpU = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
@@ -1022,52 +1068,40 @@ def fuse_decode(L, cfg, dp, cov):
         v = "in0" if nm == "in" and s0 else nm
         e(f"  %fzo_{v} = mov.i32 {off}")
         e(f"  %fza_{v} = add.rr %fzsb, %fzo_{v}")
-    e(f"  %fzinp = mov.scalar-to-address %fza_{'in0' if s0 else 'in'}")
-    # the raw unit: every row's 4 super-blocks into the record row (RECROW holds them), 16 words a step
-    e("  %fz32 = mova.i32 32")
-    e("  %fzm32 = mov.modifier %fz32")
-    e(f"  %fzrr = mov.i32 {D.RECROW}")
-    e("  %fz16r = mova.i32 16")
-    e(f"  %fzws = mova.i32 {RW // 16}")
-    e("  low.br ^fzrw(%fzR0: reg<aie2p.er>, %fzinp: reg<aie2p.ep>)")
-    e("^fzrw(%fzri: reg<aie2p.er>, %fzrp: reg<aie2p.ep>):")
-    e("  %fzrm = lt %fzri, %fz16r")
-    e("  low.cond_br %fzrm, ^fzrb, ^fzrx : reg<aie2p.er>")
-    e("^fzrb:")
-    e("  %fzrpc = copy %fzrp : reg<aie2p.ep> -> reg<aie2p.ep>")
-    e("  %fzrq = padds.modifier %fzrpc, %fzm32")      # 16 words a step around the pointer (offsets -32 .. 28)
-    e("  low.br ^fzw(%fzR0: reg<aie2p.er>, %fzrq: reg<aie2p.ep>)")
-    e("^fzw(%fzwi: reg<aie2p.er>, %fzwq: reg<aie2p.ep>):")
-    e("  %fzwlm = lt %fzwi, %fzws")
-    e("  low.cond_br %fzwlm, ^fzwb, ^fzwx : reg<aie2p.er>")
-    e("^fzwb:")
-    for w in range(16):   # (a stream read holds the core ~10 cycles: measured, no stall event)
-        e(f"  %fzv{w} = mov.ss")
-    for w in range(16):
-        e(f"  st %fzv{w}, %fzwq, {4 * w - 32}")
-    e("  %fzwq1 = padda %fzwq, 64")
-    e("  %fzwi1 = add.rr %fzwi, %fzR1")
-    e("  low.br ^fzw(%fzwi1: reg<aie2p.er>, %fzwq1: reg<aie2p.ep>)")
-    e("^fzwx:")
-    for w in range(RW % 16):                            # the row's last words
-        e(f"  %fzt{w} = mov.ss")
-        e(f"  st %fzt{w}, %fzwq, {4 * w - 32}")
-    e("  %fzrpa = mov.address-to-scalar %fzrp")
-    e("  %fzrpb = add.rr %fzrpa, %fzrr")
-    e("  %fzrpn = mov.scalar-to-address %fzrpb")
-    e("  %fzri1 = add.rr %fzri, %fzR1")
-    e("  low.br ^fzrw(%fzri1: reg<aie2p.er>, %fzrpn: reg<aie2p.ep>)")
-    e("^fzrx:")
+    inb = f"%fza_{'in0' if s0 else 'in'}"
+    if cfg.rawdma:   # the unit is the raw ring's record (units left) % cap, its rows RECROW apart (the DMA lands them)
+        e("  %fzAm1 = mova.i32 -1")
+        e(f"  acq %fzAm1, {rawport}")
+        if cap == 2:
+            e("  %fzsl = and %fzu, %fzR1")
+            e(f"  %fzsk = mov.i32 {16 * D.RECROW}")
+            e("  %fzso = mul %fzsl, %fzsk")
+            e(f"  %fzinx = add.rr {inb}, %fzso")
+            inb = "%fzinx"
+    else:
+        raw_stream_unit(e, D, RW, inb)
     if s0:   # the decoder reads this row's super-blocks
         e(f"  %fzo_ins = mov.i32 {D.BLK * s0}")
-        e("  %fza_in = add.rr %fza_in0, %fzo_ins")
+        e(f"  %fzinS = add.rr {inb}, %fzo_ins")
+        inb = "%fzinS"
     for nm in ("sp", "in", "sp2", "out"):
-        e(f"  %dq_{nm} = mov.scalar-to-address %fza_{nm}")
+        e(f"  %dq_{nm} = mov.scalar-to-address {inb if nm == 'in' else '%fza_' + nm}")
     # the decoder (its values and labels prefixed)
     ren = lambda m: m.group(1) + "dq_" + m.group(2)
     for ln in D.leaf_inline(nsb):
         ln = re.sub(r"([%^])([A-Za-z_]\w*)", lambda m: ren(m) if not m.group(2).startswith("dq_") else m.group(0), ln)
         e(ln if ln.startswith("^") else "  " + ln.strip())
+    if cfg.rawdma:   # the raw record is consumed: back to the DMA, but for the last cap units (the panel follows them)
+        e("  %fzpQ = storage_address %fzs : low.storage<private> -> reg<aie2p.ep>")
+        e("  %fzuQ = lda %fzpQ, 12")
+        e(f"  %fzcQ = mov.i32 {cap}")
+        e("  %fzmQ = lt %fzcQ, %fzuQ")
+        e("  low.cond_br %fzmQ, ^fzrr, ^fzrj : reg<aie2p.er>")
+        e("^fzrr:")
+        e("  %fzr1Q = mova.i32 1")
+        e(f"  rel %fzr1Q, {rawport}")
+        e("  low.br ^fzrj")
+        e("^fzrj:")
     # the egress: per slice of this row's panel (rows - 2: its own and the last row's, interleaved per unit), its
     # padded slab from the decoded super-blocks (the pad copies whatever follows), a record (fw words) at a time
     e("  %fzE1 = mova.i32 1")
@@ -1141,6 +1175,46 @@ def fuse_decode(L, cfg, dp, cov):
     e("  low.br ^fzu")
     e("^fzux:")
     e("  low.br ^fzgemm")
+
+
+def raw_stream_unit(e, D, RW, inb):
+    """fuse_decode's raw unit from the core stream: every row's 4 super-blocks into the decoder's input record row
+    (RECROW holds them) at inb, 16 words a step."""
+    e(f"  %fzinp = mov.scalar-to-address {inb}")
+    e("  %fz32 = mova.i32 32")
+    e("  %fzm32 = mov.modifier %fz32")
+    e(f"  %fzrr = mov.i32 {D.RECROW}")
+    e("  %fz16r = mova.i32 16")
+    e(f"  %fzws = mova.i32 {RW // 16}")
+    e("  low.br ^fzrw(%fzR0: reg<aie2p.er>, %fzinp: reg<aie2p.ep>)")
+    e("^fzrw(%fzri: reg<aie2p.er>, %fzrp: reg<aie2p.ep>):")
+    e("  %fzrm = lt %fzri, %fz16r")
+    e("  low.cond_br %fzrm, ^fzrb, ^fzrx : reg<aie2p.er>")
+    e("^fzrb:")
+    e("  %fzrpc = copy %fzrp : reg<aie2p.ep> -> reg<aie2p.ep>")
+    e("  %fzrq = padds.modifier %fzrpc, %fzm32")      # 16 words a step around the pointer (offsets -32 .. 28)
+    e("  low.br ^fzw(%fzR0: reg<aie2p.er>, %fzrq: reg<aie2p.ep>)")
+    e("^fzw(%fzwi: reg<aie2p.er>, %fzwq: reg<aie2p.ep>):")
+    e("  %fzwlm = lt %fzwi, %fzws")
+    e("  low.cond_br %fzwlm, ^fzwb, ^fzwx : reg<aie2p.er>")
+    e("^fzwb:")
+    for w in range(16):   # (a stream read holds the core ~10 cycles: measured, no stall event)
+        e(f"  %fzv{w} = mov.ss")
+    for w in range(16):
+        e(f"  st %fzv{w}, %fzwq, {4 * w - 32}")
+    e("  %fzwq1 = padda %fzwq, 64")
+    e("  %fzwi1 = add.rr %fzwi, %fzR1")
+    e("  low.br ^fzw(%fzwi1: reg<aie2p.er>, %fzwq1: reg<aie2p.ep>)")
+    e("^fzwx:")
+    for w in range(RW % 16):                            # the row's last words
+        e(f"  %fzt{w} = mov.ss")
+        e(f"  st %fzt{w}, %fzwq, {4 * w - 32}")
+    e("  %fzrpa = mov.address-to-scalar %fzrp")
+    e("  %fzrpb = add.rr %fzrpa, %fzrr")
+    e("  %fzrpn = mov.scalar-to-address %fzrpb")
+    e("  %fzri1 = add.rr %fzri, %fzR1")
+    e("  low.br ^fzrw(%fzri1: reg<aie2p.er>, %fzrpn: reg<aie2p.ep>)")
+    e("^fzrx:")
 
 
 def fuse_egress_rotated(e, cfg, dp, cov, pieces, fw, OUT, k0, k1, s0):
