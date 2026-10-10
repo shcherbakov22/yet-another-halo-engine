@@ -1103,15 +1103,13 @@ class LoomNpuSplit : public NpuSplit {
     const auto e = (reinterpret_cast<std::uintptr_t>(p) + bytes + 4095) & ~std::uintptr_t{4095};
     for (const Raw& r : raw_)
       if (r.begin <= b && e <= r.end) return;
-    // libamdf pins for writing: the private mapping gets its own copies of these pages (the same bytes; the page cache
-    // ones stay reclaimable, and the GPU's userptr import follows the new pages). The NPU does not snoop the CPU's
-    // caches, so the copies are flushed to memory.
+    // libamdf pins for writing: the model is resident writable memory (Gguf::OpenResident), so the NPU shares the
+    // GPU's pages (a protection change or a copy-on-write fault there would evict every GPU queue). The NPU does not
+    // snoop the CPU's caches, so the rows are flushed to memory.
     auto* pages = reinterpret_cast<void*>(b);
-    if (mprotect(pages, e - b, PROT_READ | PROT_WRITE)) throw LoomError("npu: mprotect(weights)");
     LoomNpu::Shared& s = npu_.RegisterHost(pages, e - b);
     for (std::uintptr_t a = b; a < e; a += 64) _mm_clflushopt(reinterpret_cast<void*>(a));
     _mm_sfence();
-    mprotect(pages, e - b, PROT_READ);
     raw_.push_back({b, e, &s});
   }
   std::uint32_t BindRaw(const std::string& image, const std::string& swap, int dec, NpuView a, const void* raw,

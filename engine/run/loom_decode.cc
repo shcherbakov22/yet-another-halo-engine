@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
     }
   }
   try {
-    auto gguf = yah::core::Gguf::Open(model);
+    auto gguf = yah::core::Gguf::OpenResident(model);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
     const auto tconfig = yah::core::TokenizerConfig::FromGguf(gguf);
     const auto tokenizer = yah::core::Tokenizer::FromGguf(gguf, tconfig);

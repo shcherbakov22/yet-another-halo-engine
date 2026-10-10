@@ -43,7 +43,7 @@ class Engine : public TextGenerator {
   void set_tail(Tail t) { tail_ = t; }
 
   explicit Engine(const Options& o)
-      : gguf_(core::Gguf::Open(o.model)),
+      : gguf_(core::Gguf::OpenResident(o.model)),
         cfg_(core::Qwen35Config::FromGguf(gguf_)),
         tokenizer_(core::Tokenizer::FromGguf(gguf_, core::TokenizerConfig::FromGguf(gguf_))),
         weights_(gpu_, gguf_.tensor_data_base(), gguf_.tensor_data_size()),

@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    auto gguf = yah::core::Gguf::Open(argv[1]);
+    auto gguf = yah::core::Gguf::OpenResident(argv[1]);
     const std::string hal = argv[2];
     const uint32_t gx = static_cast<uint32_t>(std::atoi(argv[3]));  // "gx" or "gx,gy"
     const char* comma = std::strchr(argv[3], ',');

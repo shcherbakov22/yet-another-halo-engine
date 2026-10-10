@@ -21,7 +21,7 @@ Qwen3.8-27B is a hybrid: every 4th layer is full (softmax) attention, the others
 | vocab | 248320; output head Q6_K, token embedding IQ4_XS |
 | weights | 12.17 GiB, 3.84 bpw, 11 formats: IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 |
 
-The weights are the GGUF's own mmap, imported once into HRX as one device-visible buffer. Every tensor is an offset into that import. There is no second copy and no repacking.
+The weights are the GGUF read into locked anonymous memory (`Gguf::OpenResident`: 2 MB pages where the kernel has them, the file mapping dropped), imported once into HRX as one device-visible buffer. Every tensor is an offset into that import. There is no second copy and no repacking. The NPU pins its raw rows of the same pages. A mapped file does not work: reclaim and compaction scan its page-cache folios (large folios escape mlock), and every scan of a GPU-imported page evicts all of the process's GPU queues (hardware.md).
 
 ## Prefill
 

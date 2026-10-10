@@ -70,6 +70,12 @@ struct MetadataValue {
 class Gguf {
  public:
   static Gguf Open(const std::string& path);
+  // The file read into locked anonymous memory (2 MB pages where the kernel has them) instead of mapped: for a GPU
+  // that imports the bytes as user pages. Reclaim scans mapped file pages (their large folios escape mlock) and every
+  // scan of an imported page evicts all of the process's GPU queues for 0.03-3 s. The memory is writable, so a
+  // device that pins it for writing shares these pages (no copy-on-write copies). Needs RLIMIT_MEMLOCK (a warning
+  // when the kernel refuses the lock).
+  static Gguf OpenResident(const std::string& path);
   Gguf(Gguf&& other) noexcept;
   Gguf& operator=(Gguf&& other) noexcept;
   Gguf(const Gguf&) = delete;
@@ -97,6 +103,7 @@ class Gguf {
 
   std::uint8_t* base_{nullptr};
   std::size_t size_{0};
+  std::size_t map_bytes_{0};   // the mapping's length (OpenResident rounds it up to 2 MB)
   int fd_{-1};
   std::uint32_t version_{0};
   std::uint64_t data_offset_{0};

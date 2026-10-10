@@ -128,6 +128,8 @@ Steady state per instruction mix (5 s probe, default tctl):
 | the same after warming the cache with `cat` | 830 ms (small page-cache folios) |
 | host CPU during prefill, sleep-polled final wait | 3-4% of a core (busy-poll: 104%) |
 
+GPU queue evictions (2026-10-10, kprobes on `kgd2kfd_quiesce_mm` / `svm_range_cpu_invalidate_pagetables`): host memory the GPU imports is a KFD SVM range (or a userptr BO). Any MMU notifier on it (mprotect, a copy-on-write fault, reclaim's `try_to_unmap`, compaction's `try_to_migrate`, a THP split) stops all of the process's GPU queues; the restore takes 15-70 ms, 0.5-3 s while compaction keeps invalidating. mlock does not stop it: `try_to_unmap_one` fires the notifier before its VM_LOCKED check, and PTE-mapped large page-cache folios (XFS) are not mlocked. With the GGUF mapped and the NPU rows write-pinned (mprotect + 4 GB of copy-on-write copies), a 16-window gate hit the NPU's 2 s watchdog (amdxdna TDR) 1-2 times; the resident load: 0 in 16 windows, a pp2048 process 48 -> 25 s (setup evictions gone), longest NPU command 1148 -> 141 ms typical. Left: compaction still migrates the model's 4 KB pages (~50% got 2 MB pages) and HRX's shared host buffers (`/dev/zero` userptrs): evictions up to ~280 ms while the NPU runs, one 1.2 s NPU command in 16 windows.
+
 HRX counters, rocprofv3, ATT and what does not work (PC sampling, RGP) are listed in build-and-run.md, Profiling.
 
 ## NPU compute tile (AIE2P) (2026-10-07)

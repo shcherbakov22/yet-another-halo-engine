@@ -5,6 +5,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -148,6 +150,7 @@ Gguf& Gguf::operator=(Gguf&& other) noexcept {
     Close();
     base_ = other.base_;
     size_ = other.size_;
+    map_bytes_ = other.map_bytes_;
     fd_ = other.fd_;
     version_ = other.version_;
     data_offset_ = other.data_offset_;
@@ -155,6 +158,7 @@ Gguf& Gguf::operator=(Gguf&& other) noexcept {
     meta_ = std::move(other.meta_);
     other.base_ = nullptr;
     other.size_ = 0;
+    other.map_bytes_ = 0;
     other.fd_ = -1;
   }
   return *this;
@@ -166,7 +170,7 @@ Gguf::~Gguf() {
 
 void Gguf::Close() {
   if (base_ != nullptr) {
-    ::munmap(base_, size_);
+    ::munmap(base_, map_bytes_);
     base_ = nullptr;
   }
   if (fd_ >= 0) {
@@ -192,6 +196,7 @@ Gguf Gguf::Open(const std::string& path) {
     throw std::runtime_error("gguf: mmap failed");
   }
   g.base_ = static_cast<std::uint8_t*>(base);
+  g.map_bytes_ = g.size_;
 
   Cursor c{g.base_, g.base_ + g.size_};
   if (c.Read<std::uint32_t>() != kGgufMagic) {
@@ -266,6 +271,34 @@ const TensorInfo* Gguf::Find(const std::string& name) const {
 const MetadataValue* Gguf::Meta(const std::string& key) const {
   const auto it = meta_.find(key);
   return it == meta_.end() ? nullptr : &it->second;
+}
+
+Gguf Gguf::OpenResident(const std::string& path) {
+  Gguf g = Open(path);
+  constexpr std::size_t kHuge = std::size_t{2} << 20;
+  const std::size_t bytes = (g.size_ + kHuge - 1) & ~(kHuge - 1);
+  void* raw = ::mmap(nullptr, bytes + kHuge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (raw == MAP_FAILED) throw std::runtime_error("gguf: cannot reserve memory for " + path);
+  // 2 MB aligned, so whole huge pages map it
+  const auto r = reinterpret_cast<std::uintptr_t>(raw);
+  const std::uintptr_t a = (r + kHuge - 1) & ~(kHuge - 1);
+  if (a > r) ::munmap(raw, a - r);
+  if (r + kHuge > a) ::munmap(reinterpret_cast<void*>(a + bytes), r + kHuge - a);
+  auto* p = reinterpret_cast<std::uint8_t*>(a);
+  ::madvise(p, bytes, MADV_HUGEPAGE);
+  for (std::size_t off = 0; off < g.size_;) {
+    const ssize_t n = ::pread(g.fd_, p + off, std::min<std::size_t>(g.size_ - off, std::size_t{1} << 30),
+                              static_cast<off_t>(off));
+    if (n <= 0) {
+      ::munmap(p, bytes);
+      throw std::runtime_error("gguf: read failed: " + path);
+    }
+    off += static_cast<std::size_t>(n);
+  }
+  if (::mlock(p, bytes) != 0) std::fprintf(stderr, "gguf: cannot lock the model in memory (RLIMIT_MEMLOCK)\n");
+  ::munmap(g.base_, g.map_bytes_);
+  g.base_ = p, g.map_bytes_ = bytes;
+  return g;
 }
 
 }  // namespace yah::core

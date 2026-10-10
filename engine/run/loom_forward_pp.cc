@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
   const std::uint32_t want = argc > 4 ? std::strtoul(argv[4], nullptr, 10) : 2048;
   const char* ids_path = argc > 5 ? argv[5] : "/home/q/yah-scratch/ids2048.txt";
   try {
-    auto gguf = yah::core::Gguf::Open(argv[1]);
+    auto gguf = yah::core::Gguf::OpenResident(argv[1]);
     const auto cfg = yah::core::Qwen35Config::FromGguf(gguf);
     std::vector<std::uint32_t> ids = ParseIds(ids_path);
     LoomDevice gpu;

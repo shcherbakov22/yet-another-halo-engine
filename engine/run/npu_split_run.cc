@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    auto gguf = yah::core::Gguf::Open(argv[1]);
+    auto gguf = yah::core::Gguf::OpenResident(argv[1]);
     auto plan = ReadPlan(argv[2]);
     auto num = [&](const char* key) {
       if (!plan.count(key)) throw LoomError(std::string("plan: missing ") + key);
