@@ -615,7 +615,7 @@ def afrag_variants(fmt, mt, kb, B, out, outdir, kind):
     return rows
 
 
-# NPU column split (YAH_NPU_SPLIT="<site>=<NPU rows>,...", rows multiples of 640, q also of 512; empty: none): the NPU (XDNA2, HRX .xdna)
+# NPU column split (YAH_NPU_SPLIT="<site>=<NPU rows>,...", rows multiples of "npurows" (640; fused sets 512), q also of 512; empty: none): the NPU (XDNA2, HRX .xdna)
 # computes the trailing rows of a GEMM, the GPU the leading ones. Sites (rows x K):
 #   qkv  DeltaNet attn_qkv (10240 x 5120, f16 out)     gate  DeltaNet attn_gate (6144 x 5120, f16 out)
 #   q    attention attn_q (12288 x 5120, kqg: whole heads of [256 q | 256 gate])
@@ -642,10 +642,11 @@ NPU_SPLIT = dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("
 # permutes the activations (gen_bfp16_encode.ACT_PERM): "p4" for the fused writers (norm, postnorm, ffn unpack) and the
 # plain encoders, "pk" (Q4_K) by the "_pk" encoders into A's second half. Tensors of other formats stay on the GPU.
 # YAH_NPU_FUSE=1: the same raw-row sets on 8 fused GEMM columns (gen_npu_gemm fuse 2: every GEMM core decodes its own
-# panel slice; no decoder column, no swap images), images "npu_dcol_<fmt>_<K>.xdna" for the formats in FUSE_FMTS.
+# panel slice; no decoder column, no swap images), images "npu_dcol_<fmt>_<K>.xdna" for the formats in FUSE_FMTS, NP 4:
+# 512-row calls (site rows multiples of 512; NP 5 images no longer fit the grid decoders' raw rings).
 NPU_FUSE = os.environ.get("YAH_NPU_FUSE") == "1"
 NPU_DCOL = os.environ.get("YAH_NPU_DCOL") == "1" or NPU_FUSE
-FUSE_FMTS = ("iq4xs",)
+FUSE_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs", "q4k")
 FUSE_FFN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q3k", "iq2xxs", "iq2xs")   # the fused FFN block's gate / up (NP 4 images:
 # room for a grid decoder's tables; Q4_K's own k-block order would need its own activation stream)
 FUSE_FFN_DOWN_FMTS = ("iq4xs", "iq3xxs", "iq3s", "q4k")
@@ -654,7 +655,8 @@ DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3
              "iq2xs": ("IQ2_XS", "p4")}
 NPU_KS = (36, 36, 36, 20) if NPU_DCOL else GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
 NPU_COLS = 7 if NPU_DCOL and not NPU_FUSE else 8
-NPU_ROWS = NPU_COLS * GN.TN   # output rows per NPU call
+NPU_NP = 4 if NPU_FUSE else GN.NP   # 16-row slabs per column of a site call
+NPU_ROWS = NPU_COLS * 16 * NPU_NP   # output rows per NPU call
 NPU_SITES = {"qkv": ("kstore", 640, 20), "gate": ("kstore", 384, 20), "q": ("kqg", 768, 20), "out": ("kres", 320, 24),
              "down": ("kres", 320, 68), "ffn": ("ffn", 1088, 20)}
 NPU_PASSES = 5   # one NPU image: K = 5120 per call (gen_npu_gemm passes)
@@ -996,8 +998,9 @@ def npu_dcol_images(images, B, tmp, outdir, extra=()):
     jobs = []
     for fmt, K in sorted(images):
         if NPU_FUSE:
+            # (rawdma: plain-A calls hang the NPU; their raw rows take the core stream)
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2, kraw=K,
-                            fmt=DCOL_FMTS[fmt][0])
+                            fmt=DCOL_FMTS[fmt][0], rawdma=0)
         else:
             cfg = GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2, fmt=DCOL_FMTS[fmt][0],
                             kraw=K)
@@ -1311,7 +1314,8 @@ def main():
 
     geom.extend(ffn_fused(rows, B, outdir))
     if NPU_SPLIT or NPU_FFNBLK:
-        geom.extend(npu_split(rows, combos, B, outdir))
+        with GN.np_override(NPU_NP):
+            geom.extend(npu_split(rows, combos, B, outdir))
 
     # The calibration menu (calibration_menu, for engine/model/prefill_calib.hpp) is shelved with the calibration;
     # YAH_CALIB_MENU=1 still emits it.

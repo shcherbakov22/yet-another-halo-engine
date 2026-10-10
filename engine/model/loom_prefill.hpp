@@ -312,7 +312,7 @@ class LoomPrefill {
         const bool q_af = Af("gemm_kqg", pre + "attn_q.weight");
         const bool k_af = Af("gemm_kstore", pre + "attn_k.weight");
         const bool v_af = Af("gemm_kstore", pre + "attn_v.weight");
-        const bool q_npu = NpuRows("q") && !NpuHal(KqgHal(pre + "attn_q.weight", q_af)).empty();
+        const bool q_npu = NpuRows("q") && NpuOk(pre + "attn_q.weight") && !NpuHal(KqgHal(pre + "attn_q.weight", q_af)).empty();
         RunNorm(pre + "attn_norm.weight",
                 q_af && k_af && v_af   ? NormOut::kTiled
                 : q_af || k_af || v_af ? NormOut::kBoth
@@ -323,7 +323,8 @@ class LoomPrefill {
         // afrag qkv / gate read the fragment-major copy; alpha / beta keep the row-major one
         const bool qkv_af = Af("gemm_kstore", pre + "attn_qkv.weight");
         const bool gate_af = Af("gemm_kstore", pre + "attn_gate.weight");
-        const bool qkv_npu = NpuRows("qkv") && NpuRows("gate") &&
+        const bool qkv_npu = NpuRows("qkv") && NpuRows("gate") && NpuOk(pre + "attn_qkv.weight") &&
+                             NpuOk(pre + "attn_gate.weight") &&
                              !NpuHal(KstoreHal(pre + "attn_qkv.weight", qkv_af)).empty() &&
                              !NpuHal(KstoreHal(pre + "attn_gate.weight", gate_af)).empty();
         RunNorm(pre + "attn_norm.weight", qkv_af || gate_af ? NormOut::kBoth : NormOut::kRow, qkv_npu ? "qkv" : nullptr);
@@ -1451,9 +1452,11 @@ class LoomPrefill {
                                           : dir_ + "/npu_gemm_" + std::to_string(chunks[c].second) + ".xdna";
       const std::size_t cp = NpuK(chunks[c].second).c;
       for (const NpuView& wv : w[c]) {
+        // fused sets: each image its own family (a family change runs the image's setup; a swap would splice a whole
+        // image's first call, which stalls the array)
         calls.push_back(npu_dcol_ ? npu_->BindRaw(image, swap.empty() ? image : swap, dec, a[c],
                                                   gguf_.tensor_data_base() + wv.offset,
-                                                  wv.length, {c_off, cp})
+                                                  wv.length, {c_off, cp}, swap.empty() ? image : "dcol")
                                   : npu_->Bind(image, a[c], wv, {c_off, cp}));
         c_off += cp;
       }
@@ -1769,14 +1772,14 @@ class LoomPrefill {
     if (ai >= full_) throw LoomError("full-attention layer index past the KV slot count");
     // an afrag o-projection reads the attention output fragment-major (wmma_t)
     const bool o_af = Af("gemm_kres", pre + "attn_output.weight");
-    const std::uint32_t nq = NpuRows("q");
+    const std::uint32_t nq = NpuOk(pre + "attn_q.weight") ? NpuRows("q") : 0;   // (a format without a decoder: GPU)
     const std::string qs = nq ? NpuHal(KqgHal(pre + "attn_q.weight", q_af)) : "";
     bool qg_fused = !qs.empty();
     if (qg_fused) {
       // the NPU's heads of q (whole heads of 512 rows [256 q | 256 gate]) beside the GPU's heads and k / v;
       // the norm wrote the row-major input unless q, k and v are all afrag
       const bool tiled = q_af && k_af && v_af;
-      const auto a = NpuEncode("q", tiled ? *normt_ : *scratch_, tiled);
+      const auto a = NpuEncode("q", tiled ? *normt_ : *scratch_, tiled, NpuPk(pre + "attn_q.weight"));
       std::size_t w_off = 0, c_off = 0;
       const auto w = NpuDecode("q", pre + "attn_q.weight", nq, w_off);
       std::vector<std::uint32_t> calls;
@@ -1915,6 +1918,10 @@ class LoomPrefill {
       const auto wg = NpuDecode("gate", pre + "attn_gate.weight", ng, w_off);
       std::vector<std::uint32_t> calls;
       const NpuView cq = NpuCalls("qkv", kq ? ak : a4, wq, c_off, calls, pre + "attn_qkv.weight");
+      // fused sets: a job runs one image (one family: NpuCalls)
+      if (npu_dcol_ && DcolImage(pre + "attn_qkv.weight") != DcolImage(pre + "attn_gate.weight") &&
+          ::access((dir_ + "/npu_dcol_iq4xs.swap.xdna").c_str(), R_OK) != 0)
+        NpuEnqueue(std::exchange(calls, {}), "qkv");
       const NpuView cg = NpuCalls("gate", kg ? ak : a4, wg, c_off, calls, pre + "attn_gate.weight");
       NpuEnqueue(std::move(calls), "qkv");
       RunKstore(pre + "ssm_alpha.weight", *alpha_);
