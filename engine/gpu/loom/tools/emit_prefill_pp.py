@@ -654,6 +654,10 @@ DCOL_FMTS = {"iq4xs": ("IQ4_XS", "p4"), "iq3s": ("IQ3_S", "p4"), "iq3xxs": ("IQ3
              "q3k": ("Q3_K", "p4"), "iq2xxs": ("IQ2_XXS", "p4"),
              "iq2xs": ("IQ2_XS", "p4")}
 NPU_KS = (36, 36, 36, 20) if NPU_DCOL else GN.KS   # k-blocks per pass and K-slice row; K = 1024 * passes
+# the fused FFN block's gate / up of one format whose filler cores hold 40 k-block slices (the grid decoders' tables leave
+# no room): the short tail slice frees the room for its deferred epilogue (gen_npu_gemm dfr); the norm before such a
+# layer writes this split's stream ("norm_t_bfp_g1s.hal", dispatch row "npuffndfr_<fmt>")
+NPU_DFR_FMTS, NPU_DFR_KS = ("iq4xs",), (40, 40, 40, 8)
 NPU_COLS = 7 if NPU_DCOL and not NPU_FUSE else 8
 NPU_NP = 4 if NPU_FUSE else GN.NP   # 16-row slabs per column of a site call
 NPU_ROWS = NPU_COLS * 16 * NPU_NP   # output rows per NPU call
@@ -1068,9 +1072,10 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
             blk = GN.decoder(DCOL_FMTS[fmt][0]).BLK
             name = "npu_ffnsw_%s%s" % (fmt, hord and "_" + hord.lower())
             if NPU_FUSE:
-                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, mu=1, gate=GN.GATE_SUPPLY, fuse=2,
-                                       swiglu=True, dgu=mt * 16 * kb * blk, swcol=32, hpass=F // 1024, hord=hord,
-                                       fmt=DCOL_FMTS[fmt][0]), name, None, 4))
+                dfr = fmt in NPU_DFR_FMTS
+                jobs.append((GN.Config(NPU_COLS, B // 64, NPU_DFR_KS if dfr else NPU_KS, NPU_PASSES, mu=1,
+                                       gate=GN.GATE_SUPPLY, fuse=2, swiglu=True, dgu=mt * 16 * kb * blk, swcol=32,
+                                       hpass=F // 1024, hord=hord, fmt=DCOL_FMTS[fmt][0], dfr=int(dfr)), name, None, 4))
                 continue
             jobs.append((GN.Config(NPU_COLS, B // 64, NPU_KS, NPU_PASSES, gate=GN.GATE_SUPPLY, dcol=2,
                                    fmt=DCOL_FMTS[fmt][0], swiglu=True, dgu=mt * 16 * kb * blk, swcol=1024,
@@ -1156,15 +1161,20 @@ def npu_ffnblk(rows, B, tmp, outdir, out, split, variants):
     # gate / up read their activations in one replay group: the norm before them writes that stream (fragment-major)
     import gen_half_norm
     groups, perm = GE.GROUPS, GE.ACT_PERM
-    GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
-    try:
-        src = os.path.join(tmp, "norm_t_bfp_g1.loom")
-        open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True,
-                                                     bfp=(B, list(NPU_KS), NPU_PASSES)))
-    finally:
-        GE.GROUPS, GE.ACT_PERM = groups, perm
-    E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
-                 "yah_half_norm.fused=0"], "norm_t_bfp_g1.hal", outdir)
+    dfrs = sorted({j[0].fmt for j in jobs if j[0].dfr})
+    for name, ks in (("norm_t_bfp_g1", NPU_KS),) + ((("norm_t_bfp_g1s", NPU_DFR_KS),) if dfrs else ()):
+        GE.GROUPS, GE.ACT_PERM = (NPU_PASSES,), "p4"
+        try:
+            src = os.path.join(tmp, name + ".loom")
+            open(src, "w").write(gen_half_norm.gen_split(5120, wpr=4, split=NORM_SPLIT, tiled=True,
+                                                         bfp=(B, list(ks), NPU_PASSES)))
+        finally:
+            GE.GROUPS, GE.ACT_PERM = groups, perm
+        E.emit(src, ["yah_half_norm.rows=%d" % B, "yah_half_norm.dim=5120", "yah_half_norm.eps=1e-06",
+                     "yah_half_norm.fused=0"], name + ".hal", outdir)
+    for fmt in NPU_DFR_FMTS:
+        if DCOL_FMTS[fmt][0] in dfrs:
+            out.append(("npuffndfr_" + fmt, 1, 0, 0))
     out.append(("npuffnblk", F, 256 if NPU_FUSE else 224, rows))   # F, gate / up features per call, down rows
     sw = next(j for j in jobs if j[1].startswith("npu_ffnsw_"))
     with GN.np_override(4):

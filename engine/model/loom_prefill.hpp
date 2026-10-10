@@ -961,8 +961,11 @@ class LoomPrefill {
         !geom_.count(rem) || ::access((dir_ + "/norm_t_bfp_g1.hal").c_str(), R_OK) ||
         ::access((sw + ".xdna").c_str(), R_OK))
       return false;
-    // the norm also writes gate / up's activations (one replay group: that stream layout)
-    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, "ffnblk");
+    // the norm also writes gate / up's activations (one replay group: that stream layout; "npuffndfr_<fmt>": the
+    // deferred-epilogue image's K split, emit_prefill_pp NPU_DFR_KS)
+    const bool dfr = !pair && geom_.count("npuffndfr_" + std::string(f.name));
+    if (dfr && ::access((dir_ + "/norm_t_bfp_g1s.hal").c_str(), R_OK)) return false;
+    RunNorm(pre + "post_attention_norm.weight", NormOut::kTiled, dfr ? "ffnblk_s" : "ffnblk");
     const NpuView ag{0, NpuK(5120).a};
     const std::uint8_t* base = gguf_.tensor_data_base();
     const std::size_t rb = static_cast<std::size_t>(tg->bytes) / M, blk = rb * 256 / tg->dims[0];
@@ -1147,12 +1150,14 @@ class LoomPrefill {
   // writes its BFP16 input into A ("<norm>_bfp.hal") and NpuEncode(npu_site) skips the encoder.
   void RunNorm(const std::string& wname, NormOut mode = NormOut::kRow, const char* npu_site = nullptr) {
     // A row takes `split` waves (dispatch.txt norm_split, else 1); a workgroup of w waves takes w / split rows.
-    // npu_site "ffnblk": the FFN block's one-replay-group stream (RunFfnBlock, fragment-major output only)
-    const bool g1 = npu_site && std::strcmp(npu_site, "ffnblk") == 0;
+    // npu_site "ffnblk": the FFN block's one-replay-group stream (RunFfnBlock, fragment-major output only); "ffnblk_s":
+    // in the deferred-epilogue images' K split
+    const bool g1s = npu_site && std::strcmp(npu_site, "ffnblk_s") == 0;
+    const bool g1 = g1s || (npu_site && std::strcmp(npu_site, "ffnblk") == 0);
     const bool bfp = npu_site && (g1 || geom_.count("npunormbfp"));
     norm_bfp_ = bfp && !g1 ? npu_site : "";
     const std::string hal = mode == NormOut::kTiled ? "norm_t" : mode == NormOut::kBoth ? "norm_rt" : "norm";
-    const LoomExecutable& exe = Exe(g1 ? "norm_t_bfp_g1.hal" : hal + (bfp ? "_bfp.hal" : ".hal"));
+    const LoomExecutable& exe = Exe(g1s ? "norm_t_bfp_g1s.hal" : g1 ? "norm_t_bfp_g1.hal" : hal + (bfp ? "_bfp.hal" : ".hal"));
     const std::uint32_t ws = exe.WorkgroupSize(exe.OrdinalOrZero("yah_half_norm"));
     const auto ns = geom_.find("norm_split");
     const std::uint32_t split = ns != geom_.end() && ns->second.rowgrp ? ns->second.rowgrp : 1;
