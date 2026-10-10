@@ -1997,6 +1997,26 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                 e(f"  {nm} = vmul.bf16x32 {one_}, {x_}, {p}c")
                 kmemo[("a", x, kch[0])] = nm
                 return nm
+            def weave(*bodies):
+                """Emits the bodies' instructions round-robin: independent chains (their own SSA names, shared
+                constants made at first use) whose latencies the locked order would otherwise expose one after the other."""
+                segs, kpre = [], (f"  {p}kc", f"  {p}kv", f"  {p}ka")
+                for b in bodies:
+                    s0 = len(L)
+                    b()
+                    steps, kdefs = [], []   # a shared constant rides with the first step that uses it
+                    for x in L[s0:]:
+                        if x.startswith(kpre):
+                            kdefs.append(x)
+                        else:
+                            steps.append(kdefs + [x])
+                            kdefs = []
+                    del L[s0:]
+                    segs.append(steps)
+                for i in range(max(map(len, segs))):   # same program: chain 0's step i (with its constants) leads
+                    for sg in segs:
+                        if i < len(sg):
+                            L.extend(sg[i])
             L2E = 1 / math.log(2)
             e(f"  {p}amk = mov.i32 32767")                      # bf16 |x| mask
             e(f"  {p}amv = vbcst.16 {p}amk")
@@ -2189,22 +2209,25 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                         return f"{n}sib{h}"
                     if kind in ("graw", "gsig"):   # the gate tail: g or silu(g) to the buffer, (r, h) blocks of 32 bf16
                         g4 = load(f"{q}gib", "g")
-                        for h in range(2):
-                            kch[0] = (r, h)
+
+                        def gbody(h):
+                            kch[0] = r   # the woven pair shares its constants
                             g2 = f"{n}g2{h}"
                             e(f"  {g2} = concat({g4[2 * h]}, {g4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
                             e(f"  {n}gb{h} = vconv.bf16.fp32 {g2}")
                             v = silu(h) if kind == "gsig" else f"{n}gb{h}"
                             e(f"  {n}gp{h} = mov.scalar-to-address {q}gbb")   # short-lived (the ep budget is 8)
                             e(f"  vst.512.bf16x32 {v}, {n}gp{h}, {64 * (2 * r + h)}")
+                        weave(lambda: gbody(0), lambda: gbody(1))
                         continue
                     if kind == "sw":
                         g4, u4 = load(f"{q}gib", "g"), load(f"{q}uib", "u")
                     else:
                         u4 = load(f"{q}uib", "u")
-                    hs = []
-                    for h in range(2):
-                        kch[0] = (r, h)
+                    hs = {}
+
+                    def hbody(h):
+                        kch[0] = r   # the woven pair shares its constants
                         u2 = f"{n}u2{h}"
                         e(f"  {u2} = concat({u4[2 * h]}, {u4[2 * h + 1]}) : ({M1}, {M1}) -> {M2}")
                         if kind == "sw":
@@ -2217,8 +2240,9 @@ def body(L, cfg, role, ks, a_adv, acap, gate=None, pair=None, fills=False):
                         e(f"  {n}ub{h} = vconv.bf16.fp32 {u2}")
                         sib = f"{n}gb{h}" if kind == "umul" else silu(h)
                         e(f"  {n}h{h} = vmul.bf16x32 {sib}, {n}ub{h}, {p}c")       # silu(g) * u
-                        q0, q1, _ = lo32(f"{n}h{h}", f"hq{h}")
-                        hs += [q0, q1]
+                        hs[h] = lo32(f"{n}h{h}", f"hq{h}")[:2]
+                    weave(lambda: hbody(0), lambda: hbody(1))
+                    hs = hs[0] + hs[1]
                     e(f"  {n}H = concat({hs[0]}, {hs[1]}, {hs[2]}, {hs[3]}) : ({M1}, {M1}, {M1}, {M1}) -> {M4}")
                     nf += 1
                     nxt = (f"{p}xf{nf}", f"{p}xp{nf}", f"{p}xq{nf}")
